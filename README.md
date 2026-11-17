@@ -1,6 +1,13 @@
 # pix68k
 Bare Metal X68000 emulator for Raspberry Pi
 
+pix68k emulates the Sharp X68000 on Raspberry Pi 3 / 4 / 5 without an OS
+(bare metal, built on Circle). Besides the 68000 models, it runs X68030
+(68030 + 68882) and 060turbo (68060) configurations. A host build (SDL2)
+for macOS and Linux is used for development and testing.
+IPL ROM, CGROM and disk images are not included; use your own.
+The documentation is in Japanese. License: GPLv3.
+
 文中の #番号 は、開発用の非公開リポジトリの issue と PR の番号。
 
 ## ビルドとテスト (ホスト)
@@ -13,7 +20,8 @@ cmake --build build -j
 ./build/bench               # ホスト上での CPU コアの速度 (68000)
 ./build/cpu020_bench        # 68030 / 68060 のコアだけの速さ (周辺機器なし。--cpu 68030 で 68030)
 ./build/machine_bench --profile   # X68000 全体 (CPU、周辺機器、画面と音の合成) の速さと内訳
-./build/pix68k              # ホスト版 (SDL2)。今はテストパターンを表示し、押したキーを表示するだけ
+./build/pix68k -0 disk.xdf  # ホスト版 (SDL2)。X68000 を実時間で動かす。IPL ROM と CGROM は ~/.cache/pix68k/rom から読む (-r で変える。
+                            # IPL ROM がなければテストパターンを出す)。オプションの一覧は host/main.cpp の先頭、入力は下の「ホスト版の入力」
 ```
 
 ホスト版には SDL2 が要る (`brew install sdl2`)。見つからなければホスト版だけビルドしない。
