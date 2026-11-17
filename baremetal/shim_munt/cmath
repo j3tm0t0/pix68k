@@ -1,0 +1,41 @@
+// Munt (external/munt) をベアメタル (Circle) でビルドするための <cmath>。Homebrew の aarch64-elf-gcc には
+// C++ の標準ライブラリのヘッダも libm もないので、Munt が使う関数だけを用意する (baremetal/munt_libc.cpp)。
+// このディレクトリは Munt と platform/mt32_synth.cpp をビルドするときだけ -I で足す (baremetal/Makefile)。
+#pragma once
+
+extern "C" {
+double sin(double x);
+double cos(double x);
+double exp(double x);
+double log(double x);
+double log10(double x);
+double fmod(double x, double y);
+double sqrt(double x);
+double floor(double x);
+double ceil(double x);
+double fabs(double x);
+}
+
+namespace std {
+using ::ceil;
+using ::cos;
+using ::exp;
+using ::fabs;
+using ::floor;
+using ::fmod;
+using ::log;
+using ::log10;
+using ::sin;
+using ::sqrt;
+// float の版 (Munt の float の計算は float のまま行う。倍精度で計算して丸める)
+inline float sin(float x) { return (float)::sin((double)x); }
+inline float cos(float x) { return (float)::cos((double)x); }
+inline float exp(float x) { return (float)::exp((double)x); }
+inline float log(float x) { return (float)::log((double)x); }
+inline float log10(float x) { return (float)::log10((double)x); }
+inline float fmod(float x, float y) { return (float)::fmod((double)x, (double)y); }
+inline float sqrt(float x) { return (float)::sqrt((double)x); }
+inline float floor(float x) { return (float)::floor((double)x); }
+inline float ceil(float x) { return (float)::ceil((double)x); }
+inline float fabs(float x) { return (float)::fabs((double)x); }
+} // namespace std

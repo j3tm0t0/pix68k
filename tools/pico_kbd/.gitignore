@@ -1,0 +1,6 @@
+# SSID、パスワード、トークンの入ったイメージや、そのヘッダをコミットしない
+*.uf2
+*.bin
+*.elf
+pico_kbd_secrets.h
+!host_stubs/pico_kbd_secrets.h

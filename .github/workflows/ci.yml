@@ -1,0 +1,84 @@
+name: CI
+
+# 公開リポジトリ (j3tm0t0/pix68k) 用。GitHub のホストの runner だけを使う (持ち主の機械の runner は使わない)。
+# ROM とディスクのイメージは置いていないので、それが要る試験は飛ばされる (終了コード 77)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  host-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: パッケージを入れる
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libsdl2-dev python3
+      - name: SingleStepTests を取得
+        run: tools/fetch_sst.sh
+      - name: Musashi を取得 (差分テスト用)
+        run: tools/fetch_musashi.sh
+      - name: ビルド
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
+          cmake --build build
+      - name: テスト
+        run: cd build && ctest --output-on-failure
+      - name: pico_kbd のホストの試験
+        run: tools/pico_kbd/run_host_tests.sh build/pico_kbd_host
+
+  host-macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: パッケージを入れる
+        run: brew install sdl2
+      - name: SingleStepTests を取得
+        run: tools/fetch_sst.sh
+      - name: Musashi を取得 (差分テスト用)
+        run: tools/fetch_musashi.sh
+      - name: ビルド
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
+          cmake --build build -j
+      - name: テスト
+        run: cd build && ctest --output-on-failure
+
+  baremetal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PREFIX64: aarch64-linux-gnu-
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: パッケージを入れる
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-system-arm mtools python3
+      - name: submodule (Circle) を取得
+        run: git submodule update --init --depth 1
+      - name: ビルド (QEMU 用 Pi 3)
+        run: tools/build_baremetal.sh 3 --qemu
+      - name: QEMU raspi3b で起動を確認 (ROM は使わない)
+        run: tools/qemu_smoke.sh
+      - name: ビルド (Pi 3、68000 だけ)
+        run: PIX68K_CPU020=0 tools/build_baremetal.sh 3
+      - name: ビルド (Pi 3)
+        run: tools/build_baremetal.sh 3
+      - name: ビルド (Pi 4、Pi 400)
+        run: tools/build_baremetal.sh 4
+      - name: ビルド (Pi 5)
+        run: tools/build_baremetal.sh 5

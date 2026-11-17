@@ -1,0 +1,106 @@
+pix68k
+
+pix68k は GPLv3 (LICENSE) で配布する。次の部分は、ほかのソフトウェアのコードをもとにしている。
+バイナリ (kernel8.img など) を配るときは、このファイルを一緒に置く。
+
+----------------------------------------------------------------------
+src/x68k/opm.h、src/x68k/opm.cpp (YM2151) は ymfm をもとにしている。
+https://github.com/aaronsgiles/ymfm
+
+BSD 3-Clause License
+
+Copyright (c) 2021, Aaron Giles
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----------------------------------------------------------------------
+src/platform/menu_font.h (設定メニューの文字) は、Circle (https://github.com/rsta2/circle、GPLv3) の
+lib/font8x16.cpp から ASCII の部分を写したもの (tools/gen_menu_font.py で作る)。元は Linux の
+kbd パッケージ (Keyboard and Font Utilities) の lat1-16 で、作者は Andries Brouwer、Alexey Gladkov ほか、
+GPLv2 以降で配布されている。
+
+----------------------------------------------------------------------
+external/tinysoundfont/tsf.h (MIDI の SoundFont の音源。src/platform/sf2_synth.cpp が使う) は TinySoundFont を
+そのまま写したもの (https://github.com/schellingb/TinySoundFont のコミット 853a0a171759f1ddba0de1442133a75912bbeffa)。
+ライセンスは external/tinysoundfont/LICENSE と tsf.h の先頭にある MIT License。
+
+Copyright (C) 2017-2025 Bernhard Schelling
+Based on SFZero, Copyright (C) 2012 Steve Folta (https://github.com/stevefolta/SFZero)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+----------------------------------------------------------------------
+external/munt/mt32emu (MT-32 / CM-32L の音源。src/platform/mt32_synth.cpp が使う) は Munt の libmt32emu 2.8.6 を
+変えずに写したもの (https://github.com/munt/munt のコミット 91d2205e、使うファイルだけ)。
+external/munt/config/config.h は、CMake が作るヘッダの代わりに書いたもの。
+
+Copyright (C) 2003, 2004, 2005, 2006, 2008, 2009 Dean Beeler, Jerome Fisher
+Copyright (C) 2011-2026 Dean Beeler, Jerome Fisher, Sergey V. Mikayev
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 2.1 of the License, or
+(at your option) any later version.
+
+ライセンスの全文は external/munt/mt32emu/COPYING.LESSER.txt にある (バイナリを配るときは一緒に置く)。
+libmt32emu は、ベアメタル版の kernel8.img にもホスト版の pix68k にも静的にリンクしている。どちらかを配るときは、
+配るバイナリを作ったのと同じ版の pix68k のソース一式 (external/munt を含む) を一緒に渡すか、手に入れる方法
+(リポジトリの URL とコミット) を示す。ソース一式の external/munt/mt32emu を別の libmt32emu に替え、README の手順
+(ホスト版は CMake、ベアメタル版は tools/build_baremetal.sh) でビルドし直せば、Munt を差し替えたものをリンクできる。
+作者の一覧は external/munt/mt32emu/AUTHORS.txt にある。
+
+----------------------------------------------------------------------
+external/nuked-sc55 (SC-55mkII の音源。src/platform/sc55_synth.cpp が使う) は Nuked-SC55 から、マイコンと PCM の LSI の
+エミュレーションのファイルだけを写したもの (https://github.com/nukeykt/Nuked-SC55 のコミット
+cc801b26a83a25e6d8d1ed5edf2a91fdcc822ab6)。pix68k で使うために次のファイルを変えた (2026-11。変えたところは各ファイルの
+先頭に書いた): src/mcu.cpp (SDL の音と画面、作業のスレッド、MIDI の入力、main()、ROM のファイルの読み込みを除き、
+1 命令を進める MCU_Step() と、グローバル変数を初めの値に戻す MCU_ResetGlobals() を足し、ROM と SRAM の配列をポインタに
+変えた)、src/pcm.cpp と src/pcm.h (波形の ROM の配列をポインタに変えた)、src/submcu.cpp (UART の変数を初めの値に戻す
+SM_ResetGlobals() を足した)。
+
+Copyright (C) 2021, 2024 nukeykt
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+ライセンスの全文は external/nuked-sc55/LICENSE にある。GPL 2 以降なので、pix68k 全体は GPLv3 で配る。

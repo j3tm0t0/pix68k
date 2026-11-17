@@ -1,0 +1,3 @@
+// Munt をベアメタルでビルドするための <cstring> (shim_munt/cmath の説明を参照)。Circle の同名の関数を使う
+#pragma once
+#include <circle/util.h>

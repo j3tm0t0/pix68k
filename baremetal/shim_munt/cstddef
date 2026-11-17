@@ -1,0 +1,8 @@
+// Munt をベアメタルでビルドするための <cstddef> (shim_munt/cmath の説明を参照)
+#pragma once
+#include <stddef.h>
+
+namespace std {
+using ::ptrdiff_t;
+using ::size_t;
+} // namespace std

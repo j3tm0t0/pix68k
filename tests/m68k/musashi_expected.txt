@@ -1,0 +1,47 @@
+# musashi_diff の既知の違い (musashi_diff -n 200000 -e このファイル。種は既定の 1)
+# 1 行に「命令の名前 違いの数 ハッシュ」。ハッシュは違いの出たテストの番号の並びのもの (musashi_diff.cpp の説明)。
+# 違いの出る命令の集まりが変わったら (ここにない命令で違いが出る、数が変わる、同じ数でも別のテストで違いが出る) 失敗にする。
+# どれも、こちらを instructiontest.x (実機の結果) か MC68030UM で確かめてあり、Musashi のほうが実機と違うもの。
+# 種や回数を変えたり、テストの作り方を変えたりしたら、結果の表の「expect:」の行から書き直すこと
+# ハッシュや数が変わって失敗したら、「expect:」の行を写す前に、違いが増えたのか、別のテストに入れ替わったのかを
+# 確かめること。Musashi は未定義動作を含むので (CMakeLists.txt の -fwrapv)、コンパイラや最適化を変えただけでも
+# Musashi の結果が変わりうる。違いが増えたなら、こちらのコアが変わった疑いがある
+
+# 未定義のフラグ (CHK の N 以外、DIVx のあふれ・ゼロ除算の N Z): instructiontest.x の実機の結果に合わせている
+chk.w      837 a8d2b8a8
+chk.l      803 f450dbaa
+divs.w     582 dc7e9a96
+divu.w     436 59fbf237
+divs.l      15 f1fc17a4
+divu.l      13 00754a07
+# ABCD / SBCD / NBCD の N と V (68030 は V が常に 0、N は結果の最上位ビット): instructiontest.x の実機の結果
+abcd       131 3034d0a9
+sbcd       102 a9eaffc5
+nbcd        14 f546f1c3
+# PACK / UNPK の -(An) で書く値と、UNPK -(A7) でワードを書くときに A7 を 2 減らすところ (Musashi は 4 減らす)。
+# こちらは instructiontest.x の pack / unpk で確かめた
+unpk       209 7fd90afd
+pack       205 9aa748d5
+# CHK2 / CMP2: Musashi は未定義の N と V を変えず、範囲の外かどうか (C と例外) も違う。こちらの N と V は実機の
+# MC68EC030 の規則 (cpu020_ops.inc の chk2Flags())、Z と C は定義どおりで、instructiontest.x の hard の chk2 / cmp2 で
+# 実機と合っている
+chk2.b      36 580d97aa
+chk2.w      43 a275cdc6
+chk2.l      35 0047b174
+cmp2.b      27 9be77d5d
+cmp2.w      39 2e59dc29
+cmp2.l      33 1c1e8dbb
+# MOVEM <list>,-(An) で An がリストにあれば、命令の始めの An - 大きさを書く (68020 以降。MC68030UM の MOVEM)
+movem.w     19 0c12f479
+movem.l     15 025f9f44
+# BFFFO の結果はオフセット + 先頭の 0 の数を 32 ビットで回り込ませたもの: instructiontest.x の bfffo で確かめた
+bfffo       12 b5132d75
+# CAS2.W で比べて違ったとき、Dc は下位のワードだけを書き換える (MC68030UM の CAS2)。Musashi は 32 ビットを書く
+cas2.w       2 9ca34005
+# BFCHG / BFCLR / BFSET / BFINS で Dn のオフセットが -$7FFFFFF9 以下 ($80000000 など) のとき、Musashi の
+# m68ki_bitfield_patch_ea() の「7 - offset」があふれ、バイトのアドレスが 2^29 - 1 ずれる (24 ビットでは 1 バイト前。-fwrapv を付けたとき。
+# 付けないと最適化の度合いで結果が変わる)。こちらはオフセットを符号付き 32 ビットとして 8 で割る (MC68030UM のビットフィールド)
+bfchg        4 5ace5b3b
+bfclr        2 8076fb5f
+bfins        8 51dfa5bf
+bfset        7 620520b7

@@ -1,0 +1,14 @@
+// Munt をベアメタルでビルドするための <cstdio> (shim_munt/cmath の説明を参照)。
+// Munt は printf / vprintf をデバッグの出力 (既定の ReportHandler) に、sprintf / snprintf をパートの名前などに使う。
+// printf と vprintf は何も出さない (pix68k は Munt のメッセージを platform/mt32_synth.cpp の ReportHandler で受ける)
+#pragma once
+#include <stdarg.h>
+#include <stddef.h>
+
+extern "C" {
+int printf(const char* format, ...);
+int vprintf(const char* format, va_list args);
+int sprintf(char* out, const char* format, ...);
+int snprintf(char* out, size_t size, const char* format, ...);
+int vsnprintf(char* out, size_t size, const char* format, va_list args);
+}

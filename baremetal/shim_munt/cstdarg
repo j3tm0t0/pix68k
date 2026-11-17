@@ -1,0 +1,7 @@
+// Munt をベアメタルでビルドするための <cstdarg> (shim_munt/cmath の説明を参照)
+#pragma once
+#include <stdarg.h>
+
+namespace std {
+using ::va_list;
+} // namespace std

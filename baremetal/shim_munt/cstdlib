@@ -1,0 +1,23 @@
+// Munt をベアメタルでビルドするための <cstdlib> (shim_munt/cmath の説明を参照)
+#pragma once
+
+extern "C" {
+int rand(void);
+}
+
+inline int abs(int x) { return x < 0 ? -x : x; }
+
+namespace std {
+struct div_t {
+    int quot;
+    int rem;
+};
+inline div_t div(int a, int b) {
+    div_t r;
+    r.quot = a / b;
+    r.rem = a % b;
+    return r;
+}
+using ::abs;
+using ::rand;
+} // namespace std
