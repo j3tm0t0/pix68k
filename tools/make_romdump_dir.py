@@ -7,7 +7,7 @@
 AUTOEXEC.BAT が ROMDUMP.X を動かし、同じディレクトリに IPLROM.DAT ($FE0000 から 128KB) と ROM30.DAT
 ($FC0000 から 128KB) を書いて "ROMDUMP OK" と出す。
 
-060turbo の IPL ROM を、XEiJ の IPLROM 1.6 から取り出すために使う (README の「060turbo」を参照)。
+060turbo の IPL ROM を、XEiJ の IPLROM 1.6 から取り出すために使う (docs/060turbo.md を参照)。
 ROMDUMP.X の中身 (152 バイト) は下の CODE で、次のアセンブリを組み立てたもの:
 
     start:  clr.l   -(sp)               ; _SUPER (スーパーバイザモードにする)

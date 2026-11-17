@@ -360,7 +360,7 @@ double filterGainRange(const std::vector<float>& h, double srcRate, double f0, d
 }
 
 // SC-55mkII の PCM の LSI の周波数 (66207Hz) から 48kHz に変えるときの、通過域の落ち込みと、24kHz を超える成分の減衰
-// (出力の 48kHz で 48kHz - f に折り返す)。値は README に書いたもの。FIR を変えずにタップの数の限界を見るための試験で、
+// (出力の 48kHz で 48kHz - f に折り返す)。値は docs/midi.md に書いたもの。FIR を変えずにタップの数の限界を見るための試験で、
 // 下限は測った値より少しゆるくしてある
 void testFilter() {
     const double srcRate = 24000000.0 / 725 * 2;
@@ -608,7 +608,7 @@ void testRealLongRun(const RomFiles& roms, uint64_t start, bool async) {
 }
 
 // 非同期で、midiByte() / midiReset() / mixFrame() を呼ぶスレッドと、pump() を呼ぶスレッドを分ける。今のベアメタル版は
-// どちらもコア 3 で呼ぶが、pump() を別のコアに移したとき (README の案) にも同じ音になることを確かめる。mixFrame() を呼ぶ側は、pump() が作ったフレームの数 (試験の側で数える) を見て待つので、
+// どちらもコア 3 で呼ぶが、pump() を別のコアに移したとき (docs/midi.md の案) にも同じ音になることを確かめる。mixFrame() を呼ぶ側は、pump() が作ったフレームの数 (試験の側で数える) を見て待つので、
 // 間に合わないことはなく、同期で作った音より ASYNC_DELAY 遅れるほかは同じになる。-fsanitize=thread のビルドで
 // 走らせると、2 つのスレッドの間のデータの競合を調べられる。スレッドの中では確保しない (operator new の数を数えているため)
 struct PumpThread {

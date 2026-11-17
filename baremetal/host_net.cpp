@@ -247,7 +247,7 @@ void CSerialTask::Serve(CSocket* c) {
         // Circle の受信のキューが伸び続ける。また、キューを空にしないと、相手が切れたこと (CLOSE_WAIT) が
         // Receive() の負の値で分からない (GetStatus() の bConnected は CLOSE_WAIT でも 1)。
         // リングに入らない分は捨てる。X68000 が受信を止めているときだけでなく、RTS が上がっていても、X68000 は
-        // ボーレートの速さでしか読まないので、相手が一度に 64KB を超えて送れば超えた分を捨てる (README の RS-232C の節。
+        // ボーレートの速さでしか読まないので、相手が一度に 64KB を超えて送れば超えた分を捨てる (docs/expansion.md の RS-232C の節。
         // 相手はボーレートより速く送らないか、一度に 64KB までにする)
         const int n = platform::pumpRx(*m_pLink, m_Rx, sizeof m_Rx,
                                        [c](u8* buf, unsigned size) { return c->Receive(buf, size, MSG_DONTWAIT); }, dropped);

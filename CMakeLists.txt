@@ -557,7 +557,7 @@ set_tests_properties(x68k_iocs_wait060 PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME x68k_iocs_wait060_75mhz COMMAND iocs_wait060 --ipl ${X68030_IPLROM} --min 950 --max 1050 --clock 75)
 set_tests_properties(x68k_iocs_wait060_75mhz PROPERTIES SKIP_RETURN_CODE 77)
 # 68060 で動く IPL ROM 1.6 は書き換えないので、1 単位は 1ms にならない (待ちのループの間はデータキャッシュが無効で、
-# 1 周に本体の RAM を 9 回読む。50MHz で 1000 単位 約 2171ms。README の「68060 のサイクル数」と #123)。
+# 1 周に本体の RAM を 9 回読む。50MHz で 1000 単位 約 2171ms。docs/060turbo.md の「68060 のサイクル数」と #123)。
 # 本体のメモリの読み出しの時間 (Cpu020 の MISS060_MAIN) や、ループの間の CACR ($20808000。EDC が 0 でデータキャッシュは無効) が変わったら
 # 分かるように、長さの範囲と CACR を確かめる。ROM がなければ飛ばす
 set(IPLROM060 "$ENV{HOME}/.cache/pix68k/rom/IPLROM060.DAT" CACHE FILEPATH "68060 で動く IPL ROM (IPL ROM 1.6)")

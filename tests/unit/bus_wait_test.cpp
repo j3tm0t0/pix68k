@@ -378,7 +378,7 @@ void testSync060Regions() {
     delete m;
 }
 
-// si.r の 2 つのループ。実機の 060turbo (50MHz) は processor 13348%、system 177.82% (README の表)。
+// si.r の 2 つのループ。実機の 060turbo (50MHz) は processor 13348%、system 177.82% (docs/060turbo.md の表)。
 // system は RTC の秒 ($E8A001) を読むが、ここでは値の変わらない RTC のモードのレジスタ ($E8A01B) を読む
 void testSiLoops060() {
     printf("060turbo: the si.r system loop takes 1.6 us, the processor loop 1 cycle\n");
@@ -443,7 +443,7 @@ void testTimeShiftKeepsPhase() {
 }
 
 // X68030 (68030 25MHz) にも同じ待ちを入れる。区切りは 40 サイクルごと (1.6 マイクロ秒)。
-// 実機の X68030 の si.r は、キャッシュの有効 / 無効によらず system 177.82% / 177.81% (README の表)
+// 実機の X68030 の si.r は、キャッシュの有効 / 無効によらず system 177.82% / 177.81% (docs/060turbo.md の表)
 void testSync030() {
     printf("X68030: I/O accesses end on the 1.6 us strobe (40 cycles)\n");
     Opt060 o30;
