@@ -49,12 +49,15 @@ struct TestBus : x68k::Dmac::Host {
     int done[4] = {}, errors[4] = {};
     uint32_t log[16];
     int logLen = 0;
+    uint32_t countFrom = 0, countTo = 0; // この範囲 (チェーンの表) を読んだバイト数を rangeReads に数える
+    uint32_t rangeReads = 0;
     TestBus(x68k::Fdc* f) : fdc(f) { clear(); }
     void clear() {
         memset(mem, 0, sizeof mem);
         busErrorAt = 0xffffffff;
         for (int i = 0; i < 4; i++) done[i] = errors[i] = 0;
         logLen = 0;
+        countFrom = countTo = rangeReads = 0;
     }
     static bool user(int fc) { return fc == m68k::FC_USER_DATA || fc == m68k::FC_USER_PROG; }
     void record(uint32_t a, uint8_t v) {
@@ -64,6 +67,7 @@ struct TestBus : x68k::Dmac::Host {
         if (a == busErrorAt) return false;
         if (a < sizeof mem) {
             if (user(fc) && a >= 0x8000) return false;
+            if (a >= countFrom && a < countTo) rangeReads++;
             v = mem[a];
             return true;
         }
@@ -776,6 +780,71 @@ void testDmaReentry() {
     CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x80); // COC、エラーなし、ACT なし
     CHECK_EQ(m.read8(b + 0x0a, fc), 0);
     CHECK_EQ(m.read8(b + 0x0b, fc), 0);
+}
+
+// オートリクエストの最大速度 (OCR の REQG = 01) の転送は、終わるまで DMAC がバスを持ち、CPU は止まる
+// (Inside X68000 の PDF の 36、38、53 ページ)。開始 (CCR) を書いた命令の次の命令では、もう転送が終わっている。
+// グラディウス II は、PCG とスプライトの表をチャネル 2 のこの転送で送り、開始を書いた直後に次の転送のレジスタを
+// 書く (終わりを待たない)。開始のときに転送しないと、MAR / DAR / MTC が次の転送の値で上書きされ、別のデータが送られる。
+// レジスタを書く順はゲームと同じ: OCR、MAR、SCR、DAR、CSR、MTC、CCR
+void testAutoRequestMaxRateHoldsBus() {
+    printf("dmac auto request at maximum rate finishes before the next instruction\n");
+    static x68k::Machine m;
+    static uint8_t ipl[x68k::Machine::IPL_SIZE];
+    memset(ipl, 0xff, sizeof ipl);
+    uint8_t* r = ipl + 0x10000;
+    const uint8_t vec[] = {0x00, 0x00, 0x20, 0x00, 0x00, 0xff, 0x00, 0x10}; // SSP、PC
+    memcpy(r, vec, 8);
+    const uint8_t code[] = {
+        0x41, 0xf9, 0x00, 0xe8, 0x40, 0x80, // $FF0010 lea $e84080,a0 (チャネル 2)
+        0x47, 0xf8, 0x30, 0x00,             // lea $3000,a3 (1 つ目の転送元)
+        0x49, 0xf8, 0x40, 0x00,             // lea $4000,a4 (1 つ目の転送先)
+        0x74, 0x10,                         // moveq #16,d2 (ワード数)
+        0x61, 0x00, 0x00, 0x1a,             // bsr go
+        0x47, 0xf8, 0x31, 0x00,             // lea $3100,a3 (2 つ目の転送元)
+        0x49, 0xf8, 0x41, 0x00,             // lea $4100,a4 (2 つ目の転送先)
+        0x61, 0x00, 0x00, 0x0e,             // bsr go (1 つ目の終わりを待たずに、続けて開始する)
+        0x31, 0xfc, 0xff, 0xff, 0x31, 0x00, // move.w #$ffff,$3100 (開始の直後に転送元を書き換える)
+        0x11, 0xd0, 0x50, 0x00,             // move.b (a0),$5000 (開始の直後の CSR)
+        0x60, 0xfe,                         // bra.s *
+        0x11, 0x7c, 0x00, 0x11, 0x00, 0x05, // go: move.b #$11,5(a0) OCR: メモリ → デバイス、ワード、オートリクエスト最大
+        0x21, 0x4b, 0x00, 0x0c,             // move.l a3,$c(a0)  MAR
+        0x11, 0x7c, 0x00, 0x05, 0x00, 0x06, // move.b #5,6(a0)   SCR: メモリ側もデバイス側も増やす
+        0x21, 0x4c, 0x00, 0x14,             // move.l a4,$14(a0) DAR
+        0x10, 0xbc, 0x00, 0xff,             // move.b #$ff,(a0)  CSR を消す
+        0x31, 0x42, 0x00, 0x0a,             // move.w d2,$a(a0)  MTC
+        0x11, 0x7c, 0x00, 0x88, 0x00, 0x07, // move.b #$88,7(a0) CCR: 開始、割り込み許可
+        0x4e, 0x75,                         // rts
+    };
+    memcpy(r + 0x10, code, sizeof code);
+    CHECK_EQ(m.setIplRom(ipl, sizeof ipl), true);
+    m.powerOn();
+    const int fc = m68k::FC_SUPER_DATA;
+    for (uint32_t i = 0; i < 32; i++) {
+        m.write8(0x3000 + i, (uint8_t)(0x10 + i), fc);
+        m.write8(0x3100 + i, (uint8_t)(0x80 + i), fc);
+        m.write8(0x4000 + i, 0xee, fc);
+        m.write8(0x4100 + i, 0xee, fc);
+    }
+    m.write8(0x5000, 0xff, fc);
+    const uint32_t b = 0xe84080;
+    m.write8(b + 0x04, 0x08, fc);       // DCR: 16 ビットのポート
+    m.write8(b + 0x29, (uint8_t)fc, fc); // MFC
+    m.write8(b + 0x31, (uint8_t)fc, fc); // DFC
+    m.run(2000);
+    bool ok;
+    int first = 0, second = 0;
+    for (uint32_t i = 0; i < 32; i++) {
+        first += m.peek8(0x4000 + i, ok) == (uint8_t)(0x10 + i);
+        second += m.peek8(0x4100 + i, ok) == (uint8_t)(0x80 + i); // 書き換える前の転送元の中身
+    }
+    CHECK_EQ(first, 32);
+    CHECK_EQ(second, 32);
+    CHECK_EQ(m.peek8(0x5000, ok) & 0x98, 0x80); // 開始の次の命令で、COC が立ち、ACT は消えている
+    CHECK_EQ(m.read8(b + 0x0a, fc), 0);         // MTC
+    CHECK_EQ(m.read8(b + 0x0b, fc), 0);
+    CHECK_EQ(m.read8(b + 0x0f, fc), 0x20);      // MAR = $3120
+    CHECK_EQ(m.read8(b + 0x17, fc), 0x20);      // DAR = $4120
 }
 
 // メモリからメモリ / ポートへ 1 ブロック転送するチャネル 2 の設定
@@ -1496,6 +1565,281 @@ void testLinkChainRing() {
     CHECK_EQ(dmacRead32(dmac, 1, 0x0c), 0x100); // 表は開始のときに読む
     CHECK_EQ(dmacRead16(dmac, 1, 0x0a), 3);
     CHECK_EQ(dmacRead32(dmac, 1, 0x1c), 0x40);
+}
+
+void machineWrite32(x68k::Machine& m, uint32_t addr, uint32_t v, int fc) {
+    m.write16(addr, (uint16_t)(v >> 16), fc);
+    m.write16(addr + 2, (uint16_t)v, fc);
+}
+
+// 開始を書くプログラムを IPL ROM に置いて動かす。ocr は OCR の値 (メモリ → デバイス、バイト、チェーン、REQG = 01)、
+// 表は $3000、転送先は dar (既定は $200000)。開始の次の命令で CSR を $5000、MTC を $5002 に写し、その次の命令で poke を書く
+x68k::Machine* runChainStart(int cpu, uint8_t ocr, uint8_t scr, uint32_t poke, uint32_t dar = 0x200000) {
+    x68k::Config cfg;
+    CHECK_EQ(cfg.setCpu(cpu), true);
+    x68k::Machine* m = new x68k::Machine(cfg);
+    static uint8_t ipl[x68k::Machine::IPL_SIZE];
+    memset(ipl, 0xff, sizeof ipl);
+    uint8_t* r = ipl + 0x10000;
+    const uint8_t vec[] = {0x00, 0x00, 0x20, 0x00, 0x00, 0xff, 0x00, 0x10}; // SSP、PC
+    memcpy(r, vec, 8);
+    const uint8_t code[] = {
+        0x41, 0xf9, 0x00, 0xe8, 0x40, 0x80,             // $FF0010 lea $e84080,a0 (チャネル 2)
+        0x10, 0xbc, 0x00, 0xff,                         // move.b #$ff,(a0)        CSR を消す
+        0x11, 0x7c, 0x00, ocr, 0x00, 0x05,              // move.b #ocr,5(a0)       OCR
+        0x11, 0x7c, 0x00, scr, 0x00, 0x06,              // move.b #scr,6(a0)       SCR
+        0x21, 0x7c, (uint8_t)(dar >> 24), (uint8_t)(dar >> 16), (uint8_t)(dar >> 8), (uint8_t)dar, 0x00,
+        0x14,                                           // move.l #dar,$14(a0)     DAR
+        0x21, 0x7c, 0x00, 0x00, 0x30, 0x00, 0x00, 0x1c, // move.l #$3000,$1c(a0)   BAR
+        0x31, 0x7c, 0x00, 0x02, 0x00, 0x1a,             // move.w #2,$1a(a0)       BTC
+        0x11, 0x7c, 0x00, 0x80, 0x00, 0x07,             // move.b #$80,7(a0)       CCR: 開始
+        0x11, 0xd0, 0x50, 0x00,                         // move.b (a0),$5000       開始の直後の CSR
+        0x31, 0xe8, 0x00, 0x0a, 0x50, 0x02,             // move.w $a(a0),$5002     開始の直後の MTC
+        0x13, 0xfc, 0x00, 0x5a, (uint8_t)(poke >> 24), (uint8_t)(poke >> 16), (uint8_t)(poke >> 8),
+        (uint8_t)poke,                                  // move.b #$5a,poke        転送元を書き換える
+        0x60, 0xfe,                                     // bra.s *
+    };
+    memcpy(r + 0x10, code, sizeof code);
+    CHECK_EQ(m->setIplRom(ipl, sizeof ipl), true);
+    m->powerOn();
+    const int fc = m68k::FC_SUPER_DATA;
+    const uint32_t b = 0xe84080;
+    m->write8(b + 0x04, 0x08, fc);        // DCR: 16 ビットのポート
+    m->write8(b + 0x29, (uint8_t)fc, fc); // MFC
+    m->write8(b + 0x31, (uint8_t)fc, fc); // DFC
+    m->write8(b + 0x39, (uint8_t)fc, fc); // BFC
+    m->write8(0x5000, 0xff, fc);
+    m->write16(0x5002, 0xffff, fc);
+    return m;
+}
+
+// 終わりのあるチェーンは、65,536 オペランドを超えても開始のところで最後まで転送する (68000、68030、68060)。
+// アレイチェーンで 40,000 バイトを 2 ブロック。開始の次の命令で見る CSR は COC、MTC は 0 で、そのあとに転送元の
+// 最後のバイトを書き換えても、送られるのは書き換える前の中身
+void testAutoRequestMaxRateLongChain() {
+    printf("dmac auto request at maximum rate finishes a finite chain longer than 65536 operands\n");
+    const int fc = m68k::FC_SUPER_DATA;
+    const uint32_t src = 0x100000, dst = 0x200000, len = 40000;
+    for (int cpu : {68000, 68030, 68060}) {
+        const int before = failures;
+        x68k::Machine* m = runChainStart(cpu, 0x09, 0x05, src + 2 * len - 1);
+        for (uint32_t i = 0; i < 2 * len; i++) m->write8(src + i, (uint8_t)(i * 7 + (i >> 8) + 1), fc);
+        for (uint32_t k = 0; k < 2; k++) {
+            machineWrite32(*m, 0x3000 + 6 * k, src + k * len, fc);
+            m->write16(0x3004 + 6 * k, (uint16_t)len, fc);
+        }
+        m->run(20000);
+        bool ok;
+        uint32_t same = 0;
+        for (uint32_t i = 0; i < 2 * len; i++) same += m->peek8(dst + i, ok) == (uint8_t)(i * 7 + (i >> 8) + 1);
+        CHECK_EQ(same, 2 * len);
+        CHECK_EQ(m->peek8(0x5000, ok) & 0x98, 0x80); // COC、ACT なし、エラーなし
+        CHECK_EQ(m->peek8(0x5002, ok), 0);           // MTC
+        CHECK_EQ(m->peek8(0x5003, ok), 0);
+        CHECK_EQ(m->peek8(src + 2 * len - 1, ok), 0x5a); // 書き換えの命令まで進んでいる
+        CHECK_EQ(m->read8(0xe84080 + 0x1b, fc), 0);      // BTC
+        if (failures != before) printf("  cpu %d\n", cpu);
+        delete m;
+    }
+}
+
+// リンクチェーンの輪 (終わらない転送) は、開始のところで回し続けない。輪と分かったところで CPU に戻り、
+// 残りは周辺機器の更新のたびに少しずつ進む (実機では CPU が止まったままになる)
+void testAutoRequestMaxRateRing() {
+    printf("dmac auto request at maximum rate returns from a link chain ring\n");
+    const int fc = m68k::FC_SUPER_DATA;
+    for (int cpu : {68000, 68030}) {
+        const int before = failures;
+        x68k::Machine* m = runChainStart(cpu, 0x0d, 0x04, 0x6000);
+        // 表 A ($3000): $100000 から 3 バイト、次は B。表 B ($3010): $100100 から 2 バイト、次は A
+        machineWrite32(*m, 0x3000, 0x100000, fc);
+        m->write16(0x3004, 3, fc);
+        machineWrite32(*m, 0x3006, 0x3010, fc);
+        machineWrite32(*m, 0x3010, 0x100100, fc);
+        m->write16(0x3014, 2, fc);
+        machineWrite32(*m, 0x3016, 0x3000, fc);
+        m->run(20000);
+        bool ok;
+        CHECK_EQ(m->peek8(0x5000, ok) & 0x98, 0x08); // ACT だけ
+        CHECK_EQ(m->peek8(0x6000, ok), 0x5a);        // CPU は先へ進んでいる
+        CHECK_EQ(m->read8(0xe84080, fc) & 0x98, 0x08);
+        m->write8(0xe84080 + 0x07, 0x10, fc); // ソフトウェアアボートで止まる
+        CHECK_EQ(m->read8(0xe84080, fc) & 0x98, 0x90);
+        if (failures != before) printf("  cpu %d\n", cpu);
+        delete m;
+    }
+    // Dmac だけで: 自分を指す表、2 つの輪、輪に入る前に表が 3 つある場合。どれも戻り、チャネルは動いたまま
+    for (int kind = 0; kind < 3; kind++) {
+        const int before = failures;
+        x68k::Fdc fdc;
+        fdc.reset();
+        x68k::Dmac dmac;
+        dmac.reset();
+        static TestBus bus(&fdc);
+        bus.clear();
+        if (kind == 0) {
+            putLink(bus.mem + 0x40, 0x100, 3, 0x40);
+        } else if (kind == 1) {
+            putLink(bus.mem + 0x40, 0x100, 3, 0x50);
+            putLink(bus.mem + 0x50, 0x200, 2, 0x40);
+        } else {
+            putLink(bus.mem + 0x40, 0x100, 1, 0x50);
+            putLink(bus.mem + 0x50, 0x100, 1, 0x60);
+            putLink(bus.mem + 0x60, 0x100, 1, 0x70);
+            putLink(bus.mem + 0x70, 0x100, 2, 0x80);
+            putLink(bus.mem + 0x80, 0x100, 2, 0x90);
+            putLink(bus.mem + 0x90, 0x100, 2, 0x70);
+        }
+        const int ch = 2;
+        dmac.write(ch * 64 + 0x00, 0xff);
+        dmac.write(ch * 64 + 0x04, 0x08);
+        dmac.write(ch * 64 + 0x05, 0x0d);
+        dmac.write(ch * 64 + 0x06, 0x04);
+        dmacWrite32(dmac, ch, 0x14, 0xf00000);
+        dmacWrite32(dmac, ch, 0x1c, 0x40);
+        dmac.write(ch * 64 + 0x07, 0x80);
+        bus.countFrom = 0x40; // 表は $40-$99、転送元は $100 から
+        bus.countTo = 0xa0;
+        dmac.runBusHolders(bus);
+        CHECK_EQ(dmac.active(ch), true);
+        CHECK_EQ(dmac.holdsBus(ch), true);
+        // 輪を見つけて戻っている: 読んだ表は数個 (1 つ 10 バイト)。65,536 オペランドの上限で戻る作りなら、
+        // 表を 2 万個以上読む
+        const uint32_t tables = bus.rangeReads / 10;
+        CHECK_EQ(bus.rangeReads % 10, 0u);
+        CHECK_EQ(tables >= 2 && tables <= 16, true);
+        if (failures != before) printf("  tables %u\n", (unsigned)tables);
+        CHECK_EQ(dmacRead16(dmac, ch, 0x0a) != 0, true); // 次の表は読んであり、run() が続きを進められる
+        CHECK_EQ(bus.done[ch], 0);
+        CHECK_EQ(bus.errors[ch], 0);
+        dmac.run(bus, 1);
+        CHECK_EQ(dmac.active(ch), true);
+        if (failures != before) printf("  kind %d\n", kind);
+    }
+    // 輪でないリンクチェーンは、表が多くても最後まで転送する (同じ転送元を指す表が 300 個)
+    {
+        x68k::Fdc fdc;
+        fdc.reset();
+        x68k::Dmac dmac;
+        dmac.reset();
+        static TestBus bus(&fdc);
+        bus.clear();
+        for (uint32_t k = 0; k < 300; k++) putLink(bus.mem + 0x1000 + 16 * k, 0x100, 2, k == 299 ? 0 : 0x1000 + 16 * (k + 1));
+        const int ch = 2;
+        dmac.write(ch * 64 + 0x00, 0xff);
+        dmac.write(ch * 64 + 0x04, 0x08);
+        dmac.write(ch * 64 + 0x05, 0x0d);
+        dmac.write(ch * 64 + 0x06, 0x04);
+        dmacWrite32(dmac, ch, 0x14, 0xf00000);
+        dmacWrite32(dmac, ch, 0x1c, 0x1000);
+        dmac.write(ch * 64 + 0x07, 0x80);
+        dmac.runBusHolders(bus);
+        CHECK_EQ(dmac.active(ch), false);
+        CHECK_EQ(dmac.read(ch * 64 + 0x00) & 0x98, 0x80);
+        CHECK_EQ(bus.done[ch], 1);
+    }
+}
+
+// 転送が DMAC 自身のレジスタを書いて終わらなくなる場合も、開始のところで回し続けない (実機では CPU が止まったままに
+// なるが、ここでは CPU に戻り、ソフトウェアアボートやリセットが効く)。
+// kind 0: DAR が自分の MTC の下位バイト ($E8408B)。転送元の $02 を 1 オペランドごとに書くので、MTC が 0 にならない
+// kind 1: DAR が自分の CCR ($E84087)。転送元の $C0 (STR と CNT) を書くので、ブロックが終わるたびにコンティニューが続く
+void testAutoRequestMaxRateSelfWrite() {
+    printf("dmac auto request at maximum rate returns when the transfer writes the dmac itself\n");
+    const int fc = m68k::FC_SUPER_DATA;
+    for (int cpu : {68000, 68030, 68060}) {
+        for (int kind = 0; kind < 2; kind++) {
+            const int before = failures;
+            x68k::Machine* m = runChainStart(cpu, 0x01, 0x00, 0x6000, kind == 0 ? 0xe8408b : 0xe84087);
+            const uint32_t b = 0xe84080;
+            const uint8_t v = kind == 0 ? 0x02 : 0xc0;
+            m->write8(0x100000, v, fc);
+            m->write8(0x3000, v, fc);       // コンティニューの次のブロック (BAR = $3000、BTC = 2)
+            machineWrite32(*m, b + 0x0c, 0x100000, fc); // MAR
+            m->write16(b + 0x0a, 2, fc);                // MTC
+            m->run(20000);
+            bool ok;
+            CHECK_EQ(m->peek8(0x5000, ok) & 0x98, 0x08); // ACT だけ
+            CHECK_EQ(m->peek8(0x6000, ok), 0x5a);        // CPU は先へ進んでいる
+            CHECK_EQ(m->read8(b, fc) & 0x98, 0x08);
+            // 動いているチャネルのレジスタを CPU が書いても (ここでも runBusHolders() を通る) 戻る
+            m->write8(b + 0x25, 0x40, fc);
+            CHECK_EQ(m->read8(b, fc) & 0x98, 0x08);
+            m->write8(b + 0x07, 0x10, fc); // ソフトウェアアボートで止まる
+            CHECK_EQ(m->read8(b, fc) & 0x98, 0x90);
+            if (failures != before) printf("  cpu %d kind %d\n", cpu, kind);
+            delete m;
+        }
+    }
+}
+
+// 開始のところで最後まで転送するのは REQG = 01 だけ。REQG = 00 (オートリクエストの限定速度)、10 (外部要求)、
+// 11 (最初だけオートリクエスト) は、開始を書いても転送しない。HLT で止めてある REQG = 01 も転送せず、HLT を
+// 外したところで最後まで転送する。CPU を動かさずにレジスタを書くので、周辺機器の更新は挟まらない
+void testAutoRequestMaxRateOnly() {
+    printf("dmac start does not transfer synchronously unless reqg = 01 and not halted\n");
+    static x68k::Machine m;
+    static uint8_t ipl[x68k::Machine::IPL_SIZE];
+    memset(ipl, 0xff, sizeof ipl);
+    const uint8_t vec[] = {0x00, 0x00, 0x20, 0x00, 0x00, 0xff, 0x00, 0x10, 0x60, 0xfe}; // SSP、PC、bra.s *
+    memcpy(ipl + 0x10000, vec, 8);
+    memcpy(ipl + 0x10010, vec + 8, 2);
+    CHECK_EQ(m.setIplRom(ipl, sizeof ipl), true);
+    m.powerOn();
+    const int fc = m68k::FC_SUPER_DATA;
+    const uint32_t b = 0xe84080;
+    auto start = [&](uint8_t reqg, uint8_t ccr) {
+        for (uint32_t i = 0; i < 16; i++) {
+            m.write8(0x3000 + i, (uint8_t)(0x10 + i), fc);
+            m.write8(0x4000 + i, 0xee, fc);
+        }
+        m.write8(b + 0x07, 0x10, fc); // 前の転送が残っていれば止める
+        m.write8(b + 0x00, 0xff, fc);
+        m.write8(b + 0x04, 0x08, fc);
+        m.write8(b + 0x05, reqg, fc); // OCR: メモリ → デバイス、バイト、チェーンなし
+        m.write8(b + 0x06, 0x05, fc);
+        m.write8(b + 0x29, (uint8_t)fc, fc);
+        m.write8(b + 0x31, (uint8_t)fc, fc);
+        machineWrite32(m, b + 0x0c, 0x3000, fc);
+        machineWrite32(m, b + 0x14, 0x4000, fc);
+        m.write16(b + 0x0a, 16, fc);
+        m.write8(b + 0x07, ccr, fc);
+    };
+    auto moved = [&] {
+        bool ok;
+        int n = 0;
+        for (uint32_t i = 0; i < 16; i++) n += m.peek8(0x4000 + i, ok) == (uint8_t)(0x10 + i);
+        return n;
+    };
+    for (uint8_t reqg : {0, 2, 3}) {
+        const int before = failures;
+        start(reqg, 0x80);
+        CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x08); // ACT だけ
+        CHECK_EQ(m.read8(b + 0x0b, fc), 16);
+        CHECK_EQ(moved(), 0);
+        if (failures != before) printf("  reqg %d\n", reqg);
+    }
+    // REQG = 00 は、時間が進めば終わる
+    start(0, 0x80);
+    m.run(20000);
+    CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x80);
+    CHECK_EQ(moved(), 16);
+    // REQG = 01
+    start(1, 0x80);
+    CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x80);
+    CHECK_EQ(moved(), 16);
+    // REQG = 01 を HLT 付きで開始: 転送しない。時間が進んでも止まったまま
+    start(1, 0xa0);
+    CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x08);
+    CHECK_EQ(moved(), 0);
+    m.run(20000);
+    CHECK_EQ(m.read8(b + 0x0b, fc), 16);
+    CHECK_EQ(moved(), 0);
+    // HLT を外したところで最後まで転送する
+    m.write8(b + 0x07, 0x80, fc);
+    CHECK_EQ(m.read8(b + 0x00, fc) & 0x98, 0x80);
+    CHECK_EQ(m.read8(b + 0x0b, fc), 0);
+    CHECK_EQ(moved(), 16);
 }
 
 // チェーンの転送中に読む BAR と BTC。HD63450 のデータシートの Array Chaining の節と MC68450 のデータシートの 5.5.2:
@@ -2398,6 +2742,7 @@ int main() {
     testD88Header2a0();
     testDimFlags();
     testDmaReentry();
+    testAutoRequestMaxRateHoldsBus();
     testWordTransfer();
     testBusErrorDuringWrite();
     testSwapDuringWrite();
@@ -2411,6 +2756,10 @@ int main() {
     testD88Header2a0WithoutTrack0();
     testDmacStartModes();
     testLinkChainRing();
+    testAutoRequestMaxRateLongChain();
+    testAutoRequestMaxRateRing();
+    testAutoRequestMaxRateSelfWrite();
+    testAutoRequestMaxRateOnly();
     testChainRegisters();
     testWriteId();
     testChainStateVersion();

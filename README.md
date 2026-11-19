@@ -74,7 +74,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 - SD カードがないか `/pix68k` がないときは、USB メモリの最初の FAT のパーティションの `/pix68k/` を使う
   (Linux を入れた USB メモリなら `/boot/firmware/pix68k/`)。カーネルを LAN から起動して、SD カードを挿さずに使うこともできる
 - Raspberry Pi 5 では、ファンのコネクタのファンを温度に合わせて回す
-- 画面の右の余白に、fps、速さ、温度などを出す (`osd=`)
+- 画面の右上に、fps、速さ、温度、IP アドレスなどを出す (`osd=`)
 
 詳しくは [baremetal.md](docs/baremetal.md) を参照。
 
@@ -99,6 +99,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `max_speed` | `on`、`off` | `off` | 最高速モード。実時間に間に合う範囲で CPU をいちばん速く動かす ([060turbo.md](docs/060turbo.md)) | ○ |
 | `speed060` | `5`〜`3200` | `100` | 060turbo の命令の速さ (選んだクロックの実機の 68060 を 100 とした %) | ○ |
 | `max_speed_limit` | `0`〜`3200` | `0` (上限なし) | 060turbo の最高速モードの上限 (`speed060` と同じ単位) | ○ |
+| `bus_sync_sprite` | `on`、`off` | `off` | X68030 と 060turbo で、スプライト ($EB0000-$EBFFFF) の読み書きも I/O と同じ 1.6 マイクロ秒ごとの区切りにそろえる。測っていない仮定の値で、`on` にすると Outrun (CBX68) のスプライトが崩れる ([060turbo.md](docs/060turbo.md)) | ○ |
 | `sram_memsize` | `fix`、`keep` | `fix` | `fix` は起動のたびに SRAM のメインメモリの容量を `ram` に合わせる | ○ |
 | `scsi_ex` | `on`、`off` | `off` | 外付け SCSI ボード ([disks-and-scsi.md](docs/disks-and-scsi.md)) | ○ |
 | `scsi_ex_rom` | ファイル名 | `SCSIEXROM.DAT` | 外付け SCSI ボードの ROM | ○ |
@@ -129,12 +130,100 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `syslog` | `アドレス:ポート` | なし | ログを UDP の syslog で送る先 (ポートを省くと 514) | - |
 | `keyboard` | `auto`、`usb`、`pi400us`、`pi400jp` | `auto` | キーボードの種類。`auto` は VID:PID から決める ([keyboard.md](docs/keyboard.md)) | - |
 | `hat` | `auto`、`0`、`1` | `auto` | ゲームパッドのハットの値の範囲を 0-7 / 1-8 に固定する | - |
-| `scale` | `auto`、`off` | `auto` | 画面を整数倍に拡大する ([baremetal.md](docs/baremetal.md)) | - |
-| `scanline` | `on`、`off` | `off` | 縦 2 倍以上に拡大したとき、ブラウン管のスキャンラインのように行を暗くする | - |
-| `osd` | `on`、`fps`、`off` | `on` | 画面の右の余白に fps、速さ、温度などを出す。`fps` は余白がなければ画面に重ねる | ○ |
+| `video_scale` | `off`、`integer`、`aspect`、`full` | ベアメタル版 `integer`、ホスト版 `aspect` | 画面の拡大の仕方 (下の「画面の出し方」) | ○ |
+| `video_filter` | `scanline`、`curve`、`mask`、`cz-600de`、`cz-600db` を `,` で並べる。`none` | `none` | ブラウン管のように見せる効果と、モニタの枠 (同上) | ○ |
+| `osd` | `on`、`fps`、`off` | `on` | 画面の右上に fps、速さ、温度、IP アドレスなどを出す。ベアメタル版は余白が足りなければ `on` でも画面に重ねる。ホスト版は `fps` のときだけ重ねる | ○ |
 | `render_core`、`sound_core` | `on`、`off` | `on` | `off` で画面 / 音の合成もコア 1 で行う | - |
+| `autotype` | 文字列 | なし | X68000 を動かし始めて `autotype_wait` 秒たったら打つ文字列 (`POST /type` と同じエスケープ。下の「起動の組み合わせ」) | ○ |
+| `autotype_wait` | `0`〜`600` | `10` | `autotype` を打つまでの秒数 (ホスト版は 1 秒を 55 フレームと数える) | ○ |
+| `profile_wait` | `0`〜`60` | `5` | 起動の組み合わせのメニューで待つ秒数。`0` ならメニューを出さずに前回のものにする (`pix68k.cfg` に書く) | - |
 
 キーの表は `src/platform/settings.h` の `kSettingKeys` にあり、ベアメタル版、ホスト版、設定メニューが同じ表を使う。
+
+#### 画面の出し方 (`video_scale=`、`video_filter=`)
+
+`video_scale=` で X68000 の画面の拡大の仕方を、`video_filter=` でブラウン管のモニタのように見せる効果を決める。2 つは自由に組み合わせられる (Raspberry Pi 3 は下の制限がある)。
+
+| `video_scale=` | 拡大の仕方 |
+|---|---|
+| `off` | 拡大しない (1 倍で真ん中に出す) |
+| `integer` | 整数倍 (ベアメタル版の既定)。768x512 の枠の 1 倍か 2 倍に入る最大の倍率 (1920x1080 なら、どの画面モードも 1536x1024 くらい) |
+| `aspect` | 表示の高さいっぱいで、横は X68000 のモニタと同じ 4:3 (1920x1080 なら 1440x1080)。どの画面モードも同じ枠 (ホスト版の既定) |
+| `full` | 表示いっぱいに引き伸ばす (1920x1080 なら 1920x1080) |
+
+| `video_filter=` に書く名前 | 掛けるもの |
+|---|---|
+| `scanline` | スキャンライン (元の 1 行から作る表示の行のうち、最後の 1 行を半分の明るさにする。縦 2 倍以上に拡大したときだけ) |
+| `curve` | たる型のゆがみ (四隅が内側に寄り、外は黒) と、四隅を暗くする |
+| `mask` | アパーチャーグリル (横 3 画素ごとの R、G、B の縦じま) と、横の少しのにじみ |
+| `cz-600de` | モニタの枠 (グレー)。下の「モニタの枠」 |
+| `cz-600db` | モニタの枠 (黒) |
+
+`video_filter=scanline,curve,mask` のように `,` で並べる (順番は問わない)。`none` か空なら効果なし (既定)。知らない名前は飛ばして、知っている名前だけを使い、ログに `video_filter=scanline,foo: unknown names ignored` のように出す (後の版で名前が増えても、そのファイルを前の版で読めるように)。
+X68000 の画面の中身は変えないので、`/screen.ppm`、`--screenshot`、ステートには入らない。右上の数字 (`osd=`) と左上のメッセージには掛けない。右上の数字と左上のメッセージは、`video_scale=` の枠の外の余白に置く (余白が足りないとき、ベアメタル版は X68000 の画面に重ねる。`full` には余白がない)。
+
+`aspect` と `full` の高さは、ベアメタル版では 1200 ラインまで (3840x2160 では `aspect` が 1600x1200、`full` が 2133x1200)。枠が元の画面より小さくなるとき (`pix68k_gpu_scale=2` でフレームバッファが 960x540 のときの 768 ドットの画面など) と、`pix68k_gpu_scale` の縦と横の倍率が違うときは、整数倍にする。
+整数倍でない枠では横の倍率も整数にならない (768 ドットを 1440 にすると 1.875 倍) ので、`mask` (にじみ) がなければ、元の 1 ドットが表示の 1 ドットと 2 ドットに分かれる。スキャンラインは整数でない倍率でも暗い行が元の 1 行に 1 行だけなので、縞 (モアレ) は出ない。
+
+ホスト版も同じ枠でウィンドウの中に出す。既定は `aspect` で、ウィンドウに入る最大の 4:3 にする (既定の 768x512 のウィンドウなら 682x512)。`aspect` と `full` は、ウィンドウが X68000 の画面より小さくても縮めて出し、切らない (`integer` と `off` は、ベアメタル版と同じく真ん中を切り出す)。前の版のホスト版は、ウィンドウに入る最大の 3:2 に引き伸ばしていた (768x512 のウィンドウなら 768x512)。ウィンドウいっぱいに出すなら `full` にする。
+
+設定メニューでは Display のページ (Scale、Scanlines、Curve、Mask) で切り替え、すぐに見た目が変わる。主のページには `aspect + scanline,curve` のようにまとめて出す。
+Raspberry Pi 3 (Zero 2 W、3A+ も同じ) では、`curve` と、`full` と `mask` の組は選べない (CPU で作るので、1 フレームの時間に収まらない)。`pix68k.cfg` に書いてあれば、`curve`、`mask` の順に外して選べる組み合わせにし、ログに出す。Raspberry Pi 4 / 5 ではどれも選べる。
+作り方と、かかる時間は [baremetal.md](docs/baremetal.md) の「画面の出し方」を参照。
+
+##### モニタの枠 (`cz-600de`、`cz-600db`)
+
+`video_filter=` に `cz-600de` (グレー) か `cz-600db` (黒) を足すと、画面の周りにブラウン管のモニタの枠の絵を出し、X68000 の画面をそのガラスの部分 (1920x1080 の中の 1160x870、4:3) に写す。ベアメタル版だけで、ホスト版はログに `video_filter=cz-600de: the bezel is not supported by the host version; ignored` と出して枠なしで出す (設定は消さない)。
+
+- 枠の絵は起動したドライブ (SD カード、NVMe、USB) の `/pix68k/bezel-cz-600de.bin` と `bezel-cz-600db.bin`。配る zip の `pix68k/` に入っている (自分で作るなら `tools/bezel_cz600d.py` で PNG を描き、`tools/bezel_pack.py` で .bin にする。どちらも Python 3、numpy、Pillow が要る)。
+- 2 つは同時に使えない。両方書くと、あとに書いたほうを使い、ログに `video_filter=cz-600de,cz-600db: only one bezel can be used; using the last one` と出す。
+- 枠を使うと、`video_scale=` の値によらずガラスの部分に写す。`scanline`、`curve`、`mask` は、ガラスの中の絵に掛かる。`curve` がなくても枠は出せる。
+- 枠を出すのは、フレームバッファが 1920x1080 で、X68000 の画面がガラスの部分 (1160x870) に入るときだけ。ほかの解像度に合わせて縮めることはしない。次のときは枠なしで `video_scale=` のとおりに写し、ログに理由を出す: 絵のファイルがない (`not found`)、壊れている、フレームバッファが 1920x1080 でない (`is 1920x1080 but the screen is ...`)、`pix68k_gpu_scale` で GPU に拡大させている (フレームバッファが 1920x1080 より小さくなるので、ふつうは大きさが違うというログになる)、画面がガラスより大きい (768x1024 など。`does not fit in the glass`)。
+- 右上の数字と左上のメッセージは、枠の外の暗い背景に出し、背景は枠の絵を半分の明るさにしたものにする (黒の半透明に見える)。
+- Raspberry Pi 3 でも使える。ただし、選べる組み合わせは枠がないときと同じ (`curve` と、`full` + `mask` は選べない)。枠を出せないときは `video_scale=` のとおりに写すため。
+- 設定メニューでは Display のページの Bezel (off、cz-600de、cz-600db) で切り替える。初めて選んだときに絵を起動したドライブから読む (8.3MB。Pi 5 で 0.5 秒ほどかかる)。絵が読めなければ選べない。設定に枠を書いてあって絵が読めないときも、枠なしで写しているので、Scale や効果は今までどおり変えられる。
+
+公開版 v0.1.0 の `scale=` と `scanline=` も読み、v0.1.0 と同じ見た目になるように読み替える。ログに `scale=off is old; use video_scale= (Save settings rewrites it)` のように出す。設定メニューの Save settings で保存すると、その行を消して `video_scale=` と `video_filter=` の行を書く (何も変えていなくても)。
+
+| v0.1.0 の書き方 | 読み替え |
+|---|---|
+| `scale=auto` | `video_scale=integer` |
+| `scale=off` | `video_scale=off` |
+| `scanline=on` | `video_filter=scanline` |
+| `scanline=off` | `video_filter=none` |
+
+- 読み替えは、ファイルを読み終えてから (起動の組み合わせなら `pix68k.cfg` と重ねて読んだあとで) 行う。同じキーどうしは、あとの行が勝つ。`scale=` と `video_scale=`、`scanline=` と `video_filter=` も同じで、あとにある行の値を使う (重ねて読むときは、組み合わせのファイルの行があと)。
+- ホスト版は、v0.1.0 のホスト版と同じく `scale=` と `scanline=` を読まない (知らせず、保存でも書き直さない)。ベアメタル版と同じ `pix68k.cfg` を使っても、ベアメタル版の見た目は変わらない。
+- 開発中の版にあった `crt=` は読み替えない。ログに `crt=full is no longer supported; use video_filter= and video_scale= (ignored)` と出して無視する (行は残すので、`video_filter=` と `video_scale=` に書き直す。`grille` は `scanline,mask`、`geom` は `video_scale=aspect` と `scanline,curve`、`full` は `video_scale=aspect` と `scanline,curve,mask`)。
+
+### 起動の組み合わせ (pix68k-<名前>.cfg)
+
+ゲームごとの構成 (OutRun、グラディウス II、Human68k など) を `/pix68k/pix68k-<名前>.cfg` に分けて置くと、起動のたびに選べる。
+名前は英数字と `-`、`_` だけ (32 字まで)。書き方は `pix68k.cfg` と同じで、1 行目が `#` で始まれば、その残りをメニューに出す題にする。
+
+```
+# グラディウス II
+fd0 = GRADIUS2.XDF
+clock = 10
+autotype = gr2\n
+autotype_wait = 15
+```
+
+- **起動時のメニュー**: 組み合わせが 1 つでもあれば、起動したときに HDMI に一覧を出す。先頭は `pix68k.cfg` (組み合わせなし)。
+  ↑↓ (ゲームパッドは上下) で選び、Enter (ゲームパッドは A / B) で決める。`profile_wait=` 秒 (既定 5) 何も押さなければ、前回選んだものになる。
+  何か押すと待つのをやめる (Shift などの修飾キーだけと、ゲームパッドの左右では止まらない。起動したときから押したままのゲームパッドのボタンも数えない)。組み合わせが 1 つもなければメニューは出さず、今までどおり `pix68k.cfg` で起動する。
+  メニューを出すときは、その分 (`profile_wait=` 秒ほど) 起動が遅くなる。キーボードとゲームパッドのために USB の装置を X68000 を動かす前に探し、探し終えてから少なくとも 2 秒は待つ
+- **pix68k.cfg との重ね方**: 組み合わせを選んだときは、`pix68k.cfg` からは共通の項目 (`net`、`net_*`、`syslog`、`keyboard`、`hat`、
+  `video_filter`、`video_scale`、`osd`、`render_core`、`sound_core`、`midi_uart`、`midi_uart_family`、`write_back`、`profile_wait`。前の `scale`、`scanline`、`crt` も) だけを受け継ぎ、
+  X68000 の構成 (CPU、メモリ、ディスク、拡張ボード、MIDI、`autotype`) は組み合わせのファイルだけから読む。書いていない項目は既定の値になる。
+  `pix68k.cfg` の `fd0=` などが組み合わせに混ざらないようにするためで、`pix68k.cfg` に写して使っていた控えのファイルは、そのまま置けば写したときと同じ構成になる。
+  組み合わせのファイルに共通の項目を書けば、そちらを使う
+- **前回の選択**は `/pix68k/profile.sel` に名前を 1 行で書いて覚える。前と違うものを選んだときと、HTTP で頼まれたときだけ書く
+- **autotype**: `autotype=` の文字列を、X68000 を動かし始めて `autotype_wait=` 秒 (既定 10) たったら打つ。書き方は HTTP の `POST /type` と同じ
+  (`\n` は Enter、`\e` は ESC。`#` は注釈になるので書けない)。`pix68k.cfg` に書けば、組み合わせなしで起動したときに打つ
+- **HTTP**: `POST /reboot?profile=<名前>` で、`pix68k.cfg` を書き換えずにその組み合わせで再起動する (メニューは出さない)。[network-api.md](docs/network-api.md)
+- **設定メニューの「Save settings」**は、組み合わせで動いているときは、共通の項目を `pix68k.cfg` に、そのほかを組み合わせのファイルに書く (共通の項目でも、組み合わせのファイルにその行があれば組み合わせのファイルに書く)
+- ホスト版は `--profile <名前>` で、`--config` のファイルと同じディレクトリの `pix68k-<名前>.cfg` を同じように重ねて読む (メニューはない)
 
 ### cmdline.txt (ベアメタル版)
 
@@ -159,6 +248,7 @@ SD カードのルートの `cmdline.txt` に書く。主なもの:
 | `--cpu 68000\|68030\|68060`、`--clock MHz`、`--ram MB` | 機種、クロック、本体のメモリ |
 | `--ipl FILE` | IPL ROM のファイル |
 | `--config FILE` | 設定ファイル (`pix68k.cfg` と同じ形式)。コマンドラインのほうが優先する |
+| `--profile NAME` | `--config` と同じディレクトリの `pix68k-NAME.cfg` を重ねて読む (上の「起動の組み合わせ」) |
 | `--write-back`、`--read-only` | 終了時にディスクのイメージに書き戻す / 書き込み禁止にする (既定はどちらもしない) |
 | `--max-speed` | 最高速モード |
 | `--no-audio`、`--wav FILE` | 音を出さない / WAV に書く |
@@ -194,6 +284,7 @@ curl -H 'X-Pix68k-Token: 好きな文字列' -X POST http://pix68k/reboot
 
 `neptune=on` で `neptune_link=eth` (ベアメタル版の既定) のときは、同じ Ethernet を Neptune-X が使うので、`net=on` でも HTTP と syslog は動かない ([expansion.md](docs/expansion.md))。
 書き込みには `net_token=` か `net_allow=` の設定が要る。口の一覧と決まりは [network-api.md](docs/network-api.md) にある。
+操作には curl のほか、コマンド [pix68kcli](tools/pix68kcli/README.md) (宛先と token を設定ファイルに書いておける) が使える。
 
 ## ソースからビルドする
 
@@ -223,8 +314,11 @@ QEMU での試験、カーネルの大きさの上限などは [baremetal.md](do
    `[pi5]` の節に `framebuffer_depth=32` と `framebuffer_ignore_alpha=1` を書く (ないと Raspberry Pi 5 では何も出ずに止まる)
 3. カーネル (`kernel8.img`、`kernel8-rpi4.img`、`kernel_2712.img`) をルートに置く
 
-公開リポジトリ (j3tm0t0/pix68k) に `v` で始まるタグを push すると、`.github/workflows/release.yml` が GitHub のホストの runner で `tools/make_release.sh` を動かし、
-zip を Releases に載せる。
+公開リポジトリ (j3tm0t0/pix68k) に `v` で始まるタグを push すると、`.github/workflows/release.yml` が GitHub のホストの runner で
+`tools/make_release.sh` の zip と、`tools/pix68kcli/build.sh` の pix68kcli の 7 つを作り、SHA256SUMS と一緒に Releases に載せる。
+説明の本文は `docs/releases/<タグ>.md` に書いておく ([docs/releases/README.md](docs/releases/README.md))。
+タグを打たずに作るところまでを試すときは、Actions の画面か `gh workflow run release.yml --ref <ブランチ>` で動かす (Release は作らず、artifact に置く)。
+`-f notes_tag=v0.2.0` を付けると、説明の本文も `docs/releases/v0.2.0.md` で作る。
 
 ### ビルドとテスト (ホスト)
 

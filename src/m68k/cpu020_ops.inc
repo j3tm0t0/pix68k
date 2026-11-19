@@ -1113,7 +1113,7 @@ void Cpu020::opMovec(uint16_t op) {
     tick(10);
     int cr = w & 0xfff;
     bool m060 = is060();
-    // MC68060UM 表 10-24: CACR、TC、ITT / DTT、BUSCR、URP、SRP は +3 (SFC、DFC、USP、VBR、PCR は表 cyc060_ の値のまま)
+    // MC68060UM 表 10-24: CACR、TC、ITT / DTT、BUSCR、URP、SRP は +3 (SFC、DFC、USP、VBR、PCR は表 ops060_ の値のまま)
     if (cr == 0x002 || cr == 0x003 || (cr >= 0x004 && cr <= 0x008) || cr == 0x806 || cr == 0x807) tick060(3);
     switch (cr) {
     case 0x000:

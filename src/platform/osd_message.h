@@ -1,12 +1,14 @@
 // 画面の左上に重ねて出す短いメッセージ (HTTP の POST /message、ホスト版の --message)。実機で動きを見比べるときに、
 // モニタを見ている人に「いま動いているのはどれか」を知らせる。
 //
-// 本文は UTF-8。半角 (ASCII と半角カタカナ) と全角 (JIS X 0208 の字) を、MSG_LINES 行、1 行 MSG_COLS 桁 (半角の桁)
-// まで出す。全角は 2 桁を使う。行や桁からはみ出した分は字の切れ目で捨てる。
+// 本文は UTF-8。半角 (ASCII と半角カタカナ) と全角 (JIS X 0208 の字) を、1 行 MSG_COLS 桁 (半角の桁) で折り返して
+// MSG_LINES 行まで出す (X68000 の画面に大きく重ならないよう、桁は少なくしてある)。全角は 2 桁を使う。入りきらない分は
+// 字の切れ目で捨て、最後の行の終わりを「…」にする。
 //   ASCII       platform/menu_font.h の 8x16 (OSD と同じ。CGROM がなくても出る)
 //   半角カタカナ CGROM の 8x16 の半角 ($F3A800 から、1 字 16 バイト)
 //   全角        CGROM の 16x16 ($F00000 から、1 字 32 バイト)。Unicode から区点へは platform/jis_table.h で引く
-// CGROM がないとき、表にない全角の字、CGROM の字形が空のときは、四角 (豆腐) を出す。表にない半角の字は「?」。
+// CGROM がないとき、表にない全角の字、CGROM の字形が空のときは、四角 (豆腐) を出す。ただし「…」は点を 3 つ描く。
+// 表にない半角の字は「?」。
 //
 // 表示は画面の右上の数字 (platform/osd.h) と同じ仕組みで重ねる: X68000 の画面に重なるところは、写すときに重なる部分だけ
 // この絵を書き (platform/frame_scale.h の presentScaled() の 2 つ目の FrameOverlay)、枠の外は写したあとに描く。
@@ -31,7 +33,7 @@
 namespace platform {
 
 static constexpr int MSG_LINES = 4;            // 行数の上限
-static constexpr int MSG_COLS = 40;            // 1 行の桁数の上限 (半角の桁。全角は 2 桁)
+static constexpr int MSG_COLS = 10;            // 1 行の桁数 (半角の桁。全角は 2 桁)。超えたら折り返す
 static constexpr unsigned MSG_BODY_MAX = 1024; // HTTP の本体の上限 (バイト)
 static constexpr unsigned MSG_SEC_DEFAULT = 10; // ?sec= がないときの秒数
 static constexpr unsigned MSG_SEC_MAX = 86400;  // ?sec= の上限 (1 日)
@@ -44,6 +46,7 @@ static constexpr int MSG_IMAGE_PIXELS = MSG_COLS * 8 * MSG_MAX_SCALE * MSG_LINES
 static constexpr uint16_t MSG_CELL_SPACE = 0x20;   // 0x20-0x7E は ASCII、0xA1-0xDF は半角カタカナ (X68000 の文字コード)
 static constexpr uint16_t MSG_CELL_TOFU = 0xfffe;  // 出せない全角の字 (左の桁。右の桁は MSG_CELL_RIGHT)
 static constexpr uint16_t MSG_CELL_RIGHT = 0xffff; // 全角の字の右の桁 (0x2121-0x7E7E の区点か MSG_CELL_TOFU の右)
+static constexpr uint16_t MSG_JIS_ELLIPSIS = 0x2144; // 「…」(U+2026) の区点。入りきらないときに最後の行の終わりに付ける
 
 static constexpr uint32_t CGROM_FONT8X16 = 0x3a800; // CGROM の 8x16 の半角 ($F3A800)
 
@@ -120,23 +123,23 @@ struct MessageLayout {
     uint16_t cell[MSG_LINES][MSG_COLS] = {};
 };
 
-// UTF-8 の本文を升目に並べる。\n で改行 (\r は捨てる)、TAB は空白、ほかの制御文字は捨てる。桁からはみ出した字は、
-// 次の改行まで捨てる (全角の字が 1 桁しか残っていなければ、その字から捨てる)。MSG_LINES 行より後ろは捨てる。
+// UTF-8 の本文を升目に並べる。\n で改行 (\r は捨てる)、TAB は空白、ほかの制御文字は捨てる。1 行は MSG_COLS 桁で、
+// 入らない字は次の行へ折り返す (全角の字が 1 桁しか残っていなければ、その字から次の行へ)。入らない半角の空白は
+// 捨てる (折り返しで行頭に空白は来ない)。MSG_LINES 行に入りきらない字 (空白は除く) があれば、それより後ろは捨て、最後の行の終わりを「…」(全角) に
+// する。「…」が桁に入らなければ、その分の字を最後の行の右から消す (MSG_LINES 行が空なら「…」も付けない)。
 // 終わりの空の行は数えない (本文が空か空白と改行だけなら lines は 0)
 inline void layoutMessage(const char* s, size_t n, MessageLayout& out) {
     out = MessageLayout();
     int line = 0, col = 0;
-    bool full = false; // この行は桁からはみ出した (改行まで捨てる)
+    bool cut = false; // MSG_LINES 行に入りきらない字があった
     size_t i = 0;
     uint32_t cp;
-    while (line < MSG_LINES && utf8Next(s, n, i, cp)) {
+    while (utf8Next(s, n, i, cp)) {
         if (cp == '\n') {
             line++;
             col = 0;
-            full = false;
             continue;
         }
-        if (full) continue;
         if (cp == '\t') cp = ' ';
         if (cp < 0x20 || cp == 0x7f || (cp >= 0x80 && cp < 0xa0)) continue;
         uint16_t code = 0;
@@ -157,7 +160,17 @@ inline void layoutMessage(const char* s, size_t n, MessageLayout& out) {
             code = '?';
         }
         if (col + width > MSG_COLS) {
-            full = true;
+            // 入らない半角の空白は、折り返さずに捨てる (行を進めるのは、次に空白でない字が来たとき。
+            // そのあとの \n で行が 2 つ進まないように)
+            if (code == MSG_CELL_SPACE) continue;
+            line++; // 折り返す
+            col = 0;
+        }
+        if (line >= MSG_LINES) {
+            if (code != MSG_CELL_SPACE) {
+                cut = true;
+                break;
+            }
             continue;
         }
         out.cell[line][col++] = code;
@@ -166,6 +179,18 @@ inline void layoutMessage(const char* s, size_t n, MessageLayout& out) {
         if (code != MSG_CELL_SPACE) out.cols[line] = (uint8_t)col;
         if (out.cols[line] > 0 && line + 1 > out.lines) out.lines = line + 1;
     }
+    // MSG_LINES 行に出す字が 1 つもなければ「…」も付けない (何も出さない。parseMessageRequest() は消す要求にする)
+    if (!cut || out.lines == 0) return;
+    // 最後の行の終わりを「…」にする。字の右の空白は残さず、全角の字の右半分から始めない
+    const int last = MSG_LINES - 1;
+    int at = out.cols[last];
+    if (at > MSG_COLS - 2) at = MSG_COLS - 2;
+    if (at > 0 && out.cell[last][at] == MSG_CELL_RIGHT) at--;
+    for (int c = at; c < MSG_COLS; c++) out.cell[last][c] = 0;
+    out.cell[last][at] = MSG_JIS_ELLIPSIS;
+    out.cell[last][at + 1] = MSG_CELL_RIGHT;
+    out.cols[last] = (uint8_t)(at + 2);
+    out.lines = MSG_LINES;
 }
 
 // 1 ビットの字形。bits[行][桁] は 8x16 (1 バイトが 1 ラインで bit7 が左)。lines が 0 なら出すものがない
@@ -205,6 +230,14 @@ inline void tofu(uint8_t left[16], uint8_t right[16]) {
         right[y] = edge ? 0xfc : inside ? 0x04 : 0;
     }
 }
+// 「…」(CGROM がないときの代わり。16x16 の下の方に 2x2 の点を 3 つ)
+inline void ellipsis(uint8_t left[16], uint8_t right[16]) {
+    for (int y = 0; y < 16; y++) {
+        const bool dot = y == 11 || y == 12;
+        left[y] = dot ? 0x31 : 0;
+        right[y] = dot ? 0x8c : 0;
+    }
+}
 } // namespace message_detail
 
 // 升目を字形にする。cgrom は CGROM の全体 (cgromSize バイト。なければ nullptr)
@@ -237,7 +270,8 @@ inline void rasterMessage(const MessageLayout& lay, const uint8_t* cgrom, size_t
                     // 字形が空なら豆腐にする (CGROM にない字。全角の空白 0x2121 は空のまま)
                     drawn = any != 0 || code == 0x2121;
                 }
-                if (!drawn) message_detail::tofu(g, r);
+                if (!drawn && code == MSG_JIS_ELLIPSIS) message_detail::ellipsis(g, r); // CGROM がなくても「…」は出す
+                else if (!drawn) message_detail::tofu(g, r);
             }
         }
     }

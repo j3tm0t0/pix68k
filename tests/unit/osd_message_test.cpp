@@ -117,32 +117,126 @@ void testLayout() {
     CHECK_EQ(l.lines, 3);
     CHECK_EQ(l.cols[1], 0);
 
-    // MSG_LINES 行より後ろは捨てる
+    // MSG_LINES 行より後ろは捨て、最後の行の終わりを「…」にする
+    CHECK_EQ(unicodeToJis(0x2026), MSG_JIS_ELLIPSIS);
     layout("1\n2\n3\n4\n5\n6", l);
     CHECK_EQ(l.lines, MSG_LINES);
     CHECK_EQ(l.cell[MSG_LINES - 1][0], '0' + MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], 3);
+    CHECK_EQ(l.cell[MSG_LINES - 1][1], MSG_JIS_ELLIPSIS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][2], MSG_CELL_RIGHT);
+    // ちょうど MSG_LINES 行なら「…」は付けない (後ろの改行と空白は入りきらない字に数えない)
+    layout("1\n2\n3\n4\n \n\n", l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], 1);
+    CHECK_EQ(l.cell[MSG_LINES - 1][1], 0);
+    // 後ろの行が空でも、入りきらない字があれば「…」
+    layout("a\n\n\n\nb", l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], 2);
+    CHECK_EQ(l.cell[MSG_LINES - 1][0], MSG_JIS_ELLIPSIS);
 
-    // 桁からはみ出した分は改行まで捨てる
-    std::string s(MSG_COLS + 5, 'x');
-    s += "\ny";
-    layout(s.c_str(), l);
+    // MSG_COLS 桁で折り返す
+    CHECK_EQ(MSG_COLS, 10);
+    layout("0123456789abc", l);
     CHECK_EQ(l.lines, 2);
     CHECK_EQ(l.cols[0], MSG_COLS);
-    CHECK_EQ(l.cell[1][0], 'y');
-    // 全角の字が 1 桁しか残らなければ、その字から捨てる (半分だけ出さない)
+    CHECK_EQ(l.cols[1], 3);
+    CHECK_EQ(l.cell[1][0], 'a');
+    // ちょうど MSG_COLS 桁のあとの改行は、空の行を作らない
+    layout("0123456789\nab", l);
+    CHECK_EQ(l.lines, 2);
+    CHECK_EQ(l.cell[1][0], 'a');
+    // 折り返しで行頭に来る空白は捨てる
+    layout("0123456789 ab", l);
+    CHECK_EQ(l.lines, 2);
+    CHECK_EQ(l.cell[1][0], 'a');
+    layout("0123456789   ab", l);
+    CHECK_EQ(l.cell[1][0], 'a');
+    layout("0123456789\n  ab", l); // 改行のあとの空白は残す
+    CHECK_EQ(l.cell[1][2], 'a');
+    // 10 桁ちょうどの行のあとの空白と改行で、行が 2 つ進まない
+    layout("0123456789 \nab", l);
+    CHECK_EQ(l.lines, 2);
+    CHECK_EQ(l.cell[1][0], 'a');
+    layout("aaaaaaaaaa \nb\nc\nd", l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], 1);
+    CHECK_EQ(l.cell[MSG_LINES - 1][0], 'd');
+    layout("0123456789 \na\nb\nc", l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], 1);
+    CHECK_EQ(l.cell[MSG_LINES - 1][0], 'c');
+    // 全角の字で折り返した行の頭の空白ではない (全角のあとの空白は残す)
+    layout("012345678\xe3\x81\x82 b", l);
+    CHECK_EQ(l.cell[1][2], ' ');
+    CHECK_EQ(l.cell[1][3], 'b');
+    // 全角は 5 字で 1 行
+    std::string k;
+    for (int i = 0; i < 6; i++) k += "\xe3\x81\x82"; // あ x 6
+    layout(k.c_str(), l);
+    CHECK_EQ(l.lines, 2);
+    CHECK_EQ(l.cols[0], 10);
+    CHECK_EQ(l.cols[1], 2);
+    CHECK_EQ(l.cell[1][0], 0x2422);
+    // 全角の字が 1 桁しか残らなければ、その字から次の行へ (半分だけ出さない)
     std::string w(MSG_COLS - 1, 'x');
-    w += "\xe3\x81\x82" "z\nq"; // あ z
+    w += "\xe3\x81\x82" "z"; // あ z
     layout(w.c_str(), l);
+    CHECK_EQ(l.lines, 2);
     CHECK_EQ(l.cols[0], MSG_COLS - 1);
     CHECK_EQ(l.cell[0][MSG_COLS - 1], 0);
-    CHECK_EQ(l.cell[1][0], 'q');
+    CHECK_EQ(l.cell[1][0], 0x2422);
+    CHECK_EQ(l.cell[1][1], MSG_CELL_RIGHT);
+    CHECK_EQ(l.cell[1][2], 'z');
     // ちょうど入る全角
     std::string w2(MSG_COLS - 2, 'x');
     w2 += "\xe3\x81\x82";
     layout(w2.c_str(), l);
+    CHECK_EQ(l.lines, 1);
     CHECK_EQ(l.cols[0], MSG_COLS);
     CHECK_EQ(l.cell[0][MSG_COLS - 2], 0x2422);
     CHECK_EQ(l.cell[0][MSG_COLS - 1], MSG_CELL_RIGHT);
+
+    // 4 行を超える長い本文: 最後の行の 9、10 桁目を消して「…」を 9-10 桁目に置く
+    layout(std::string(MSG_COLS * MSG_LINES + 1, 'x').c_str(), l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    for (int i = 0; i < MSG_LINES - 1; i++) CHECK_EQ(l.cols[i], MSG_COLS);
+    CHECK_EQ(l.cols[MSG_LINES - 1], MSG_COLS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 3], 'x');
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 2], MSG_JIS_ELLIPSIS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 1], MSG_CELL_RIGHT);
+    // ちょうど 4 行に入れば「…」は付けない
+    layout(std::string(MSG_COLS * MSG_LINES, 'x').c_str(), l);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 1], 'x');
+    // 最後の行が全角で埋まっていれば、全角を 1 字消して「…」 (全角の右半分から始めない)
+    std::string kk;
+    for (int i = 0; i < 5 * MSG_LINES + 1; i++) kk += "\xe3\x81\x82";
+    layout(kk.c_str(), l);
+    CHECK_EQ(l.lines, MSG_LINES);
+    CHECK_EQ(l.cols[MSG_LINES - 1], MSG_COLS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 4], 0x2422);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 2], MSG_JIS_ELLIPSIS);
+    // 最後の行が半角 9 桁 + 次の行へ送られた全角: 9 桁目を消して「…」は 9-10 桁目
+    std::string h = "1\n2\n3\n" + std::string(MSG_COLS - 1, 'y') + "\xe3\x81\x82";
+    layout(h.c_str(), l);
+    CHECK_EQ(l.cols[MSG_LINES - 1], MSG_COLS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 3], 'y');
+    CHECK_EQ(l.cell[MSG_LINES - 1][MSG_COLS - 2], MSG_JIS_ELLIPSIS);
+    // 4 行目がちょうど 10 桁 (abcde あ fgh) なら「…」は付けない
+    std::string h2 = "1\n2\n3\nabcde\xe3\x81\x82" "fgh";
+    layout(h2.c_str(), l);
+    CHECK_EQ(l.cols[MSG_LINES - 1], MSG_COLS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][7], 'f');
+    CHECK_EQ(l.cell[MSG_LINES - 1][9], 'h');
+    // 「…」を置く 9 桁目が全角の右半分なら、その全角の左 (8 桁目) から「…」
+    h2 = "1\n2\n3\nabcdefg\xe3\x81\x82" "\nz"; // 4 行目は abcdefg あ (9 桁目が右半分) の次に 5 行目
+    layout(h2.c_str(), l);
+    CHECK_EQ(l.cols[MSG_LINES - 1], MSG_COLS - 1);
+    CHECK_EQ(l.cell[MSG_LINES - 1][6], 'g');
+    CHECK_EQ(l.cell[MSG_LINES - 1][7], MSG_JIS_ELLIPSIS);
+    CHECK_EQ(l.cell[MSG_LINES - 1][8], MSG_CELL_RIGHT);
+    CHECK_EQ(l.cell[MSG_LINES - 1][9], 0);
 
     // 半角カタカナ (ｱ = U+FF71 は X68000 の 0xB1)、表にない全角 (絵文字) は豆腐、表にない半角は ?
     layout("\xef\xbd\xb1\xf0\x9f\x98\x80\xc2\xa5", l); // ｱ 😀 ¥
@@ -202,6 +296,15 @@ void testRaster() {
     rasterMessage(l, cg.data(), 1000, g);
     CHECK_EQ(isTofu(g.bits[0][1], g.bits[0][2]), 1);
     CHECK_EQ(g.maxCols(), 8);
+
+    // 「…」は CGROM がなくても豆腐にしない (点を 3 つ)
+    layout("1\n2\n3\n4\n5", l);
+    rasterMessage(l, nullptr, 0, g);
+    CHECK_EQ(g.lines, MSG_LINES);
+    CHECK_EQ(isTofu(g.bits[MSG_LINES - 1][1], g.bits[MSG_LINES - 1][2]), 0);
+    CHECK_EQ(g.bits[MSG_LINES - 1][1][11] != 0, 1);
+    CHECK_EQ(g.bits[MSG_LINES - 1][2][12] != 0, 1);
+    CHECK_EQ(g.bits[MSG_LINES - 1][1][5], 0);
 }
 
 MessageGlyphs glyphsOf(const char* s, const uint8_t* cg = nullptr, size_t cgSize = 0) {
@@ -247,7 +350,7 @@ void testPlace() {
     CHECK_EQ(messageLimitX(640, 480, OsdRect(), g, 1), 640);
     osd.y = 200; // 行が違えば切らない
     CHECK_EQ(messageLimitX(640, 480, osd, g, 1), 640);
-    // 40 桁でも、640 の画面で右上の数字にかからない
+    // MSG_COLS 桁でも、640 の画面で右上の数字にかからない
     const MessageGlyphs wide = glyphsOf(std::string(MSG_COLS, 'w').c_str());
     osd = placeOsd(640, 480, 0, 0, 640, 480, 1, OSD_CHARS);
     r = placeMessage(640, 480, 0, 0, 640, 480, wide, 1, messageLimitX(640, 480, osd, wide, 1));

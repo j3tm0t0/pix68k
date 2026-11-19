@@ -551,95 +551,255 @@ void testDiscardConfirm() {
 
 } // namespace
 
-// 画面の拡大 (scale=) の項目は、hasScale() が true の環境 (ベアメタル版) だけに出し、開いたときはいまの値を出す
+// 画面の出し方 (Display のページ)。hasVideo() が true の環境だけに出す。Scale (video_scale=) と、効果 (video_filter=) の
+// Scanlines、Curve、Mask。開いたときはいまの値を出し、変えたらすぐに知らせる。選べない組み合わせ (videoAllowed()) は選ばない
 void testScale() {
-    printf("scale\n");
-    FakeHost host;
-    Menu m(host);
-    Settings s;
-    m.open(s, s);
-    for (int i = 0; i < 30; i++) {
-        CHECK_EQ(strcmp(m.currentLabel(), "Scale") != 0, 1);
-        m.key(mk::DOWN);
+    printf("video scale and filter\n");
+    using namespace platform;
+    // 選べない環境では、Display の行を出さない
+    {
+        FakeHost host;
+        Menu m(host);
+        Settings s;
+        m.open(s, s);
+        for (int i = 0; i < 30; i++) {
+            CHECK_EQ(strcmp(m.currentLabel(), "Display") != 0, 1);
+            CHECK_EQ(strcmp(m.currentLabel(), "Scale") != 0, 1);
+            m.key(mk::DOWN);
+        }
     }
-    struct ScaleHost : FakeHost {
-        int scale = -1, calls = 0, scanline = -1, scanlineCalls = 0;
-        bool hasScale() const override { return true; }
-        void scaleChanged(int v) override {
-            scale = v;
+    // pi3 なら curve と、full + mask を選べない (試験用の決まり)
+    struct VideoHost : FakeHost {
+        int scale = -1, filter = -1, calls = 0;
+        bool pi3 = false;
+        bool hasVideo() const override { return true; }
+        bool videoAllowed(int sc, int f) const override {
+            return !pi3 || ((f & CRT_CURVE) == 0 && !(sc == VIDEO_SCALE_FULL && (f & CRT_MASK)));
+        }
+        void videoChanged(int sc, int f) override {
+            scale = sc;
+            filter = f;
             calls++;
         }
-        void scanlineChanged(int v) override {
-            scanline = v;
-            scanlineCalls++;
-        }
-    } sh;
-    Menu ms(sh);
+    } vh;
+    Menu ms(vh);
     Settings running, saved;
-    running.scale = 0; // メニューで off にしたが、保存していない
-    saved.scale = 1;
+    running.videoScale = VIDEO_SCALE_OFF; // メニューで off にしたが、保存していない
+    saved.videoScale = VIDEO_SCALE_INTEGER;
     ms.open(running, saved);
     char buf[64];
-    if (moveTo(ms, "Scale")) {
-        CHECK_EQ(ms.pending().scale, 0);
+    auto openDisplay = [&](Menu& m) {
+        if (!moveTo(m, "Display")) return false;
+        m.key(mk::ENTER);
+        return true;
+    };
+    if (moveTo(ms, "Display")) {
         CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "off"), 0);
-        ms.key(mk::RIGHT);
-        CHECK_EQ(ms.pending().scale, 1);
-        CHECK_EQ(ms.pending().scanline, 0);
-        CHECK_EQ(sh.scale, 1); // 変えたらすぐに環境に知らせる (描き直しを待たない)
-        CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "auto (integer)"), 0);
-        // off → auto (integer) → auto + scanlines → off の順 (Enter は右と同じ)
         ms.key(mk::ENTER);
-        CHECK_EQ(ms.pending().scale, 1);
-        CHECK_EQ(ms.pending().scanline, 1);
-        CHECK_EQ(sh.scanline, 1);
-        CHECK_EQ(sh.calls, 1); // 拡大は変わっていないので知らせない
-        CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "auto + scanlines"), 0);
-        // off にしても scanline= は変えない (一周して保存しても scanline=on が残る)
-        ms.key(mk::RIGHT);
-        CHECK_EQ(ms.pending().scale, 0);
-        CHECK_EQ(ms.pending().scanline, 1);
-        CHECK_EQ(sh.scale, 0);
-        CHECK_EQ(sh.scanline, 1);
+        static const char* const kRows[] = {"Scale", "Scanlines", "Curve", "Mask", "Back"};
+        for (int i = 0; i < 5; i++) {
+            CHECK_EQ(strcmp(ms.currentLabel(), kRows[i]), 0);
+            ms.key(mk::DOWN);
+        }
+        CHECK_EQ(strcmp(ms.currentLabel(), "Scale"), 0); // 一周する
         CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "off"), 0);
-        // 左は逆の順 (off → auto + scanlines)
+        // off → integer → aspect → full → off。左と Enter
+        static const char* const kScales[] = {"integer", "aspect", "full", "off"};
+        for (int i = 0; i < 4; i++) {
+            ms.key(mk::RIGHT);
+            CHECK_EQ(ms.pending().videoScale, (i + 1) % 4);
+            CHECK_EQ(vh.scale, (i + 1) % 4); // 変えたらすぐに環境に知らせる (描き直しを待たない)
+            CHECK_EQ(vh.filter, 0);
+            CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), kScales[i]), 0);
+        }
         ms.key(mk::LEFT);
-        CHECK_EQ(ms.pending().scale, 1);
-        CHECK_EQ(ms.pending().scanline, 1);
+        CHECK_EQ(ms.pending().videoScale, (int)VIDEO_SCALE_FULL);
+        ms.key(mk::ENTER); // Enter は右と同じ
+        CHECK_EQ(ms.pending().videoScale, (int)VIDEO_SCALE_OFF);
+        ms.key(mk::RIGHT);
+        CHECK_EQ(vh.calls, 7);
+        // 効果は 1 つずつ on / off
+        moveTo(ms, "Scanlines");
+        ms.key(mk::RIGHT);
+        CHECK_EQ(ms.pending().videoFilter, (int)CRT_SCANLINE);
+        CHECK_EQ(vh.filter, (int)CRT_SCANLINE);
+        CHECK_EQ(vh.scale, (int)VIDEO_SCALE_INTEGER);
+        CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "on"), 0);
+        moveTo(ms, "Curve");
+        ms.key(mk::RIGHT);
+        moveTo(ms, "Mask");
+        ms.key(mk::ENTER);
+        CHECK_EQ(vh.filter, (int)CRT_FULL);
+        moveTo(ms, "Scanlines");
+        ms.key(mk::LEFT);
+        CHECK_EQ(vh.filter, (int)(CRT_CURVE | CRT_MASK));
+        CHECK_EQ(vh.calls, 11);
+        // Esc で主のページの Display に戻る。値はまとめて出す
+        ms.key(mk::ESC);
+        CHECK_EQ(ms.isOpen(), 1);
+        CHECK_EQ(strcmp(ms.currentLabel(), "Display"), 0);
+        CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "integer + curve,mask"), 0);
         // 切り替えてすぐに Esc で閉じても、閉じる前に知らせてある
-        ms.key(mk::LEFT);
+        ms.key(mk::ENTER);
+        ms.key(mk::RIGHT); // Scale を aspect
+        ms.key(mk::ESC);
+        CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "aspect + curve,mask"), 0);
         ms.key(mk::ESC);
         CHECK_EQ(ms.isOpen(), 0);
-        CHECK_EQ(sh.scale, 1);
-        CHECK_EQ(sh.scanline, 0);
-        CHECK_EQ(sh.calls, 3);
-        CHECK_EQ(sh.scanlineCalls, 2);
+        CHECK_EQ(vh.scale, (int)VIDEO_SCALE_ASPECT);
+        CHECK_EQ(vh.calls, 12);
     }
-    // 開いたときは、いま動いている値を出す。scale=off なら scanline=on でも off と出す
-    running.scale = 1;
-    running.scanline = 1;
+    // 開いたときは、いま動いている値を出す
+    running.videoScale = VIDEO_SCALE_FULL;
+    running.videoFilter = CRT_SCANLINE;
     ms.open(running, saved);
-    if (moveTo(ms, "Scale")) CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "auto + scanlines"), 0);
-    running.scale = 0;
-    ms.open(running, saved);
-    if (moveTo(ms, "Scale")) CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "off"), 0);
-    running.scanline = 0;
+    if (moveTo(ms, "Display")) CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "full + scanline"), 0);
+    // 選べない組み合わせ: Scale は飛ばし、効果は変えずに状態の行で知らせる
     {
-        const SettingKey* k = findSettingKey("scanline");
-        CHECK_EQ(k != nullptr, 1);
-        if (k) {
-            CHECK_EQ(k->restart, 0);
-            CHECK_EQ(k->host, 0);
+        vh.pi3 = true;
+        vh.calls = 0;
+        running.videoScale = VIDEO_SCALE_ASPECT;
+        running.videoFilter = CRT_MASK;
+        ms.open(running, saved);
+        if (openDisplay(ms)) {
+            ms.key(mk::RIGHT); // aspect → full は full + mask が選べないので飛ばして off
+            CHECK_EQ(ms.pending().videoScale, (int)VIDEO_SCALE_OFF);
+            ms.key(mk::LEFT); // off → full も飛ばして aspect
+            CHECK_EQ(ms.pending().videoScale, (int)VIDEO_SCALE_ASPECT);
+            CHECK_EQ(vh.calls, 2);
+            moveTo(ms, "Curve");
+            ms.key(mk::RIGHT);
+            CHECK_EQ(ms.pending().videoFilter, (int)CRT_MASK); // 変えない
+            CHECK_EQ(strcmp(ms.status(), "not available on this machine"), 0);
+            CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "off"), 0);
+            CHECK_EQ(vh.calls, 2);
+            moveTo(ms, "Mask");
+            ms.key(mk::RIGHT);
+            CHECK_EQ(ms.pending().videoFilter, (int)CRT_OFF);
+            moveTo(ms, "Scale");
+            ms.key(mk::RIGHT); // mask がなければ full を選べる
+            CHECK_EQ(ms.pending().videoScale, (int)VIDEO_SCALE_FULL);
+            moveTo(ms, "Mask");
+            ms.key(mk::RIGHT); // full + mask は選べない
+            CHECK_EQ(ms.pending().videoFilter, (int)CRT_OFF);
+            CHECK_EQ(vh.calls, 4);
         }
+        vh.pi3 = false;
     }
-    // すぐに反映する項目なので、「*」(Restart で反映) は付けない
-    const SettingKey* k = findSettingKey("scale");
-    CHECK_EQ(k != nullptr, 1);
-    if (k) {
-        CHECK_EQ(k->restart, 0);
-        CHECK_EQ(k->host, 0);
+    // モニタの枠 (Bezel)。hasBezel() が true の環境だけに出す。off → cz-600de → cz-600db、効果のビットは変えない。
+    // 効果を切り替えても枠は残る。選べない枠 (絵のファイルがない) は飛ばす
+    {
+        struct BezelHost : VideoHost {
+            bool noDe = false, noDb = false; // 絵が読めない枠
+            mutable int asked = 0;            // bezelAvailable() を呼んだ回数
+            bool hasBezel() const override { return true; }
+            bool bezelAvailable(int f) const override {
+                asked++;
+                return !(noDe && (f & CRT_BEZEL_DE)) && !(noDb && (f & CRT_BEZEL_DB));
+            }
+        } bh;
+        Menu mb(bh);
+        running = Settings();
+        running.videoFilter = CRT_SCANLINE;
+        mb.open(running, saved);
+        if (openDisplay(mb)) {
+            static const char* const kRows[] = {"Scale", "Scanlines", "Curve", "Mask", "Bezel", "Back"};
+            for (int i = 0; i < 6; i++) {
+                CHECK_EQ(strcmp(mb.currentLabel(), kRows[i]), 0);
+                mb.key(mk::DOWN);
+            }
+            moveTo(mb, "Bezel");
+            CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "off"), 0);
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_SCANLINE | CRT_BEZEL_DE));
+            CHECK_EQ(bh.filter, (int)(CRT_SCANLINE | CRT_BEZEL_DE));
+            CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "cz-600de"), 0);
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_SCANLINE | CRT_BEZEL_DB));
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)CRT_SCANLINE);
+            mb.key(mk::LEFT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_SCANLINE | CRT_BEZEL_DB));
+            // 効果を切り替えても枠は残る
+            moveTo(mb, "Curve");
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_GEOM | CRT_BEZEL_DB));
+            // 選べない枠は飛ばす (cz-600de → off)
+            bh.noDb = true;
+            moveTo(mb, "Bezel");
+            mb.key(mk::LEFT); // cz-600db → cz-600de
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_GEOM | CRT_BEZEL_DE));
+            mb.key(mk::RIGHT); // cz-600de → (cz-600db は選べない) → off
+            CHECK_EQ(mb.pending().videoFilter, (int)CRT_GEOM);
+            // 選べる枠がほかにない: 変えずに知らせる
+            bh.noDb = false;
+            mb.key(mk::ESC);
+            CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "integer + scanline,curve"), 0);
+        }
+        // 枠があれば、まとめた値は拡大の代わりに枠の名前 (枠だけなら名前だけ)
+        running.videoFilter = CRT_FULL | CRT_BEZEL_DE;
+        mb.open(running, saved);
+        if (moveTo(mb, "Display"))
+            CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "cz-600de + scanline,curve,mask"), 0);
+        running.videoFilter = CRT_BEZEL_DB;
+        mb.open(running, saved);
+        if (moveTo(mb, "Display")) CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "cz-600db"), 0);
+        // 設定に枠があって絵が読めない: 枠なしで写しているので、Scale と効果は変えられ、絵が読めるかは聞かない。
+        // Display の行は拡大と効果だけ
+        bh.noDe = true;
+        bh.pi3 = true;
+        running = Settings();
+        running.videoFilter = CRT_SCANLINE | CRT_BEZEL_DE;
+        mb.open(running, saved);
+        if (moveTo(mb, "Display"))
+            CHECK_EQ(strcmp(mb.currentValue(buf, sizeof buf), "integer + scanline"), 0);
+        if (openDisplay(mb)) {
+            bh.asked = 0;
+            moveTo(mb, "Scale");
+            mb.key(mk::RIGHT); // integer → aspect
+            CHECK_EQ(mb.pending().videoScale, (int)VIDEO_SCALE_ASPECT);
+            CHECK_EQ(bh.scale, (int)VIDEO_SCALE_ASPECT);
+            moveTo(mb, "Mask");
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_SCANLINE | CRT_MASK | CRT_BEZEL_DE));
+            CHECK_EQ(bh.filter, (int)(CRT_SCANLINE | CRT_MASK | CRT_BEZEL_DE));
+            moveTo(mb, "Scanlines");
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_MASK | CRT_BEZEL_DE));
+            CHECK_EQ(bh.asked, 0);
+            // Pi 3 の制限は、枠があっても今までどおり (aspect → full は mask があるので飛ばす)
+            moveTo(mb, "Scale");
+            mb.key(mk::RIGHT);
+            CHECK_EQ(mb.pending().videoScale != (int)VIDEO_SCALE_FULL, 1);
+            // Bezel を替えるときだけ聞く: cz-600de (読めない) → cz-600db
+            moveTo(mb, "Bezel");
+            mb.key(mk::RIGHT);
+            CHECK_EQ(bh.asked > 0, 1);
+            CHECK_EQ(mb.pending().videoFilter, (int)(CRT_MASK | CRT_BEZEL_DB));
+            mb.key(mk::ESC);
+        }
+        bh.noDe = false;
+        bh.pi3 = false;
+        // hasBezel() が false の環境 (ホスト版) では出さず、Display の行にも枠の名前を出さない (枠なしで写している)
+        running = Settings();
+        running.videoFilter = CRT_SCANLINE | CRT_BEZEL_DB;
+        ms.open(running, saved);
+        if (moveTo(ms, "Display")) CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "integer + scanline"), 0);
+        ms.open(running, saved);
+        if (openDisplay(ms))
+            for (int i = 0; i < 6; i++) {
+                CHECK_EQ(strcmp(ms.currentLabel(), "Bezel") != 0, 1);
+                ms.key(mk::DOWN);
+            }
     }
-    // 「Save settings」は Scale の項目があっても、最後から 3 つ目のまま
+    // どちらもすぐに反映する項目なので、「*」(Restart で反映) は付けない。ホスト版でも使う
+    static const char* const kVideoKeys[] = {"video_scale", "video_filter"};
+    for (const char* key : kVideoKeys) {
+        const SettingKey* k = findSettingKey(key);
+        CHECK_EQ(k != nullptr && !k->restart && k->host, 1);
+    }
+    // 「Save settings」は Display の項目があっても、最後から 3 つ目のまま
+    running = Settings();
     ms.open(running, saved);
     ms.key(mk::END);
     ms.key(mk::UP);
@@ -665,7 +825,7 @@ void testOsd() {
     if (moveTo(m, "OSD")) {
         CHECK_EQ(m.pending().osd, 1);
         char v[Menu::COLS + 1];
-        CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "fps (overlay)"), 0);
+        CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "fps"), 0);
         // off (0) → on (2) → fps (1) → off の順に変わる
         m.key(mk::RIGHT);
         CHECK_EQ(m.pending().osd, 0);
@@ -673,7 +833,7 @@ void testOsd() {
         CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "off"), 0);
         m.key(mk::RIGHT);
         CHECK_EQ(oh.osd, 2);
-        CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "on (margin)"), 0);
+        CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "on"), 0);
         m.key(mk::RIGHT);
         CHECK_EQ(oh.osd, 1);
         m.key(mk::LEFT);
@@ -853,9 +1013,9 @@ void testBoards() {
     m.key(mk::ENTER);
     CHECK_EQ(host.saved.midi, 1);
     CHECK_EQ(host.saved.midiOut, 2);
-    // Scale のある環境 (ベアメタル版) でも、Boards の下は Scale、OSD
+    // Scale のある環境 (ベアメタル版) でも、Boards の下は Display、OSD
     struct ScaleHost : FakeHost {
-        bool hasScale() const override { return true; }
+        bool hasVideo() const override { return true; }
     } sh;
     Menu ms(sh);
     ms.open(withSf2, withSf2);
@@ -864,7 +1024,7 @@ void testBoards() {
     ms.key(mk::RIGHT);
     ms.key(mk::ESC);
     ms.key(mk::DOWN);
-    CHECK_EQ(strcmp(ms.currentLabel(), "Scale"), 0);
+    CHECK_EQ(strcmp(ms.currentLabel(), "Display"), 0);
     ms.key(mk::DOWN);
     CHECK_EQ(strcmp(ms.currentLabel(), "OSD"), 0);
     ms.key(mk::END);
@@ -944,7 +1104,7 @@ void testFit() {
     static uint32_t buf[1920 * 1080];
     struct FitHost : FakeHost {
         bool scale = false;
-        bool hasScale() const override { return scale; }
+        bool hasVideo() const override { return scale; }
     } host;
     static const int kCpus[] = {68000, 68030, 68060};
     for (int cpu : kCpus)
@@ -993,7 +1153,7 @@ void testFitPages() {
     static uint32_t buf[768 * 512];
     struct FitHost : FakeHost {
         bool scale = false;
-        bool hasScale() const override { return scale; }
+        bool hasVideo() const override { return scale; }
     } host;
     static const int kCpus[] = {68000, 68030, 68060};
     for (int cpu : kCpus)
@@ -1106,7 +1266,7 @@ void testFit480() {
     printf("fit 480\n");
     static uint32_t buf[720 * 480];
     struct FitHost : FakeHost {
-        bool hasScale() const override { return true; }
+        bool hasVideo() const override { return true; }
     } host;
     static const int kWidths[] = {640, 720};
     static const int kCpus[] = {68000, 68030, 68060};

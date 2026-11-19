@@ -1497,7 +1497,21 @@ bool Machine::ioWrite(uint32_t addr, uint8_t v) {
             if (!inDma_) {
                 inDma_ = true;
                 dmac_.notify(*this);
+                // オートリクエストの最大速度 (OCR の REQG = 01) の転送は、終わるまで DMAC がバスを持ち、CPU は止まる
+                // (Inside X68000 の PDF の 36、38、53 ページ)。次の周辺機器の更新を待たずに、ここで最後まで転送する。
+                // グラディウス II は、PCG とスプライトの表をチャネル 2 のこの転送で送り、開始を書いた直後に次の転送の
+                // MAR / DAR / MTC を書く。後回しにすると、前の転送がその値で進み、別のパターンが PCG に入った
+                // (タイトルのロゴや弾が別のキャラになる)。転送にかかる時間は数えていない (X68000 の時間は進まない)
+                // 終わりのある転送は長さによらず最後まで進め、終わらない転送 (リンクチェーンの輪、転送が DMAC の
+                // レジスタを書く場合) は途中で戻る (dmac.h の runBusHolders())。
+                // HLT を外す書き込みもここを通るので、止めてあった転送はそこで最後まで進む
+                if (dmac_.holdsBus()) {
+                    dmaWroteDmac_ = false;
+                    dmac_.runBusHolders(*this, &dmaWroteDmac_);
+                }
                 inDma_ = false;
+            } else {
+                dmaWroteDmac_ = true; // DMAC の転送が DMAC のレジスタを書いた
             }
             updateIrq();
         }

@@ -8,11 +8,19 @@
 #   ROM かディスクがなければ、何もせずに成功で終わる (ROM のない CI のため)。
 #   SCREENSHOT=out.png を指定すると、DIR のあとの画面を PNG で保存する (macOS の sips で変換する。out.ppm なら変換しない)。
 #   FB_SIZE=1920x1080 のように指定すると、フレームバッファをその大きさにする (既定 768x512。画面の拡大を見るとき)。
-#   SCALE=off を指定すると、pix68k.cfg に scale=off を書き、X68000 の画面を拡大しない。
-#   SCANLINE=on を指定すると、pix68k.cfg に scanline=on を書き、縦 2 倍以上に拡大したときに各行の最後の 1 行を暗くする
-#   (FB_SIZE=1920x1080 と SCREENSHOT で見る)。
+#   VIDEO_SCALE=off (か integer、aspect、full) を指定すると、pix68k.cfg に video_scale= を書く (画面の拡大の仕方)。
+#   VIDEO_FILTER=scanline,curve,mask (並べ方は自由。none も書ける) を指定すると、pix68k.cfg に video_filter= を書き、
+#   ブラウン管のように見せる効果を掛ける (platform/crt_effect.h。FB_SIZE=1920x1080 と SCREENSHOT で見る)。
+#   SCALE=off、SCANLINE=on (v0.1.0 の書き方) と CRT=full (使えなくなった書き方) を指定すると、scale=、crt=、scanline= を、
+#   video_filter= と video_scale= より前の行に書く (scale= と scanline= は読み替えて、crt= は無視して知らせることを見る)。Pi 3 で選べない組み合わせ (curve を含むもの、full と mask の組)
+#   のときは、選べるよう、カーネルに pix68k_crt_all=1 を渡す。PI3_LIMIT=1 なら渡さず、選べる組み合わせに替わることを見る。
 #   MESSAGE_PPM_COPY=out.ppm を HOSTNET=1 と指定すると、POST /message で左上にメッセージを出したときの画面 (QEMU の screendump) を写す。
-#   OSD=fps を指定すると、pix68k.cfg に osd=fps を書き、画面の右上にフレームの数と速さを出す (SCREENSHOT で見る。既定の osd=on は、右に余白がなければ出さない)。
+#   BEZEL=cz-600de (か cz-600db) を指定すると、video_filter= にモニタの枠の名前を足し (VIDEO_FILTER がなければ枠だけ)、
+#   枠の絵 (tools/bezel_cz600d.py と tools/bezel_pack.py で作る。numpy と Pillow が要る) を SD カードのイメージの /pix68k/ に写す。
+#   FB_SIZE=1920x1080 なら、絵を読み、X68000 の画面をガラスの矩形 (1160x870) に写したログを見る。ほかの大きさなら、
+#   大きさが違うので枠なしで写すログを見る。BEZEL_FILE=none なら絵を写さず、ないので枠なしで写すログを見る。
+#   BEZEL_FILE=bad なら壊れた絵を写し、読めないので枠なしで写すログを見る。
+#   OSD=fps を指定すると、pix68k.cfg に osd=fps を書き、画面の右上にフレームの数と速さを出す (SCREENSHOT で見る。既定の osd=on でも、余白がなければ X68000 の画面に重ねて出す。違うのはフレームバッファの高さが 148 ラインより低いときだけ)。
 #   BOOT=hd を指定すると、起動ディスクから tools/make_sasi_hdf.py で SASI のイメージを作り、
 #   フロッピーディスクの代わりに pix68k.cfg の hd0= でつないで、SASI から起動する。
 # RENDER_CORE=off を指定すると、pix68k.cfg に render_core=off を書き、画面の合成をコア 1 で行う。
@@ -126,7 +134,31 @@ else
 fi
 if [ -n "${RENDER_CORE:-}" ]; then printf 'render_core = %s\n' "$RENDER_CORE" >> "$WORK/pix68k.cfg"; fi
 if [ -n "${SCALE:-}" ]; then printf 'scale = %s\n' "$SCALE" >> "$WORK/pix68k.cfg"; fi
+if [ -n "${CRT:-}" ]; then printf 'crt = %s\n' "$CRT" >> "$WORK/pix68k.cfg"; fi
 if [ -n "${SCANLINE:-}" ]; then printf 'scanline = %s\n' "$SCANLINE" >> "$WORK/pix68k.cfg"; fi
+# 枠を写すか (絵を写し、フレームバッファが 1920x1080 で、GPU で拡大しない)。左上のメッセージの背景が変わる
+BEZEL_ON=0
+if [ -n "${BEZEL:-}" ] && [ "${BEZEL_FILE:-}" != none ] && [ "${BEZEL_FILE:-}" != bad ] && [ "$FB_SIZE" = 1920x1080 ] &&
+  [ -z "${GPU_SCALE:-}" ]; then
+  BEZEL_ON=1
+fi
+if [ -n "${BEZEL:-}" ]; then
+  printf 'video_filter = %s\n' "${VIDEO_FILTER:+$VIDEO_FILTER,}$BEZEL" >> "$WORK/pix68k.cfg"
+  case "${BEZEL_FILE:-}" in
+    none) ;;
+    bad)
+      printf 'PXBZ broken' > "$WORK/bezel-$BEZEL.bin"
+      mcopy -i "$IMG" "$WORK/bezel-$BEZEL.bin" "::/pix68k/bezel-$BEZEL.bin" ;;
+    *)
+      mkdir -p "$WORK/bezel"
+      python3 "$ROOT/tools/bezel_cz600d.py" "$WORK/bezel" >/dev/null
+      python3 "$ROOT/tools/bezel_pack.py" "$WORK/bezel/bezel-$BEZEL.png" "$WORK/bezel-$BEZEL.bin" >/dev/null
+      mcopy -i "$IMG" "$WORK/bezel-$BEZEL.bin" "::/pix68k/bezel-$BEZEL.bin" ;;
+  esac
+elif [ -n "${VIDEO_FILTER:-}" ]; then
+  printf 'video_filter = %s\n' "$VIDEO_FILTER" >> "$WORK/pix68k.cfg"
+fi
+if [ -n "${VIDEO_SCALE:-}" ]; then printf 'video_scale = %s\n' "$VIDEO_SCALE" >> "$WORK/pix68k.cfg"; fi
 if [ -n "${OSD:-}" ]; then printf 'osd = %s\n' "$OSD" >> "$WORK/pix68k.cfg"; fi
 if [ -n "${SOUND_CORE:-}" ]; then printf 'sound_core = %s\n' "$SOUND_CORE" >> "$WORK/pix68k.cfg"; fi
 if [ -n "${MIDI_SF2:-}" ]; then
@@ -178,6 +210,24 @@ if [ -n "${FAIL_CORE:-}" ]; then APPEND="$APPEND pix68k_fail_core=$FAIL_CORE"; f
 if [ -n "${WFE:-}" ]; then APPEND="$APPEND pix68k_wfe=$WFE"; fi
 if [ -n "${GPU_SCALE:-}" ]; then APPEND="$APPEND pix68k_gpu_scale=$GPU_SCALE"; fi
 if [ -n "${FB_ROWS:-}" ]; then APPEND="$APPEND pix68k_fb_rows=$FB_ROWS"; fi
+# 画面の出し方の最後の値 (tools/qemu_crt_expect.sh の video_resolve。VMODE は video_scale の名前、VBITS は video_filter のビット)
+. "$ROOT/tools/qemu_crt_expect.sh"
+# 期待の計算には、pix68k.cfg に実際に書く video_filter= の効果を渡す。BEZEL だけなら video_filter=cz-600de の行があるので、
+# 効果なし (none) の行として、前の scanline= に勝つ
+VF_EXPECT=${VIDEO_FILTER:-}
+if [ -n "${BEZEL:-}" ] && [ -z "$VF_EXPECT" ]; then VF_EXPECT=none; fi
+set -- $(video_resolve "${SCALE:-}" "${CRT:-}" "${SCANLINE:-}" "$VF_EXPECT" "${VIDEO_SCALE:-}") "$@"
+VMODE=$1 VBITS=$2
+shift 2
+if ! video_pi3_allowed "$VMODE" "$VBITS"; then
+  if [ "${PI3_LIMIT:-}" = 1 ]; then
+    set -- $(video_pi3_fallback "$VMODE" "$VBITS") "$@"
+    VMODE=$1 VBITS=$2
+    shift 2
+  else
+    APPEND="$APPEND pix68k_crt_all=1"
+  fi
+fi
 if [ -n "$NETDEV" ]; then APPEND="$APPEND pix68k_net_probe=1"; fi
 STREAM_OPT=
 if [ "${STREAM:-}" = 1 ]; then STREAM_OPT=pix68k_stream_min=0; APPEND="$APPEND $STREAM_OPT"; fi
@@ -363,7 +413,7 @@ if s is not None and b"pix68kout" in got.lower():
     check "$(code -H "$TOK" -X POST "$URL/key?up")" 200 'POST /key?up'
     # 画面の左上のメッセージ (POST /message。platform/osd_message.h): トークン、?sec= の検査、ログの 1 行、フレームバッファに
     # 出ること (QEMU の screendump。出ている間は左上の枠が白と黒だけで、消すと変わる)、/screen.ppm には出ないこと、
-    # ?sec=2 なら 2 秒で消えること。1 行目は 21 桁 (1920x1080 なら 2 倍で、左の余白から X68000 の画面に掛かる)
+    # ?sec=2 なら 2 秒で消えること。本文は 10 桁で折り返して「pix68k MSG」「1234567890」「案1 ｶﾅ」の 10 桁 x 3 行になる
     check "$(code --data 'x' "$URL/message")" 403 'POST /message without the token'
     check "$(code -H "$TOK" --data 'x' "$URL/message?sec=abc")" 400 'POST /message?sec=abc'
     MARK=$(lines)
@@ -398,14 +448,18 @@ w, h, on = ppm(sys.argv[1])
 _, _, off = ppm(sys.argv[2])
 sw, sh, scr = ppm(sys.argv[3])
 _, _, exp = ppm(sys.argv[4])
-# 左上 (8, 4) から 21 桁 x 2 行。1080 ライン以上なら 2 倍 (messageScale())
+# 左上 (8, 4) から 10 桁 x 3 行。1080 ライン以上なら 2 倍 (messageScale())
 k = 2 if h >= 900 else 1
 x0, y0 = 8 * k, 4 * k
-x1, y1 = x0 + 21 * 8 * k, y0 + 2 * 16 * k
+x1, y1 = x0 + 10 * 8 * k, y0 + 3 * 16 * k
 px = lambda d, x, y, w: d[(y * w + x) * 3:(y * w + x) * 3 + 3]
 box = [(x, y) for y in range(y0, y1) for x in range(x0, x1)]
 cols = set(px(on, x, y, w) for x, y in box)
-if not cols <= {b"\x00\x00\x00", b"\xff\xff\xff"} or len(cols) != 2: sys.exit("box is not white on black: %d colors" % len(cols))
+# モニタの枠を写しているときは、背景は枠の絵を半分の明るさにしたもの (どの色も 0x7f まで)
+if sys.argv[5] == "1":
+    dark = all(max(c) <= 0x7f for c in cols if c != b"\xff\xff\xff")
+    if b"\xff\xff\xff" not in cols or not dark or len(cols) < 2: sys.exit("box is not white on the dimmed bezel: %d colors" % len(cols))
+elif not cols <= {b"\x00\x00\x00", b"\xff\xff\xff"} or len(cols) != 2: sys.exit("box is not white on black: %d colors" % len(cols))
 diff = sum(px(on, x, y, w) != px(off, x, y, w) for x, y in box)
 if diff == 0: sys.exit("the box did not change after clearing")
 # ?sec=2 のメッセージは消えて、消したときと同じ画面に戻っている
@@ -414,7 +468,7 @@ if left: sys.exit("%d pixels differ after the message expired" % left)
 # /screen.ppm は X68000 の画面だけ。同じ大きさ (1 倍) なら、同じ位置が白と黒だけの枠になっていない
 if (sw, sh) == (w, h) and all(px(scr, x, y, sw) == px(on, x, y, w) for x, y in box): sys.exit("/screen.ppm has the message")
 print("%d pixels changed after clearing, %dx%d x%d" % (diff, w, h, k))
-' "$WORK/msg_on.ppm" "$WORK/msg_off.ppm" "$WORK/msg_screen.ppm" "$WORK/msg_expired.ppm"); then
+' "$WORK/msg_on.ppm" "$WORK/msg_off.ppm" "$WORK/msg_screen.ppm" "$WORK/msg_expired.ppm" "$BEZEL_ON"); then
       echo "ok: the message is on the framebuffer and expires ($R)"
     else
       echo "NG: the message on the framebuffer ($R)"; fail=1
@@ -600,7 +654,7 @@ fi
 FB_W=${FB_SIZE%x*} FB_H=${FB_SIZE#*x}
 K=$(( FB_W / 768 < FB_H / 512 ? FB_W / 768 : FB_H / 512 ))
 [ "$K" -gt 2 ] && K=2
-{ [ "$K" -lt 1 ] || [ "${SCALE:-auto}" = off ]; } && K=1
+{ [ "$K" -lt 1 ] || [ "$VMODE" = off ]; } && K=1
 # GPU_SCALE なら、枠は表示 (FB_SIZE) の大きさで決め、フレームバッファの中の倍率は GPU の倍率で割ったもの
 GX=1 GY=1
 case "${GPU_SCALE:-}" in
@@ -611,11 +665,71 @@ esac
 KX=$(( K / GX )) KY=$(( K / GY ))
 [ "$KX" -lt 1 ] && KX=1
 [ "$KY" -lt 1 ] && KY=1
-if [ "$FB_W" -ge 768 ] && [ "$FB_H" -ge 512 ]; then
-  set -- "$@" "screen mode 768x512, shown $((768 * KX))x$((512 * KY)) (x$KX, y$KY)"
+# video_scale=aspect と full は整数倍でない枠 (platform/crt_effect.h の videoFrameScale())。aspect は高さいっぱい
+# (1200 ラインまで) の 4:3、full はフレームバッファいっぱい (高さは 1200 ラインまで)。
+# 表ができるまでの数フレームは整数倍で写すが、ログ (コア 0 が出す) に出るのは整数倍でない枠のほうだけのことがあるので、
+# そちらだけを見る (GPU_SCALE なら、枠はフレームバッファ (FB_SIZE を GPU の倍率で割った大きさ) の中で決める)
+SW=$(( FB_W / GX )) SH=$(( FB_H / GY ))
+FILL_H=$(( SH < 1200 / GY ? SH : 1200 / GY )) FILL_W=0
+if [ "$GX" = "$GY" ]; then
+  case "$VMODE" in
+    aspect)
+      FILL_W=$(( FILL_H * 4 / 3 ))
+      [ "$FILL_W" -gt "$SW" ] && FILL_W=$SW && FILL_H=$(( SW * 3 / 4 )) ;;
+    full)
+      FILL_W=$(( SW * FILL_H / SH )) ;;
+  esac
+  { [ "$FILL_W" -lt 768 ] || [ "$FILL_H" -lt 512 ]; } && FILL_W=0
 fi
-# スキャンラインは縦 2 倍以上のときだけ暗くし、写す時間のログに「; scanlines」と出す
-if [ "${SCANLINE:-off}" = on ] && [ "$KY" -ge 2 ]; then set -- "$@" '; scanlines'; fi
+FILL=0
+[ "$FILL_W" -gt 0 ] && FILL=1
+# モニタの枠: 絵を読めて、フレームバッファが 1920x1080 なら、ガラスの矩形に写す (表を使う)
+BEZEL_SHOWN=
+if [ -n "${BEZEL:-}" ]; then
+  case "${BEZEL_FILE:-}" in
+    none) set -- "$@" "bezel: SD:/pix68k/bezel-$BEZEL.bin not found; showing without the bezel" ;;
+    bad) set -- "$@" "bezel: SD:/pix68k/bezel-$BEZEL.bin: not a bezel file; showing without the bezel" ;;
+    *)
+      if [ "$FB_SIZE" = 1920x1080 ] && [ "$GX" = 1 ] && [ "$GY" = 1 ]; then
+        set -- "$@" "bezel: SD:/pix68k/bezel-$BEZEL.bin (glass 1160x870 at 380,68)"
+        BEZEL_SHOWN=1
+      else
+        set -- "$@" "bezel: SD:/pix68k/bezel-$BEZEL.bin is 1920x1080 but the screen is $SW"x"$SH; showing without the bezel"
+      fi ;;
+  esac
+fi
+if [ -n "$BEZEL_SHOWN" ]; then
+  set -- "$@" "screen mode 768x512, shown 1160x870 (bezel $BEZEL)"
+elif [ "$FB_W" -ge 768 ] && [ "$FB_H" -ge 512 ]; then
+  if [ "$FILL_W" -gt 0 ]; then
+    set -- "$@" "screen mode 768x512, shown ${FILL_W}x${FILL_H} (video_scale=$VMODE)"
+  else
+    set -- "$@" "screen mode 768x512, shown $((768 * KX))x$((512 * KY)) (x$KX, y$KY)"
+  fi
+fi
+# video_scale=、video_filter= と前の書き方のログ (tools/qemu_crt_expect.sh。出るはずの行はここで足し、出ないはずの行は下で確かめる)
+CRT_EXPECT=$(crt_log_expect "${SCALE:-}" "${CRT:-}" "${SCANLINE:-}" "$VF_EXPECT" "${VIDEO_SCALE:-}" "$KY" "$FILL" "${PI3_LIMIT:-0}")
+if [ -n "${BEZEL:-}" ]; then
+  # 起動時の行は、効果のあとに枠の名前 (効果がなければ枠だけ)
+  CRT_EXPECT=$(echo "$CRT_EXPECT" | sed -e "s/^\(need screen: video_scale=[a-z]* video_filter=\)none\$/\1$BEZEL/" \
+    -e "/^need screen: video_scale=/{/$BEZEL\$/!s/\$/,$BEZEL/;}")
+  # Pi 3 で選べない組み合わせを替えた行も、両方の video_filter= に枠の名前が付く (枠は制限を変えない。platform::videoAllowedPi3())
+  CRT_EXPECT=$(echo "$CRT_EXPECT" | sed -E -e "/is not available on this Pi/{s/video_filter=([a-z,]+)( is|\$)/video_filter=\1,$BEZEL\2/g;s/=none,$BEZEL/=$BEZEL/g;}")
+fi
+if [ -n "$BEZEL_SHOWN" ]; then
+  # 枠を写すときは、効果がなくても表で写す
+  CRT_EXPECT=$(echo "$CRT_EXPECT" | grep -v -e '^absent ; video_filter=' -e '^absent screen: video table:' -e '^need ; video_filter=' \
+    -e '^need screen: video table:' -e '^absent ; scanlines' -e '^need ; scanlines'
+    echo "need ; video_filter=$(video_filter_name "$VBITS")"
+    echo 'need screen: video table: 1 built over ')
+fi
+CRT_ABSENT=$(echo "$CRT_EXPECT" | sed -n 's/^absent //p')
+CRT_NEED=$(echo "$CRT_EXPECT" | sed -n 's/^need //p')
+while IFS= read -r line; do
+  [ -n "$line" ] && set -- "$@" "$line"
+done <<EOF_NEED
+$CRT_NEED
+EOF_NEED
 if [ -n "${MIDI_SF2:-}" ]; then
   set -- "$@" 'MIDI board (CZ-6BM1, YM3802) at $EAFA00' 'presets, 48 voices, '
 fi
@@ -636,6 +750,18 @@ for pattern in "$@"; do
     fail=1
   fi
 done
+# 出ないはずの効果のログ (tools/qemu_crt_expect.sh)
+while IFS= read -r pattern; do
+  [ -n "$pattern" ] || continue
+  if grep -aqF -- "$pattern" "$WORK/serial.txt" 2>/dev/null; then
+    echo "NG: not expected: $pattern"
+    fail=1
+  else
+    echo "ok: not expected and not found: $pattern"
+  fi
+done <<EOF_ABSENT
+$CRT_ABSENT
+EOF_ABSENT
 if [ -n "${MIDI_SF2:-}" ]; then
   # SoundFont を読み終えたログが、コア 1 が動き出したログより後にあること (起動を遅らせない)
   c1=$(grep -anF 'core 1 started' "$WORK/serial.txt" | head -n 1 | cut -d: -f1)

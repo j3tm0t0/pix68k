@@ -1095,7 +1095,8 @@ void testBfffoOffset(bool fast) {
 
 // run() は、attn_ が 0 の間、命令の前の検査 (止まっているか、割り込み、トレース) を省く (cpu020.h の attn_)。
 // 検査が要るようになる所 (setSR()、setIPL()、setRegisters()、命令の打ち切り、reset()) が attn_ を立てることを確かめる。
-// どれも run() だけで動かし (step() は自分で attn_ を立てる)、先に何命令か動かして attn_ が 0 になったのを見てから調べる。
+// どれも run() だけで動かし (step() は自分で attn_ を立てる)、先に何命令か動かして attn_ の ATTN_CHECK が 0 になったのを
+// 見てから調べる (68060 は、リセットのあと命令キャッシュが無効なので、ATTN_FETCH は立ったまま)。
 // 例外の行き先は STOP #$2700 にして、積まれた PC から、どの命令の切れ目で例外になったかを見る。
 // 68030 と 68060 の両方で動かす (run() の繰り返しは CPU の種類ごとに別のコードになる)
 void testAttention(bool fast, CpuModel model) {
@@ -1112,7 +1113,7 @@ void testAttention(bool fast, CpuModel model) {
         prepare(e, {NOP, NOP, NOP, NOP, NOP, NOP, 0x027c, 0xf8ff, ADDQ_D0, ADDQ_D0, ADDQ_D0, ADDQ_D0, LOOP}, 27);
         c.setIPL(3);
         c.run(2);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         CHECK_EQ(c.pc_ < 0x100c, true);
         c.run(300);
         CHECK_EQ(c.stopped(), true);
@@ -1125,7 +1126,7 @@ void testAttention(bool fast, CpuModel model) {
         Cpu020& c = e.cpu;
         prepare(e, {NOP, NOP, NOP, NOP, NOP, NOP, 0x007c, 0x8000, ADDQ_D0, ADDQ_D0, ADDQ_D0, ADDQ_D0, LOOP}, 9);
         c.run(2);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         CHECK_EQ(c.pc_ < 0x100c, true);
         c.run(300);
         CHECK_EQ(c.stopped(), true);
@@ -1139,7 +1140,7 @@ void testAttention(bool fast, CpuModel model) {
         Cpu020& c = e.cpu;
         prepare(e, {NOP, NOP, NOP, NOP, NOP, NOP, 0x4e72, 0x2000, ADDQ_D0, LOOP}, 0);
         c.run(2);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         CHECK_EQ(c.pc_ < 0x100c, true);
         c.run(300);
         CHECK_EQ(c.stopped(), true);
@@ -1161,7 +1162,7 @@ void testAttention(bool fast, CpuModel model) {
         prepare(e, {LOOP}, 28);
         c.setSR(0x2000);
         c.run(20);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         c.setIPL(4);
         c.run(300);
         CHECK_EQ(c.stopped(), true);
@@ -1175,7 +1176,7 @@ void testAttention(bool fast, CpuModel model) {
         e.bus.put(0x2000, {ADDQ_D0, LOOP});
         c.setIPL(3);
         c.run(20);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         Registers r;
         c.getRegisters(r);
         r.sr = 0x2000;
@@ -1192,7 +1193,7 @@ void testAttention(bool fast, CpuModel model) {
         prepare(e, {LOOP}, 9);
         e.bus.put(0x2000, {ADDQ_D0, ADDQ_D0, LOOP});
         c.run(20);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         Registers r;
         c.getRegisters(r);
         r.sr = 0xa700;
@@ -1209,7 +1210,7 @@ void testAttention(bool fast, CpuModel model) {
         prepare(e, {NOP, NOP, NOP, NOP, NOP, NOP, 0x4a39, 0x00c0, 0x0000, ADDQ_D0, ADDQ_D0, LOOP}, 0); // TST.B $C00000
         c.a_[7] = 0xc00100;
         c.run(2);
-        CHECK_EQ(c.attn_, 0);
+        CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
         CHECK_EQ(c.pc_ < 0x100c, true);
         c.run(300);
         CHECK_EQ(c.halted(), true);
@@ -1242,7 +1243,7 @@ void testResetHalts(CpuModel model) {
     bus.put(0x1000, {0x5280, 0x60fc}); // ADDQ.L #1,D0; BRA.S $1000
     c.reset();
     c.run(100);
-    CHECK_EQ(c.attn_, 0);
+    CHECK_EQ(c.attn_ & Cpu020::ATTN_CHECK, 0);
     CHECK_EQ(c.d_[0] > 0, true);
     bus.bad0 = true;
     c.reset();

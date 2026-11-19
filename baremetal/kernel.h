@@ -30,12 +30,16 @@
 #include "pi5_fan.h"
 #include "sound_out.h"
 #include "platform/boot_drive.h"
+#include "platform/bezel.h"
+#include "platform/crt_effect.h"
+#include "platform/boot_profile.h"
 #include "platform/frame_scale.h"
 #include "platform/snapshot_wait.h"
 #include "platform/input_map.h"
 #include "platform/key_merge.h"
 #include "platform/key_remap.h"
 #include "platform/key_tracker.h"
+#include "platform/key_type.h"
 #include "platform/menu.h"
 #include "platform/osd.h"
 #include "platform/osd_message.h"
@@ -148,6 +152,22 @@ private:
     void ReadConfig();
     void ApplySettings();
     bool SaveConfig(const platform::Settings& s);
+    // 起動の組み合わせ (platform/boot_profile.h。machine_run.cpp)
+    FRESULT LoadConfigText(const char* name, const char* tmpName, platform::ConfigText& text, CString& path);
+    bool LoadSavedConfigText(const char* name, const char* tmpName, platform::ConfigText& text);
+    void ChooseProfile();
+    void ListProfiles(platform::ProfileList& list);
+    bool ProfileFileExists(const char* name);
+    int RunBootMenu(const platform::ProfileList& list, int initial);
+    void DrawBootMenu(const platform::BootMenu& menu);
+    void BootMenuKeys(u8 mods, const u8 down[32]);
+    bool WriteProfileChoice(const char* name, bool once);
+    bool RequestProfileChoice(const char* name);
+    bool CancelProfileChoice();
+    bool CancelProfileChoiceForRestart(const char* who);
+    void ReapplyInputSettings(int keyboard, int hat);
+    void StartAutoType();
+    void ServiceAutoType();
     bool EjectDisk(int drive, bool discard = false);
     // ディスクの書き戻し (machine_run.cpp)
     int OpenHardDiskImage(int disk, const char* name, bool cdrom, x68k::HardDiskImage*& image, u32 cdBlockSize = 2048);
@@ -164,6 +184,7 @@ private:
         BootDevices,    // 画面、UART、割り込み、タイマを用意した
         BootMounted,    // SD カード (Pi 5 は NVMe も) をマウントした
         BootConfig,     // pix68k.cfg を読み始める
+        BootProfile,    // 起動の組み合わせのメニューを出した
         BootRoms,       // ROM を読み終えた
         BootSetUp,      // X68000 を用意した
         BootDisks,      // ディスクのイメージを読み終えた (大きなイメージは開いただけ)
@@ -234,7 +255,7 @@ private:
     void LoadScsi();
     void LoadSram();
     bool SaveSram(const u8* data);
-    void ShowFrame(const Emulator::Frame& frame);
+    void ShowFrame(const Emulator::Frame& frame, bool stopped = false);
     void DumpText();
     void ReportSpeed();
     void ReportMaxSpeed(); // 最高速モードの CPU の速さをログに出す (2 秒ごと)
@@ -308,6 +329,7 @@ private:
     void netIdleUntil(u64 deadline) override { IdleUntil(deadline); }
     bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) override;
     void netRequestReboot() override;
+    platform::ProfileRequest netBootProfile(const char* name) override;
     bool netKeyReport(u8 modifiers, const u8 keys[6]) override;
     unsigned netLog(char* out) override { return m_LogRing.Snapshot(out); }
     void netThermal(CString& out) override;
@@ -316,7 +338,6 @@ private:
     }
     NetSerialLink* netSerialLink() override { return m_pSerialLink; }
     bool netMessage(const char* text, unsigned n, unsigned sec) override;
-    bool hasScale() const override { return true; }
     // Pi 3 では SC-55 の音源を使わない (StartMidiSc55())
     bool hasMidiOut(int out) const override {
 #if RASPPI <= 3
@@ -327,9 +348,20 @@ private:
 #endif
     }
     // メニューを開いている間は合成するコアに写す役を任せないので、コア 0 が書き換えてよい。次に写すときから反映する
-    void scaleChanged(int scale) override { m_Settings.scale = scale; }
-    // スキャンラインも同じ (変わったら presentScaled() がすべての行を写し直す)
-    void scanlineChanged(int scanline) override { __atomic_store_n(&m_Settings.scanline, scanline, __ATOMIC_RELAXED); }
+    // 画面の出し方 (video_scale=、video_filter=)。変わったら ShowFrame() がすべての行を写し直す。
+    // この機種で選べない組み合わせは使わない (メニューは選ばないが、念のため)
+    bool hasVideo() const override { return true; }
+    bool hasBezel() const override { return true; }
+    bool videoAllowed(int scale, int filter) const override { return VideoAllowed(scale, filter); }
+    // 枠 (video_filter= の cz-600de / cz-600db) は、絵を読めたときだけ選べる (初めて聞かれたときに起動したドライブから読む。
+    // LoadBezel())。メニューが聞くのは、Bezel で枠を替えるときだけ (platform::MenuHost::bezelAvailable())
+    bool bezelAvailable(int filter) const override { return const_cast<CKernel*>(this)->LoadBezel(filter) != nullptr; }
+    void videoChanged(int scale, int filter) override {
+        if (!VideoAllowed(scale, filter)) return;
+        m_Settings.videoScale = scale;
+        m_Settings.videoFilter = filter;
+        __atomic_store_n(&m_Video, scale << 16 | filter, __ATOMIC_RELAXED);
+    }
     // 画面の隅の数字も同じ。数字は数え直す (前に出していた数字は出さない)
     void osdChanged(int osd) override {
         m_Settings.osd = osd;
@@ -484,6 +516,19 @@ private:
     // 書き換える)、m_FileSettings は pix68k.cfg に書いてある設定 (メニューの「Save settings」はこれと違う項目だけを書く)
     platform::Settings m_Settings, m_FileSettings;
     bool m_FdExplicit[2] = {false, false}; // pix68k.cfg に fd0= / fd1= の行がある (空なら、既定の名前を探さない)
+    // 起動の組み合わせ (platform/boot_profile.h)。m_Profile は動いている組み合わせの名前 (空なら pix68k.cfg だけ)。
+    // 組み合わせで動いているときは、m_FileSettings は pix68k.cfg と組み合わせのファイルを重ねた値
+    char m_Profile[platform::PROFILE_NAME_MAX + 1] = {};
+    // profile.sel に書いてある前回の選択と、POST /reboot?profile= で once 付きで書いたか。再起動を断ったときと、
+    // そのあと profile= なしの POST /reboot が来たときは、前回の選択に書き戻す
+    platform::ProfileChoiceStore m_ProfileChoice;
+    u8* m_pBootCgrom = nullptr;            // メニューの字に使うために先に読んだ CGROM (StartMachine() がそのまま使う)
+    volatile bool m_BootMenuActive = false; // 起動の組み合わせのメニューを出している (キーとゲームパッドをメニューに渡す)
+    u8 m_BootMenuHeld[32] = {};            // メニューの間に押していたキー (USB の割り込みだけが触る)
+    volatile u8 m_BootPadBits[2] = {};     // メニューの間のゲームパッドのジョイスティックのビット
+    volatile unsigned m_BootPadReports[2] = {}; // メニューの間に来たゲームパッドのレポートの数
+    u64 m_PadAttachTicks[2] = {};          // ゲームパッドをつないだ時刻 (CTimer::GetClockTicks64())
+    platform::AutoTyper m_AutoTyper;       // autotype= (起動したあとに打つ文字列)
     u64 m_BootTicks[BootStages] = {};  // 起動の各段階の時刻 (BootStage。0 はまだ)
     bool m_UsbStarted = false;         // USB のホストコントローラを初期化した (ScanUsb())
     bool m_UsbOk = false;              // 初期化に成功した (失敗したら UpdatePlugAndPlay() を呼ばない)
@@ -513,8 +558,39 @@ private:
     int m_ShownWidth = -1, m_ShownHeight = -1;
     // ShowFrame() が使う (コア 0 か、写す役を任された合成するコアのどちらか一方だけが触る。platform/frame_handoff.h)
     platform::FrameScale m_ShownScale;      // 最後に写したときの倍率と位置 (変われば枠の外を塗り直す)
-    bool m_ScanlineShown = false;           // 最後に写したとき暗くする行を入れたか (ShowFrame() が書き、コア 0 がログに使う)
+    // 最後に写したときの写し方 (表で写したら kCrtShownMap | video_filter、スキャンラインだけなら CRT_SCANLINE、
+    // ほかは 0。ShowFrame() が書き、コア 0 がログに使う)
+    int m_CrtShown = 0;
+    static constexpr int kCrtShownMap = 0x10;
     alignas(16) u32 m_ScaleLine[4096];      // 拡大した 1 行 (platform/frame_scale.h の presentScaled())
+    alignas(16) u32 m_ScaleLine2[4096];     // もう 1 行 (platform/crt_effect.h の presentCrt() がにじませるときに使う)
+    // 画面の出し方 (video_scale=、video_filter=。platform/crt_effect.h)
+    int m_Video = platform::VIDEO_SCALE_INTEGER << 16; // video_scale << 16 | video_filter (コア 0 が書き、写す役のコアが読む)
+    bool m_VideoAll = false;                // pix68k_crt_all=1 (Pi 3 でもどの組み合わせも選べる。VideoAllowed())
+    platform::CrtMap m_CrtMap;              // 表 (写す役のコアだけが触る。画面の大きさか組み合わせが変わると作り直す)
+    int m_CrtLast = 0;                      // 前に写したときの写し方 (m_CrtShown と同じ形。変わったらすべての行を写す。写す役のコアだけが触る)
+    uint32_t m_CrtSerialShown = 0;          // 最後に効果を掛けて写した表 (CrtMap::serial。変わったらすべての行を写す)
+    // 表は、フレームを写すたびに kCrtBuildSliceUs だけ作り進める (ShowFrame()。1 回で作ると、Pi 3 では 39ms かかり、
+    // その間に来たフレームが写されずに置き換わる)。Pi 3 の 1920x1080 で 20 フレームほどかかる
+    static constexpr unsigned kCrtBuildSliceUs = 2000;
+    // ログ用 (写す役のコアが書き、コア 0 が読む)
+    uint32_t m_CrtBuildUs = 0;              // 1 フレームで表を作るのに使った時間の最大 (コア 0 が読んで 0 に戻す)
+    uint32_t m_CrtBuildSlices = 0;          // 表を作り進めたフレームの数
+    uint32_t m_CrtBuildTotalUs = 0;         // 表を作るのに使った時間の合計
+    uint32_t m_CrtBuildsDone = 0;           // 作り終えた表の数
+    uint32_t m_CrtBuildSlicesLogged = 0, m_CrtBuildTotalUsLogged = 0, m_CrtBuildsDoneLogged = 0; // コア 0 だけが触る
+    void StartCrt();
+    bool VideoAllowed(int scale, int filter) const;
+    // モニタの枠 (video_filter= の cz-600de / cz-600db。platform/bezel.h)。絵は初めて使うときに起動したドライブの /pix68k/ から読み、
+    // 読めたものは持っておく (2 つで 16MB)。読むのはコア 0 だけ (StartCrt() とメニュー。メニューを開いている間は、
+    // 合成するコアに写す役を任せない)。読めなかった枠は読み直さない (ログは 1 回)
+    platform::BezelImage m_Bezel[2];
+    bool m_BezelTried[2] = {false, false};
+    const platform::BezelImage* LoadBezel(int filter);
+    // ShowFrame() が使う (写す役のコアだけが触る)。いまの枠の外は枠の絵か (どの枠か。0 なら枠なし)
+    int m_BezelShown = 0;
+    int m_BezelSkip = 0;               // 枠を出さない理由 (platform::bezelSkipCode())。ShowFrame() が毎フレーム書き、コア 0 が読む
+    platform::BezelSkipLog m_BezelSkipLog; // コア 0 だけが触る
     platform::OsdState m_OsdState;          // 画面の隅の数字の、いま出ているもの (platform/osd.h)
     // 画面の左上のメッセージ (POST /message。platform/osd_message.h)。字形はコア 0 が作って s_MsgBox (machine_run.cpp)
     // に置き、写す役のコアが ShowFrame() で s_MsgShown に写す。ここの 3 つは写す役のコアだけが触る
@@ -547,7 +623,7 @@ private:
     bool m_ComposerPresenting = false;
     uint64_t m_SpeedCyclesLogged = 0, m_SpeedUsLogged = 0; // 前の speed のログのときの数 (区間の速さを出す)
     // 画面の隅の数字 (osd=on / fps)。コア 0 が 1 秒ごとに数え (UpdateOsd())、platform::packOsd() で詰めて PublishOsd() で
-    // m_OsdValue (64 ビット 2 つ) に置く。写す役のコアが ShowFrame() で LoadOsd() で読む。2 つの語を片方だけ新しい値で
+    // m_OsdValue (64 ビット 3 つ) に置く。写す役のコアが ShowFrame() で LoadOsd() で読む。3 つの語の一部だけ新しい値で
     // 読まないよう、版の番号 m_OsdSeq で受け渡す (seqlock。書くのはコア 0 だけ。書いている間は奇数)。
     // ログの数 (m_ScreenLogged など) とは別に、前に数えたときの数を持つ
     void PublishOsd(const platform::OsdValue& v) {
@@ -556,6 +632,7 @@ private:
         __atomic_thread_fence(__ATOMIC_RELEASE);
         __atomic_store_n(&m_OsdValue.a, v.a, __ATOMIC_RELAXED);
         __atomic_store_n(&m_OsdValue.b, v.b, __ATOMIC_RELAXED);
+        __atomic_store_n(&m_OsdValue.c, v.c, __ATOMIC_RELAXED);
         __atomic_store_n(&m_OsdSeq, seq + 2, __ATOMIC_RELEASE);
     }
     platform::OsdValue LoadOsd() const {
@@ -564,6 +641,7 @@ private:
             const unsigned seq = __atomic_load_n(&m_OsdSeq, __ATOMIC_ACQUIRE);
             v.a = __atomic_load_n(&m_OsdValue.a, __ATOMIC_RELAXED);
             v.b = __atomic_load_n(&m_OsdValue.b, __ATOMIC_RELAXED);
+            v.c = __atomic_load_n(&m_OsdValue.c, __ATOMIC_RELAXED);
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             if (!(seq & 1) && __atomic_load_n(&m_OsdSeq, __ATOMIC_RELAXED) == seq) return v;
         }

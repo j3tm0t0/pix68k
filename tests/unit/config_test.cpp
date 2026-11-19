@@ -3,6 +3,7 @@
 #include "platform/config_text.h"
 #include "platform/settings.h"
 #include "platform/settings_file.h"
+#include "platform/setting_warning.h"
 #include "test_check.h"
 
 #include <string.h>
@@ -144,6 +145,12 @@ void testSettings() {
     CHECK_EQ((int)applySetting(s, "speed060", "4"), (int)SettingResult::BAD_VALUE);
     CHECK_EQ((int)applySetting(s, "speed060", "3201"), (int)SettingResult::BAD_VALUE);
     CHECK_EQ(s.speed060, 30);
+    CHECK_EQ(s.busSyncSprite, 0); // 既定はそろえない (#218)
+    CHECK_EQ((int)applySetting(s, "bus_sync_sprite", "on"), (int)SettingResult::OK);
+    CHECK_EQ(s.busSyncSprite, 1);
+    CHECK_EQ((int)applySetting(s, "bus_sync_sprite", "1600"), (int)SettingResult::BAD_VALUE);
+    CHECK_EQ((int)applySetting(s, "bus_sync_sprite", "off"), (int)SettingResult::OK);
+    CHECK_EQ(s.busSyncSprite, 0);
     CHECK_EQ((int)applySetting(s, "max_speed_limit", "100"), (int)SettingResult::OK);
     CHECK_EQ(s.maxSpeedLimit, 100);
     CHECK_EQ((int)applySetting(s, "max_speed_limit", "-1"), (int)SettingResult::BAD_VALUE);
@@ -153,18 +160,182 @@ void testSettings() {
     CHECK_EQ(s.hat, 1);
     CHECK_EQ((int)applySetting(s, "sram_memsize", "keep"), (int)SettingResult::OK);
     CHECK_EQ(s.fixSramMemsize, 0);
-    CHECK_EQ(s.scale, 1); // 既定は auto (拡大する)
-    CHECK_EQ((int)applySetting(s, "scale", "off"), (int)SettingResult::OK);
-    CHECK_EQ(s.scale, 0);
-    CHECK_EQ((int)applySetting(s, "scale", "2"), (int)SettingResult::BAD_VALUE);
-    CHECK_EQ((int)applySetting(s, "scale", "auto"), (int)SettingResult::OK);
-    CHECK_EQ(s.scale, 1);
-    CHECK_EQ(s.scanline, 0); // 既定は off
-    CHECK_EQ((int)applySetting(s, "scanline", "on"), (int)SettingResult::OK);
-    CHECK_EQ(s.scanline, 1);
-    CHECK_EQ((int)applySetting(s, "scanline", "50"), (int)SettingResult::BAD_VALUE);
-    CHECK_EQ((int)applySetting(s, "scanline", "off"), (int)SettingResult::OK);
-    CHECK_EQ(s.scanline, 0);
+    // video_scale= と video_filter= (画面の出し方)
+    {
+        using namespace platform;
+        Settings v;
+        CHECK_EQ(v.videoScale, VIDEO_SCALE_INTEGER); // 既定は整数倍
+        CHECK_EQ(v.videoFilter, CRT_OFF);            // 既定は効果なし
+        static const char* const kScales[] = {"off", "integer", "aspect", "full"};
+        for (int i = 0; i < 4; i++) {
+            CHECK_EQ((int)applySetting(v, "video_scale", kScales[i]), (int)SettingResult::OK);
+            CHECK_EQ(v.videoScale, i);
+            CHECK_EQ(strcmp(videoScaleName(i), kScales[i]), 0);
+        }
+        CHECK_EQ((int)applySetting(v, "video_scale", "auto"), (int)SettingResult::BAD_VALUE);
+        CHECK_EQ(v.videoScale, VIDEO_SCALE_FULL); // 変えない
+        // video_filter= は , で並べる。順番は問わず、前後の空白と空の項目は無視する。「none」か空なら効果なし。
+        // 知らない名前 (後の版で増える名前) は飛ばして、知っている名前だけを使い、IGNORED_NAME を返す。
+        // 枠 (cz-600de、cz-600db) はどちらか 1 つで、両方を書いたらあとのものを使い、EXCLUSIVE_NAME を返す
+        const int OK = (int)SettingResult::OK, IGN = (int)SettingResult::IGNORED_NAME,
+                  EXC = (int)SettingResult::EXCLUSIVE_NAME;
+        static const struct {
+            const char* value;
+            int bits, result;
+        } kFilters[] = {
+            {"scanline", CRT_SCANLINE, OK},
+            {"curve", CRT_CURVE, OK},
+            {"mask", CRT_MASK, OK},
+            {"scanline,curve,mask", CRT_FULL, OK},
+            {"mask, scanline", CRT_GRILLE, OK},
+            {" curve ,scanline ", CRT_GEOM, OK},
+            {"curve,curve", CRT_CURVE, OK},
+            {"none", CRT_OFF, OK},
+            {"", CRT_OFF, OK},
+            {"scanline,", CRT_SCANLINE, OK},
+            {",scanline", CRT_SCANLINE, OK},
+            {"scanline,,mask", CRT_GRILLE, OK},
+            {"scanline,none", CRT_SCANLINE, OK},
+            {"scanline,cz-600xx", CRT_SCANLINE, IGN},
+            {"scanline,cz-600de", CRT_SCANLINE | CRT_BEZEL_DE, OK},
+            {"cz-600db", CRT_BEZEL_DB, OK},
+            {"cz-600db,curve,mask", CRT_CURVE | CRT_MASK | CRT_BEZEL_DB, OK},
+            {"cz-600de,cz-600de", CRT_BEZEL_DE, OK},
+            {"cz-600de,scanline,cz-600db", CRT_SCANLINE | CRT_BEZEL_DB, EXC},
+            {"cz-600db,cz-600de", CRT_BEZEL_DE, EXC},
+            {"cz-600db,cz-600de,bezel", CRT_BEZEL_DE, IGN},
+            {"grille", CRT_OFF, IGN},
+            {"Scanline", CRT_OFF, IGN},
+        };
+        for (const auto& f : kFilters) {
+            v.videoFilter = CRT_MASK;
+            CHECK_EQ((int)applySetting(v, "video_filter", f.value), f.result);
+            CHECK_EQ(v.videoFilter, f.bits);
+        }
+        {
+            char msg[120];
+            formatSettingWarning(msg, sizeof msg, "video_filter", "scanline,cz-600xx", SettingResult::IGNORED_NAME);
+            CHECK_EQ(strcmp(msg, "video_filter=scanline,cz-600xx: unknown names ignored"), 0);
+            formatSettingWarning(msg, sizeof msg, "video_filter", "cz-600de,cz-600db", SettingResult::EXCLUSIVE_NAME);
+            CHECK_EQ(strcmp(msg, "video_filter=cz-600de,cz-600db: only one bezel can be used; using the last one"), 0);
+        }
+        // 書く形は「scanline,curve,mask」の順。効果がなければ「none」
+        const SettingKey* fk = findSettingKey("video_filter");
+        const SettingKey* sk = findSettingKey("video_scale");
+        CHECK_EQ(fk != nullptr && sk != nullptr, 1);
+        // どちらもホスト版でも使い、すぐに反映する (「*」を付けない)
+        CHECK_EQ(fk && sk && !fk->restart && fk->host && !sk->restart && sk->host, 1);
+        if (fk && sk) {
+            // 枠のビットも書いて読み戻す (書く形は効果のあとに枠の名前)
+            for (int i = 0; i < CRT_PRESET_COUNT * 3; i++) {
+                const int b = (i & CRT_EFFECT_BITS) | (i / CRT_PRESET_COUNT == 1 ? CRT_BEZEL_DE : i / CRT_PRESET_COUNT == 2 ? CRT_BEZEL_DB : 0);
+                char out[40];
+                v.videoFilter = b;
+                CHECK_EQ(formatSetting(v, *fk, out, sizeof out), 1);
+                CHECK_EQ(strcmp(out, videoFilterName(b)), 0);
+                // 書いた値を読むと同じになる
+                Settings w;
+                CHECK_EQ((int)applySetting(w, "video_filter", out), (int)SettingResult::OK);
+                CHECK_EQ(w.videoFilter, b);
+            }
+            char small[6];
+            v.videoFilter = CRT_FULL;
+            CHECK_EQ(formatSetting(v, *fk, small, sizeof small), 0); // 入りきらない
+        }
+        CHECK_EQ(strcmp(videoFilterName(CRT_GRILLE), "scanline,mask"), 0);
+        CHECK_EQ(strcmp(videoFilterName(CRT_FULL | CRT_BEZEL_DB), "scanline,curve,mask,cz-600db"), 0);
+        CHECK_EQ(strcmp(videoFilterName(CRT_BEZEL_DE), "cz-600de"), 0);
+        CHECK_EQ(strcmp(videoFilterName(CRT_BEZEL_BITS), "?"), 0);
+        CHECK_EQ(videoBezel(CRT_SCANLINE | CRT_BEZEL_DB), 2);
+        CHECK_EQ(videoBezelName(CRT_FULL) == nullptr, true);
+        CHECK_EQ(strcmp(videoFilterName(CRT_OFF), "none"), 0);
+        // 前の書き方 (scale=、scanline=、crt=) は読み替えて LEGACY を返す (知らせる)。
+        // 項目の表にはない (保存では書かない)
+        CHECK_EQ(findSettingKey("scale") == nullptr && findSettingKey("scanline") == nullptr &&
+                     findSettingKey("crt") == nullptr && findSettingKey("curve") == nullptr &&
+                     findSettingKey("mask") == nullptr,
+                 1);
+        CHECK_EQ(isLegacySettingKey("scale") && isLegacySettingKey("scanline") && !isLegacySettingKey("crt") &&
+                     !isLegacySettingKey("video_scale"),
+                 1);
+        // 行を順に読んだあとの値 (公開版 v0.1.0 のベアメタル版と同じ見た目になる。scale=off は 1 倍、auto は整数倍、
+        // scanline=on はスキャンライン)。legacy は前の書き方の行の数、removed は crt= の行の数
+        static const struct {
+            const char* lines;
+            int scale, filter, legacy, removed;
+        } kLegacy[] = {
+            {"scale=off", VIDEO_SCALE_OFF, CRT_OFF, 1, 0},
+            {"scale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0},
+            {"scanline=on", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
+            {"scale=off\nscanline=on", VIDEO_SCALE_OFF, CRT_SCANLINE, 2, 0},
+            {"scale=off\nscale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
+            // いまの書き方とまざったら、キーごとにあとの行が勝つ
+            {"video_scale=full\nscale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0},
+            {"scale=off\nvideo_scale=full", VIDEO_SCALE_FULL, CRT_OFF, 1, 0},
+            {"video_filter=mask\nscanline=on", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nvideo_filter=mask", VIDEO_SCALE_INTEGER, CRT_MASK, 1, 0},
+            {"scanline=on\nvideo_filter=mask\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
+            // scale= と video_filter=、scanline= と video_scale= は互いに関係しない
+            {"scale=off\nvideo_filter=curve", VIDEO_SCALE_OFF, CRT_CURVE, 1, 0},
+            {"video_scale=aspect\nscanline=on", VIDEO_SCALE_ASPECT, CRT_SCANLINE, 1, 0},
+            // 受け付けなかった video_scale= / video_filter= の行は、前の scale= / scanline= を消さない
+            {"scale=off\nvideo_scale=typo", VIDEO_SCALE_OFF, CRT_OFF, 1, 0},
+            {"scanline=on\nvideo_filter=scanline,", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nvideo_filter=cz-600xx", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0}, // 知らない名前だけでも受け付けた行
+            {"scanline=on\nvideo_filter=cz-600de", VIDEO_SCALE_INTEGER, CRT_BEZEL_DE, 1, 0}, // 枠だけの行も、前の scanline= に勝つ
+            // crt= (公開版に出ていない) は読み替えずに無視する
+            {"crt=full", VIDEO_SCALE_INTEGER, CRT_OFF, 0, 1},
+            {"crt=full\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 1},
+            {"scale=off\ncrt=grille", VIDEO_SCALE_OFF, CRT_OFF, 1, 1},
+            {"video_filter=mask\ncrt=off", VIDEO_SCALE_INTEGER, CRT_MASK, 0, 1},
+        };
+        for (const auto& l : kLegacy) {
+            ConfigText c;
+            c.load(l.lines, strlen(l.lines));
+            Settings t;
+            int legacy = 0, removed = 0;
+            readSettings(
+                c, t,
+                [&](const char*, const char*, SettingResult r) {
+                    legacy += r == SettingResult::LEGACY;
+                    removed += r == SettingResult::REMOVED;
+                },
+                [](const char*) {});
+            CHECK_EQ(t.videoScale, l.scale);
+            CHECK_EQ(t.videoFilter, l.filter);
+            CHECK_EQ(legacy, l.legacy);
+            CHECK_EQ(removed, l.removed);
+        }
+        {
+            // ホスト版 (legacyVideo が 0) は、v0.1.0 のホスト版と同じく scale= と scanline= を読まず、知らせもしない
+            const char* text = "scale=off\nscanline=on\nscale=typo\nscanline=typo\n";
+            ConfigText c;
+            c.load(text, strlen(text));
+            Settings h;
+            h.videoScale = VIDEO_SCALE_ASPECT;
+            h.legacyVideo = 0;
+            int warned = 0;
+            readSettings(c, h, [&](const char*, const char*, SettingResult) { warned++; }, [](const char*) {});
+            CHECK_EQ(warned, 0);
+            CHECK_EQ(h.videoScale, (int)VIDEO_SCALE_ASPECT);
+            CHECK_EQ(h.videoFilter, (int)CRT_OFF);
+        }
+        Settings b;
+        CHECK_EQ((int)applySetting(b, "crt", "on"), (int)SettingResult::REMOVED);
+        CHECK_EQ((int)applySetting(b, "scale", "2"), (int)SettingResult::BAD_VALUE);
+        CHECK_EQ((int)applySetting(b, "scanline", "50"), (int)SettingResult::BAD_VALUE);
+        CHECK_EQ(b.videoScale == VIDEO_SCALE_INTEGER && b.videoFilter == CRT_OFF, 1); // 変えない
+        CHECK_EQ((int)applySetting(b, "curve", "on"), (int)SettingResult::UNKNOWN_KEY); // 出していない書き方
+        // ログの文言
+        char msg[160];
+        formatSettingWarning(msg, sizeof msg, "crt", "full", SettingResult::REMOVED);
+        CHECK_EQ(strcmp(msg, "crt=full is no longer supported; use video_filter= and video_scale= (ignored)"), 0);
+        formatSettingWarning(msg, sizeof msg, "scale", "auto", SettingResult::LEGACY);
+        CHECK_EQ(strcmp(msg, "scale=auto is old; use video_scale= (Save settings rewrites it)"), 0);
+        formatSettingWarning(msg, sizeof msg, "scanline", "on", SettingResult::LEGACY);
+        CHECK_EQ(strcmp(msg, "scanline=on is old; use video_filter= (Save settings rewrites it)"), 0);
+    }
     CHECK_EQ(s.osd, 2); // 既定は on (余白に入るときだけ出す)
     CHECK_EQ((int)applySetting(s, "osd", "fps"), (int)SettingResult::OK);
     CHECK_EQ(s.osd, 1);
@@ -313,6 +484,18 @@ void testSettings() {
     }
     CHECK_EQ(cfg.speed060, 100);
     CHECK_EQ(cfg.maxSpeedLimit060, 0);
+    // スプライトの読み書きは、既定ではそろえない。bus_sync_sprite=on で I/O と同じ 1600ns になる (#218)
+    if (x68k::Config::has020()) {
+        CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_RTC].read.period, 1600);
+        CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_SPRITE].write.period, 0);
+        applySetting(c, "bus_sync_sprite", "on");
+        c.toConfig(cfg);
+        CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_SPRITE].write.period, 1600);
+        CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_PCG].write.period, 1600);
+        applySetting(c, "bus_sync_sprite", "off");
+        c.toConfig(cfg);
+        CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_SPRITE].write.period, 0);
+    }
     applySetting(c, "speed060", "40");
     applySetting(c, "max_speed_limit", "150");
     c.toConfig(cfg);
@@ -372,6 +555,126 @@ void testEject() {
     CHECK_EQ(v[0], 0);
 }
 
+// bus_sync_sprite を変えて保存し、読み直すと同じ値になる (on にする場合と、off に戻す場合。#218)
+void testBusSyncSpriteSave() {
+    printf("bus_sync_sprite: save and reload\n");
+    const auto read = [](const ConfigText& c) {
+        Settings s;
+        platform::readSettings(c, s, [](const char*, const char*, SettingResult) {}, [](const char*) {});
+        return s;
+    };
+    const char* text = "cpu=68060\n";
+    ConfigText c;
+    c.load(text, strlen(text));
+    const Settings base = read(c);
+    CHECK_EQ(base.busSyncSprite, 0);
+    // 変えていなければ行を足さない
+    CHECK_EQ(platform::writeSettings(c, base, base), 1);
+    CHECK_EQ(same(c, "cpu=68060\n"), 1);
+    // off (既定) から on
+    Settings on = base;
+    on.busSyncSprite = 1;
+    CHECK_EQ(platform::writeSettings(c, on, base), 1);
+    CHECK_EQ(same(c, "cpu=68060\nbus_sync_sprite=on\n"), 1);
+    const Settings reloaded = read(c);
+    CHECK_EQ(reloaded.busSyncSprite, 1);
+    x68k::Config cfg;
+    reloaded.toConfig(cfg);
+    if (x68k::Config::has020()) CHECK_EQ(cfg.busArea[x68k::Config::BUS_AREA_SPRITE].write.period, x68k::Config::BUS_SYNC_NS);
+    // on から off
+    Settings off = reloaded;
+    off.busSyncSprite = 0;
+    CHECK_EQ(platform::writeSettings(c, off, reloaded), 1);
+    CHECK_EQ(same(c, "cpu=68060\nbus_sync_sprite=off\n"), 1);
+    const Settings again = read(c);
+    CHECK_EQ(again.busSyncSprite, 0);
+    x68k::Config cfg2;
+    again.toConfig(cfg2);
+    if (x68k::Config::has020()) CHECK_EQ(cfg2.busArea[x68k::Config::BUS_AREA_SPRITE].write.period, 0);
+}
+
+// 前の書き方の行 (v0.1.0 の scale=、scanline=) は、保存するときに消し、読んだときの値で video_scale= と video_filter= を
+// 書く (行があれば最後の行を書き換え、なければ足す)。変えた項目がなくても書き直す。crt= の行は触らない
+void testLegacySave() {
+    printf("legacy video settings: rewritten on save\n");
+    using namespace platform;
+    const auto read = [](const ConfigText& c) {
+        Settings s;
+        readSettings(c, s, [](const char*, const char*, SettingResult) {}, [](const char*) {});
+        return s;
+    };
+    {
+        const char* text = "clock=10\r\n  scale = off  # 1 倍\r\nscanline=on\r\nosd=on\r\n";
+        ConfigText c;
+        c.load(text, strlen(text));
+        const Settings base = read(c);
+        CHECK_EQ(base.videoFilter, CRT_SCANLINE);
+        CHECK_EQ(base.videoScale, VIDEO_SCALE_OFF);
+        CHECK_EQ(writeSettings(c, base, base), 1);
+        CHECK_EQ(same(c, "clock=10\r\nosd=on\r\nvideo_scale=off\r\nvideo_filter=scanline\r\n"), 1);
+        const Settings again = read(c);
+        CHECK_EQ(again.videoFilter == base.videoFilter && again.videoScale == base.videoScale, 1);
+        // 変えた値は、書いた行を書き換える
+        Settings s = base;
+        s.videoFilter = CRT_MASK;
+        CHECK_EQ(writeSettings(c, s, again), 1);
+        CHECK_EQ(same(c, "clock=10\r\nosd=on\r\nvideo_scale=off\r\nvideo_filter=mask\r\n"), 1);
+    }
+    {
+        // scale= だけなら video_scale= だけ、scanline= だけなら video_filter= だけを書く。値が正しくない行も消す。
+        // crt= の行は残す (読み替えないので、ログの知らせを見て直してもらう)
+        const char* text = "scale=off\n";
+        ConfigText c;
+        c.load(text, strlen(text));
+        const Settings base = read(c);
+        CHECK_EQ(writeSettings(c, base, base), 1);
+        CHECK_EQ(same(c, "video_scale=off\n"), 1);
+        const char* text2 = "scanline=on\ncrt=full\nscanline=bogus\n";
+        ConfigText c2;
+        c2.load(text2, strlen(text2));
+        const Settings base2 = read(c2);
+        CHECK_EQ(migrateLegacySettings(c2, base2), 1);
+        CHECK_EQ(same(c2, "crt=full\nvideo_filter=scanline\n"), 1);
+        // crt= だけなら何もしない
+        const char* text3 = "crt=full\n";
+        ConfigText c3;
+        c3.load(text3, strlen(text3));
+        CHECK_EQ(migrateLegacySettings(c3, read(c3)), 0);
+        CHECK_EQ(same(c3, "crt=full\n"), 1);
+        // ホスト版は scale= と scanline= を読まないので、行も書き直さない
+        Settings host = read(c);
+        host.legacyVideo = 0;
+        ConfigText c4;
+        c4.load(text, strlen(text));
+        CHECK_EQ(migrateLegacySettings(c4, host), 0);
+        CHECK_EQ(same(c4, "scale=off\n"), 1);
+    }
+    {
+        // いまの書き方の行があれば、そこを書き換える (あとの scanline=on が勝つので scanline だけ)
+        const char* text = "video_filter=mask\nscanline=on\n";
+        ConfigText c;
+        c.load(text, strlen(text));
+        CHECK_EQ(migrateLegacySettings(c, read(c)), 1);
+        CHECK_EQ(same(c, "video_filter=scanline\n"), 1);
+    }
+    {
+        // 前の書き方の行がなければ何も変えない
+        const char* text = "video_filter=curve\n";
+        ConfigText c;
+        c.load(text, strlen(text));
+        CHECK_EQ(migrateLegacySettings(c, read(c)), 0);
+        CHECK_EQ(same(c, "video_filter=curve\n"), 1);
+    }
+    {
+        // removeLines() は key の行をすべて消す (注釈の行、ほかのキーは残す)
+        const char* text = "# crt=full\ncrt=full\ncrtx=1\n crt = off # x\n";
+        ConfigText c;
+        c.load(text, strlen(text));
+        CHECK_EQ(c.removeLines("crt"), 2);
+        CHECK_EQ(same(c, "# crt=full\ncrtx=1\n"), 1);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -380,5 +683,7 @@ int main() {
     testCrlf();
     testSettings();
     testEject();
+    testBusSyncSpriteSave();
+    testLegacySave();
     return finish();
 }

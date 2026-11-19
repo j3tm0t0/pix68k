@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <string.h>
 
 #include "platform/net_config.h"
 #include "platform/settings.h"
@@ -24,13 +25,36 @@ inline size_t append(char* out, size_t size, size_t pos, const char* s) {
 
 static constexpr const char* SECRET_LINE_WARNING = "ignored a line about net_token";
 
-// readSettings() の 1 つ目の呼び出し (キーが不明か、値が読めない) のときの文言
+// readSettings() の 1 つ目の呼び出し (キーが不明か、値が読めないか、前の書き方) のときの文言
 inline void formatSettingWarning(char* out, size_t size, const char* key, const char* value, SettingResult r) {
     using setting_warning_detail::append;
     if (mentionsSecretSetting(key)) {
         append(out, size, 0, SECRET_LINE_WARNING);
     } else if (r == SettingResult::UNKNOWN_KEY) {
         append(out, size, append(out, size, 0, "unknown key: "), key);
+    } else if (r == SettingResult::LEGACY) {
+        // 前の書き方 (読み替えて使う)。代わりのキーを出す
+        size_t n = append(out, size, 0, key);
+        n = append(out, size, n, "=");
+        n = append(out, size, n, value);
+        n = append(out, size, n, strcmp(key, "scale") == 0 ? " is old; use video_scale=" : " is old; use video_filter=");
+        append(out, size, n, " (Save settings rewrites it)");
+    } else if (r == SettingResult::REMOVED) {
+        // 使えなくなったキー (crt=)。読み替えずに無視する
+        size_t n = append(out, size, 0, key);
+        n = append(out, size, n, "=");
+        n = append(out, size, n, value);
+        append(out, size, n, " is no longer supported; use video_filter= and video_scale= (ignored)");
+    } else if (r == SettingResult::IGNORED_NAME) {
+        size_t n = append(out, size, 0, key);
+        n = append(out, size, n, "=");
+        n = append(out, size, n, value);
+        append(out, size, n, ": unknown names ignored");
+    } else if (r == SettingResult::EXCLUSIVE_NAME) {
+        size_t n = append(out, size, 0, key);
+        n = append(out, size, n, "=");
+        n = append(out, size, n, value);
+        append(out, size, n, ": only one bezel can be used; using the last one");
     } else {
         size_t n = append(out, size, 0, key);
         n = append(out, size, n, "=");

@@ -7,7 +7,7 @@
 // - メインメモリの上のループはリフレッシュで約 2.2% 遅くなる
 //
 // X68030 と 060turbo の本体のバス (Config::busWait060 と busArea) のテスト。
-// - I/O とスプライトの読み書きは 1.6 マイクロ秒ごとの区切りで終わる。VRAM、SRAM、ROM、メインメモリは待たない
+// - I/O の読み書きは 1.6 マイクロ秒ごとの区切りで終わる。スプライトは、そろえるとき (bus_sync_sprite=on) だけ (既定はそろえない。#218)。VRAM、SRAM、ROM、メインメモリは待たない
 // - si.r の system performance のループ (I/O を 1 回読む) は、キャッシュの有効 / 無効、50 / 75MHz、speed060、
 //   最高速モードのどれでも 1 周 1.6 マイクロ秒 (実機の 177.82% = 毎秒 625000 周)
 // - si.r の processor performance のループは 1 周 1 サイクルのまま
@@ -221,6 +221,9 @@ struct Opt060 {
     int maxSpeed = 100;  // Machine::setCpuSpeed()
     int syncNs = -1;     // 0 以上なら Config::setBusSync() の周期
     int areas = -1;      // 0 以上なら Config::setBusSync() の場所
+    // スプライトの読み書きもそろえるか (pix68k.cfg の bus_sync_sprite=on と同じ。Config の既定はそろえない)。
+    // ここの試験の多くは、そろえたときの動きを確かめるので、既定を true にしている。areas を決めたときは使わない
+    bool sprite = true;
     void (*tune)(x68k::Config&) = nullptr; // Config::busArea などを書き換える (setBusSync() のあとに呼ぶ)
 };
 
@@ -237,7 +240,11 @@ x68k::Machine* make060(const Opt060& o, Code code) {
     }
     if (o.syncNs >= 0 || o.areas >= 0)
         cfg.setBusSync(o.syncNs >= 0 ? o.syncNs : x68k::Config::BUS_SYNC_NS,
-                       o.areas >= 0 ? (uint8_t)o.areas : (uint8_t)(x68k::Config::BUS_SYNC_IO | x68k::Config::BUS_SYNC_SPRITE));
+                       o.areas >= 0 ? (uint8_t)o.areas
+                                    : o.sprite ? (uint8_t)(x68k::Config::BUS_SYNC_IO | x68k::Config::BUS_SYNC_SPRITE)
+                                               : x68k::Config::BUS_SYNC_DEFAULT);
+    else
+        cfg.setBusSyncSprite(o.sprite);
     if (o.tune) o.tune(cfg);
     auto* m = new x68k::Machine(cfg);
     static uint8_t rom[x68k::Machine::IPL_SIZE];
@@ -557,18 +564,31 @@ void testBusAreas() {
         for (int j = 1; j < i; j++) CHECK_EQ(strcmp(C::busAreaName(i), C::busAreaName(j)) != 0, true);
     }
     for (const At& a : ats) CHECK_EQ((int)C::busAreaAt(a.addr), (int)a.area);
-    // 既定の表: 060turbo は I/O とスプライトが period = 1600 だけ、68030 は pre = 120 も。VRAM は 0
+    // 既定の表: 060turbo は I/O が period = 1600 だけ、68030 は pre = 120 も。VRAM とスプライトは 0 (#218)。
+    // setBusSyncSprite(true) (pix68k.cfg の bus_sync_sprite=on) で、スプライトも I/O と同じになる。false で既定に戻る
     for (int cpu : {68030, 68060}) {
         C cfg;
         cfg.setCpu(cpu);
-        for (int i = 1; i < C::BUS_AREAS; i++) {
-            const bool vram = i == C::BUS_AREA_GVRAM || i == C::BUS_AREA_TVRAM;
-            for (const C::BusTiming* t : {&cfg.busArea[i].read, &cfg.busArea[i].write}) {
-                CHECK_EQ(t->period, vram ? 0 : 1600);
-                CHECK_EQ(t->pre, !vram && cpu == 68030 ? 120 : 0);
-                CHECK_EQ(t->post, 0);
+        for (int pass = 0; pass < 3; pass++) {
+            const bool spriteOn = pass == 1;
+            if (pass) cfg.setBusSyncSprite(spriteOn);
+            for (int i = 1; i < C::BUS_AREAS; i++) {
+                const bool vram = i == C::BUS_AREA_GVRAM || i == C::BUS_AREA_TVRAM;
+                const bool sprite = i >= C::BUS_AREA_SPRITE && i <= C::BUS_AREA_BG;
+                const bool sync = !vram && (!sprite || spriteOn);
+                for (const C::BusTiming* t : {&cfg.busArea[i].read, &cfg.busArea[i].write}) {
+                    CHECK_EQ(t->period, sync ? 1600 : 0);
+                    CHECK_EQ(t->pre, sync && cpu == 68030 ? 120 : 0);
+                    CHECK_EQ(t->post, 0);
+                }
             }
         }
+    }
+    // 68000 では何もしない (表は 0 のまま)
+    {
+        C cfg;
+        cfg.setBusSyncSprite(true);
+        for (int i = 1; i < C::BUS_AREAS; i++) CHECK_EQ(cfg.busArea[i].write.period, 0);
     }
     // 種類ごとに別の値: PCG の書き込みだけ長さの決まった 800ns (50MHz の 40 サイクル) に、BG のレジスタ ($EB0800 から) の
     // 書き込みだけ 400ns (20 サイクル) にする。PCG の読み出し、BG のレジスタと同じ 8KB にあるスプライトのレジスタ、
@@ -707,7 +727,7 @@ void testBusAreas() {
         CHECK_EQ(cfg.busArea[C::BUS_AREA_RTC].write.period, 1600);
         CHECK_EQ(cfg.setBusAreaText("bg.w=1000000,1000000,1000000"), true); // 上限ちょうど
         CHECK_EQ(cfg.busArea[C::BUS_AREA_BG].write.post, C::BUS_NS_MAX);
-        CHECK_EQ(cfg.busArea[C::BUS_AREA_BG].read.period, 1600);
+        CHECK_EQ(cfg.busArea[C::BUS_AREA_BG].read.period, 0); // 読みは既定のまま (スプライトはそろえない)
         // 範囲の外や形の違うものは拒み、表を変えない。4294968096 は 2^32 + 800、2147483648 は INT_MAX + 1
         const C before = cfg;
         for (const char* bad :
@@ -729,7 +749,7 @@ void testBusAreas() {
         CHECK_EQ(m->busSyncKeepsPhase(), v != 2);
         delete m;
     }
-    // 場所ごとに、32 ビットの書き込みを続けたときの 1 回の時間 (ns)。既定では、I/O とスプライトは区切り 2 つ分
+    // 場所ごとに、32 ビットの書き込みを続けたときの 1 回の時間 (ns)。I/O と、そろえたときのスプライトは区切り 2 つ分
     // (3200ns)、VRAM は最短のバスサイクル 2 回とループの分だけ。実機やほかのエミュレータの値と比べるために出す
     struct Loop {
         const char* name;
@@ -741,18 +761,23 @@ void testBusAreas() {
         {"palette", 0x00e8, 0x2000, true}, {"sprite", 0x00eb, 0x0000, true}, {"pcg", 0x00eb, 0x8000, true},
         {"bg", 0x00eb, 0xc000, true},
     };
+    // スプライト、PCG、BG は、そろえるとき (bus_sync_sprite=on) だけ 3200ns。既定 (そろえない) では VRAM と同じく速い
     for (int cpu : {68030, 68060}) {
-        Opt060 o;
-        o.cpu = cpu;
-        printf("  %d, ns per long write:", cpu);
-        for (const Loop& l : loops) {
-            // movea.l #addr,a0 / moveq #0,d1 / addq.l #1,d1 / move.l d0,(a0) / bra.s (addq へ)
-            const uint32_t n = loops060(o, {0x207c, l.hi, l.lo, 0x7200, 0x5281, 0x2080, 0x60fa}, 1);
-            printf(" %s %.0f", l.name, 1e8 / n);
-            if (l.sync) CHECK_EQ(n >= 31240 && n <= 31250, true);
-            else CHECK_EQ(n > 100000, true);
+        for (bool sprite : {true, false}) {
+            Opt060 o;
+            o.cpu = cpu;
+            o.sprite = sprite;
+            printf("  %d, sprite sync %s, ns per long write:", cpu, sprite ? "on" : "off (default)");
+            for (const Loop& l : loops) {
+                // movea.l #addr,a0 / moveq #0,d1 / addq.l #1,d1 / move.l d0,(a0) / bra.s (addq へ)
+                const uint32_t n = loops060(o, {0x207c, l.hi, l.lo, 0x7200, 0x5281, 0x2080, 0x60fa}, 1);
+                printf(" %s %.0f", l.name, 1e8 / n);
+                const bool spriteArea = l.hi == 0x00eb;
+                if (l.sync && (sprite || !spriteArea)) CHECK_EQ(n >= 31240 && n <= 31250, true);
+                else CHECK_EQ(n > 100000, true);
+            }
+            printf("\n");
         }
-        printf("\n");
     }
 }
 

@@ -17,11 +17,8 @@
 namespace m68k {
 
 Cpu020::Handler Cpu020::table030_[65536];
-Cpu020::Handler Cpu020::table060_[65536];
+Cpu020::Op060 Cpu020::ops060_[65536];
 bool Cpu020::tablesReady_ = false;
-uint16_t Cpu020::cyc060_[65536];
-uint32_t Cpu020::use060_[65536];
-uint32_t Cpu020::wr060_[65536];
 uint8_t Cpu020::openBusRead_[4096];
 uint8_t Cpu020::openBusWrite_[4096];
 
@@ -55,7 +52,6 @@ Cpu020::Cpu020(Bus* bus, CpuModel model) : bus_(bus), model_(model) {
         memset(openBusRead_, 0xff, sizeof openBusRead_);
         tablesReady_ = true;
     }
-    table_ = model == CpuModel::M68060 ? table060_ : table030_;
     // 68030 は、68000 の 1 サイクルを 3/5 サイクルとする (概算)。68060 は命令ごとの表 (cpu060_cycles.inc) で数える
     baseCost_ = cost_ = SUB * 3 / 5;
     setSpeed(100);
@@ -861,7 +857,7 @@ void Cpu020::resumeFaulted(uint32_t addr, uint16_t ssw, uint32_t dib, unsigned o
     noTrace_ = false;
     uint16_t op = fetch16();
     op_ = op;
-    table_[op](this, op);
+    handlerOf(op)(this, op);
     replayN_ = 0;
     if (traceMode && !noTrace_ && ((traceMode & 2) || flow_)) exception(9, 2, pc_, pc0_);
     noTrace_ = true; // RTE のトレースは見ない (続けた命令のトレースを上で済ませた)
@@ -969,13 +965,15 @@ template <bool M060> C020_HOT void Cpu020::execOne() {
     }
     // トレース (MC68030UM 8.1.7): T1 なら命令ごと、T0 なら流れを変えた命令 (分岐・ジャンプ・トラップ・リターンと
     // SR を書く命令) のあと。命令の開始時の T で決まる
-    execInstr<M060>(trace_, false);
+    execInstr<M060>(trace_, false, true);
 }
 
-// 命令を 1 つ実行する。execOne() (検査のあと) と runLoop() (検査を省いたとき。traceMode は 0、fast は true) から呼ぶ
-template <bool M060> C020_HOT void Cpu020::execInstr(int traceMode, bool fast) {
+// 命令を 1 つ実行する。execOne() (検査のあと) と runLoop() (検査を省いたとき。traceMode は 0、fast は true) から呼ぶ。
+// fetchWait が false なら、68060 の命令キャッシュが無効のときの取り出しの時間を調べない (runLoop() が、無効の間は
+// true で呼ぶ。cpu020.h の ATTN_FETCH)。3 つの引数は呼ぶ側で決まっていて、ここは呼ぶ所ごとに展開される
+template <bool M060> C020_HOT void Cpu020::execInstr(int traceMode, bool fast, bool fetchWait) {
     pc0_ = pc_;
-    if (M060 && __builtin_expect(fetchWaitOn_, 0)) {
+    if (M060 && fetchWait && __builtin_expect(fetchWaitOn_, 0)) {
         // 命令キャッシュが無効: 命令の並びが新しいロングワードに入るたびに、バスの読み出し 1 回分を足す (updateCacheCosts())。
         // 前の命令が流れを変えていれば (flow_)、同じロングワードでも読み直す。拡張語の分は、次の命令の先頭までに
         // 進んだロングワードの数で数える (流れを変えた命令の拡張語の分は jumpTo() が足す)
@@ -995,39 +993,48 @@ template <bool M060> C020_HOT void Cpu020::execInstr(int traceMode, bool fast) {
     if (fast || !M060) clearUndoLog();
     uint16_t op = fetch16<M060>();
     op_ = op;
-    bool inside060 = false; // 68060 で、サイクル数を命令の中で足す、分岐でない命令 (MOVEM、FPU など)
-    uint64_t sub060 = 0;
-    if (M060) {
+    if (!M060) {
+        table030_[op](this, op);
+    } else {
         // サイクル数 (cpu060_cycles.inc)。前の命令と同時に進む命令 (スーパースカラ) は 0 サイクル。
         // 分岐の命令 (T_BRANCH) は、サイクル数も、同時実行と折りたたみの状態も、命令の中で決める。
         // ほかの命令は、表のサイクル数が 0 のもの (命令の中で足す) も含めて、ここで状態を進める: 同時実行の相手に
         // ならない命令は pairLead_ を消し (前の命令の状態が、この命令を越えて残らない)、分岐でない命令を実行したので
         // 次の分岐を折りたためる (fold060())
-        const uint32_t t = cyc060_[op];
-        if (!(t & T_BRANCH)) {
-            const uint32_t u = use060_[op];
-            if (pairLead_ && (t & T_PAIR) && !(u & pairDest_) && !(t & pairLead_ & T_MEM)) {
+        const Op060& e = ops060_[op];
+        const Handler fn = e.fn;
+        const uint64_t meta = e.meta;
+        const uint32_t t = (uint32_t)meta & 0xffffu;
+        if (__builtin_expect(!(t & T_BRANCH), 1)) {
+            // 同時実行の判定は分岐で書く。条件で値を選ぶ形 (分岐なし) も試したが、Pi 5 (GCC 14.2) で OutRun の命令数が
+            // 4.5% 増え、分岐予測の外れは減らなかった (#224)。
+            // PCR の ESS はビット 0、T_LEAD はビット 11 なので、pcr_ を 11 ビットずらして重ねて調べる
+            const uint32_t lead = pairLead_;
+            if (lead && (t & T_PAIR) && !((uint32_t)(meta >> 40) & pairDest_) && !(t & lead & T_MEM)) {
                 pairLead_ = 0;
             } else {
                 sub_ += (uint64_t)((t & T_CYC) * (uint32_t)unit060_);
-                if ((pcr_ & 1) && (t & T_LEAD)) {
+                if (t & (pcr_ << 11) & T_LEAD) {
                     pairLead_ = t;
-                    pairDest_ = wr060_[op];
+                    pairDest_ = (uint32_t)(meta >> 16) & 0xffffffu;
                 } else {
                     pairLead_ = 0;
                 }
             }
             foldOk060_ = true;
-            if (!(t & T_CYC)) {
-                inside060 = true;
-                sub060 = sub_;
+            if (__builtin_expect(!(t & T_CYC), 0)) {
+                // サイクル数を命令の中で足す、分岐でない命令 (MOVEM、FPU など)。命令の中で 1 サイクルも足さなかった
+                // もの (レジスタの数が 0 の MOVEM など) は、1 サイクルとする。分岐でない命令は必ず時間を進めるので、
+                // 0 サイクルに折りたたまれる分岐と組み合わせても、時間が止まるループにならない
+                const uint64_t sub060 = sub_;
+                fn(this, op);
+                if (sub_ == sub060) tick060(1);
+                if (traceMode && !noTrace_ && ((traceMode & 2) || flow_)) exception(9, 2, pc_, pc0_);
+                return;
             }
         }
+        fn(this, op);
     }
-    (M060 ? table060_ : table030_)[op](this, op); // table_ と同じ表
-    // 命令の中で 1 サイクルも足さなかった命令 (レジスタの数が 0 の MOVEM など) は、1 サイクルとする。分岐でない命令は
-    // 必ず時間を進めるので、0 サイクルに折りたたまれる分岐と組み合わせても、時間が止まるループにならない
-    if (inside060 && sub_ == sub060) tick060(1);
     if (traceMode && !noTrace_ && ((traceMode & 2) || flow_)) exception(9, 2, pc_, pc0_);
 }
 
@@ -1092,6 +1099,8 @@ void Cpu020::updateCacheCosts() {
     if (!eic && !fetchWaitOn_) fetchValid_ = false;
     fetchWaitOn_ = !eic;
     dataTick_ = !edc;
+    // fetchWaitOn_ が変わったかもしれない: 次の命令の前に、attn_ の ATTN_FETCH を決め直す (runLoop())
+    attn_ = ATTN_CHECK;
 }
 
 void Cpu020::setSpeed(int percent) {
@@ -1172,7 +1181,16 @@ template <bool M060> void Cpu020::stopUntil(uint64_t endSub) {
 template <bool M060> C020_HOT void Cpu020::runLoop(uint64_t endSub) {
     while (sub_ < endSub) {
         if (__builtin_expect(attn_ != 0, 0)) {
-            // endRun(): ここで戻る。attn_ は 1 のまま残し、次の run() の最初の命令の前に検査を通す
+            if (M060 && attn_ == ATTN_FETCH) {
+                // 調べることは命令キャッシュが無効なことだけ: 検査を省いた実行に、取り出しの時間を足す。
+                // ATTN_CHECK が 0 なので、下の endRun_ と stopped_ も調べなくてよい (どちらも、立てる所が attn_ を
+                // ATTN_CHECK にする: endRun()、STOP の setSR())。命令が attn_ を変えたら (setIPL()、MOVEC で CACR を
+                // 書く、など)、次の命令は下の経路で決め直す
+                undoCheckSave();
+                execInstr<M060>(0, true, true);
+                continue;
+            }
+            // endRun(): ここで戻る。attn_ は ATTN_CHECK のまま残し、次の run() の最初の命令の前に検査を通す
             if (endRun_) {
                 endRun_ = 0;
                 return;
@@ -1184,11 +1202,12 @@ template <bool M060> C020_HOT void Cpu020::runLoop(uint64_t endSub) {
             execOne<M060>();
             // 命令の途中で setIPL() や setSR() が呼ばれていても、今の値で決め直す (endRun() も残す)
             attn_ = halted_ || stopped_ || trace_ != 0 || ipl_ != lastIpl_ || ipl_ > imask_ || nmiPending_ || endRun_;
+            if (M060 && fetchWaitOn_) attn_ |= ATTN_FETCH;
             continue;
         }
         // 68060 も、命令の始めに A0-A7 と CCR を写さない。要る命令は、表に入れた関数 (thunk の U) が写す
         if (M060) undoCheckSave();
-        execInstr<M060>(0, true);
+        execInstr<M060>(0, true, false);
     }
 }
 

@@ -73,6 +73,26 @@ public:
     // (ソフトウェアアボートなど) を Host に知らせる
     void notify(Host& host);
     bool active(int ch) const { return (reg_[ch][CSR] & CSR_ACT) != 0; }
+    // オートリクエストの最大速度 (OCR の REQG = 01) で動いているチャネルがあるか。このチャネルは、転送が終わるまで
+    // バスを CPU に返さない (Inside X68000 の PDF の 36、38、53 ページ)
+    bool holdsBus(int ch) const { return active(ch) && (reg_[ch][OCR] & 3) == 1 && !(reg_[ch][CCR] & CCR_HLT); }
+    bool holdsBus() const {
+        for (int ch = 0; ch < 4; ch++)
+            if (holdsBus(ch)) return true;
+        return false;
+    }
+    // holdsBus() のチャネルだけ、転送を進める (ほかのチャネルは動かさない)。CPU が開始を書いたところで呼ぶ。
+    // 終わりのある転送 (チェーンなし、コンティニュー、アレイチェーン、輪になっていないリンクチェーン) は、長さによらず
+    // 最後まで転送する (途中で戻ると、CPU が次の命令で転送元やレジスタを書き換えられる)。
+    // 終わらない転送 (実機では CPU が止まったままになる) は、次のところで戻り、残りは run() が少しずつ進める:
+    // - リンクチェーンの輪: 同じ番地の表を 2 度読んだところ (輪を数周してから気づくこともある)
+    // - 転送が DMAC のレジスタ ($E84000-$E840FF) を書いた: そのオペランドを終えたところ (自分の MTC や CCR を
+    //   書き戻し続ける転送。終わる転送でも、どのチャネルのレジスタでも、書いたら戻る)。
+    //   書いたことは Host が *wrote に立てて知らせる (Dmac はステートに丸ごと入るので、ここには置かない。
+    //   Machine::ioWrite())。wrote が nullptr なら見ない
+    // - 合わせて 2 の 32 乗オペランドを転送した (念のための上限。チェーンなし、コンティニュー、アレイチェーンは
+    //   最大でもこれより短い。これを超えるリンクチェーンは途中で戻る)
+    void runBusHolders(Host& host, const bool* wrote = nullptr);
     // run() でする仕事がない (動いているチャネルも、知らせていないエラーもない)
     bool idle() const {
         for (int ch = 0; ch < 4; ch++)
@@ -122,7 +142,15 @@ private:
     bool loadChain(int ch, Host& host);
     bool startChain(int ch, Host& host);
     bool transferOne(int ch, Host& host);
-    void runChannel(int ch, Host& host, int maxBytes);
+    // リンクチェーンの輪を見つけるための記録 (Brent の方法: 覚えておく表の番地は 1 つ)
+    struct LinkGuard {
+        uint32_t saved = 0; // 比べる相手の表の番地
+        uint32_t count = 0, power = 0; // saved を覚えてから読んだ表の数と、覚え直すまでの数 (0 = まだ覚えていない)
+        bool ring = false;
+        const bool* wrote = nullptr; // runBusHolders() の wrote
+    };
+    // guard があれば、リンクチェーンで同じ番地の表を 2 度読んだところで guard->ring を立てて戻る
+    void runChannel(int ch, Host& host, int maxBytes, LinkGuard* guard = nullptr);
     bool requesting(int ch) const {
         return (reg_[ch][CCR] & CCR_INT) && (reg_[ch][CSR] & (CSR_COC | CSR_BTC | CSR_NDT | CSR_ERR));
     }

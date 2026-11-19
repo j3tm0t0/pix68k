@@ -1583,6 +1583,68 @@ void testSpeed060(bool fast) {
     CHECK_EQ(c30, 2); // MOVEQ: 68000 の 4 サイクルの 3/5 (端数は次の命令に持ち越す)
 }
 
+// run() の繰り返し (検査を省く経路。Cpu020::runLoop()) と step() (命令ごとに検査を通す経路) で、サイクル数と状態が同じになる。
+// 命令の途中で数え方が変わる所を通す (#224): MOVEC で PCR の ESS を立てる / 消す、CACR の EIC を立てる / 消す
+// (命令キャッシュが無効の間、run() は取り出しの時間を足す経路 ATTN_FETCH を使う)、表のサイクル数が 0 の命令
+// (レジスタの数が 0 の MOVEM)、同時実行の組、分岐。リセットのあとは命令キャッシュが無効、ESS は 0
+void testRunMatchesStep(bool fast) {
+    const uint32_t kBody = 0x1100, kEnd = 0x102e;
+    auto prepare = [&](Env060& e) {
+        // 本体: 4 周するループ (DBRA) のあと、分岐しない Bcc と NOP、RTS
+        e.bus.put(kBody, {0x7a03,                         // MOVEQ #3,D5
+                          0x5280, 0x4a10, 0xd280, 0x2810, // ADDQ.L #1,D0 / TST.B (A0) / ADD.L D0,D1 / MOVE.L (A0),D4
+                          0x48e7, 0x0000,                 // MOVEM.L #0,-(A7) (レジスタの数が 0)
+                          0x51cd, 0xfff2,                 // DBRA D5,ループの先頭
+                          0x6702, 0x4e71, 0x4e75});       // BEQ.S (分岐しない) / NOP / RTS
+        e.bus.put(0x1000, {0x6100, 0x00fe,                // BSR.W 本体 (命令キャッシュ無効、ESS 0)
+                           0x4e7b, 0x2808,                // MOVEC D2,PCR: ESS を立てる
+                           0x6100, 0x00f6,                // BSR.W 本体
+                           0x4e7b, 0x6002,                // MOVEC D6,CACR: 命令 / データキャッシュと分岐キャッシュを有効にする
+                           0x6100, 0x00ee,
+                           0x7000, 0x7201, 0xd280, 0x5281, // MOVEQ #0,D0 / MOVEQ #1,D1 / ADD.L D0,D1 / ADDQ.L #1,D1
+                           0x4e7b, 0x3808,                // MOVEC D3,PCR: ESS を消す
+                           0x6100, 0x00de,
+                           0x4e7b, 0x7002,                // MOVEC D7,CACR: 命令キャッシュを無効にする
+                           0x6100, 0x00d6,
+                           0x4e71,                        // NOP (9 サイクル。ここで run(1) が必ず区切れる)
+                           0x60fe});                      // kEnd: BRA.S *
+        e.cpu.a_[0] = 0x3000;
+        e.bus.w32(0x3000, 0x01000000);
+        e.cpu.d_[2] = e.cpu.pcr_ | 1;
+        e.cpu.d_[3] = e.cpu.pcr_ & ~1u;
+        e.cpu.d_[6] = CACHE_ON | EBC;
+        e.cpu.d_[7] = EBC;
+    };
+    Env060 a(fast), b(fast);
+    prepare(a);
+    prepare(b);
+    int n = 0;
+    for (; n < 1000 && a.cpu.pc_ != kEnd; n++) a.cpu.step();
+    CHECK_EQ(a.cpu.pc_, kEnd);
+    b.cpu.run(1); // 最初の命令は検査を通る。そのあとは検査を省く
+    bool fetchPath = false, fastPath = false;
+    for (int i = 0; i < 1000 && b.cpu.pc_ != kEnd; i++) {
+        fetchPath = fetchPath || b.cpu.attn_ == m68k::Cpu020::ATTN_FETCH;
+        fastPath = fastPath || b.cpu.attn_ == 0;
+        b.cpu.run(1);
+    }
+    CHECK_EQ(b.cpu.pc_, kEnd);
+    CHECK_EQ(fetchPath, true); // 命令キャッシュが無効の間
+    CHECK_EQ(fastPath, true);  // 有効の間
+    CHECK_EQ(b.cpu.sub_, a.cpu.sub_);
+    for (int i = 0; i < 8; i++) {
+        CHECK_EQ(b.cpu.d_[i], a.cpu.d_[i]);
+        CHECK_EQ(b.cpu.a_[i], a.cpu.a_[i]);
+    }
+    CHECK_EQ(b.cpu.pairLead_, a.cpu.pairLead_);
+    CHECK_EQ(b.cpu.pairDest_, a.cpu.pairDest_);
+    CHECK_EQ(b.cpu.foldOk060_, a.cpu.foldOk060_);
+    CHECK_EQ(b.cpu.fetchLong_, a.cpu.fetchLong_);
+    CHECK_EQ(b.cpu.fetchValid_, a.cpu.fetchValid_);
+    CHECK_EQ(b.cpu.pcr_, a.cpu.pcr_);
+    CHECK_EQ(b.cpu.cacr_, a.cpu.cacr_);
+}
+
 // 分岐キャッシュ: 空の状態、アドレスの全部のビット、CACR の CABC / CUBC (MC68060UM 5.2、5.11)
 void testBranchCache(bool fast) {
     const uint32_t CABC = 0x00400000u, CUBC = 0x00200000u;
@@ -1900,7 +1962,7 @@ void testRandomSequences(bool fast) {
         uint32_t leadWr = 0;
         for (int i = 0; i < n; i++) {
             const uint16_t op = first[i];
-            const uint16_t t = Cpu020::cyc060_[op];
+            const uint16_t t = Cpu020::cyc060(op);
             int want;
             if (t & 0x2000) { // T_BRANCH (BRA.S)
                 want = foldOk ? 0 : 1;
@@ -1908,14 +1970,14 @@ void testRandomSequences(bool fast) {
                 lead = false;
             } else {
                 const bool mem = (t & 0x1000) != 0;
-                if ((t & 0x0400) && lead && !(Cpu020::use060_[op] & leadWr) && !(mem && leadMem)) {
+                if ((t & 0x0400) && lead && !(Cpu020::use060(op) & leadWr) && !(mem && leadMem)) {
                     want = 0;
                     lead = false;
                 } else {
                     want = alone[i];
                     lead = (t & 0x0800) != 0;
                     leadMem = mem;
-                    leadWr = Cpu020::wr060_[op];
+                    leadWr = Cpu020::wr060(op);
                 }
                 foldOk = true;
             }
@@ -1933,14 +1995,14 @@ void testRandomSequences(bool fast) {
     CHECK_EQ(bad, 0);
 }
 
-// ---- 同時実行の表 (cyc060_ / use060_ / wr060_) を、実際に実行した結果と比べる ----
+// ---- 同時実行の表 (ops060_ の cyc060() / use060() / wr060()) を、実際に実行した結果と比べる ----
 //
 // 表は「メモリの読み書きがあるか」「どのレジスタを書くか」「どのレジスタを使うか」をオペコードの 1 語めから決めている。
 // 書き漏らしがあると、同時に進まないはずの 2 命令が同時に進む。ここでは、同時実行に関わるすべてのオペコード
 // (T_LEAD か T_PAIR が立っているもの) を 1 命令ずつ実行して、次のことを確かめる:
 //   1. データの読み書きをしたら T_MEM が立っている。T_MEM が立っていたら、データの読み書きをしている
-//   2. 値が変わったレジスタは、wr060_ に入っている (T_LEAD の命令)
-//   3. use060_ に入っていないレジスタの値を変えても、結果 (ほかのレジスタ、CCR、PC、メモリへの書き込み) が変わらない
+//   2. 値が変わったレジスタは、wr060() に入っている (T_LEAD の命令)
+//   3. use060() に入っていないレジスタの値を変えても、結果 (ほかのレジスタ、CCR、PC、メモリへの書き込み) が変わらない
 //      (T_PAIR の命令)
 // 例外になったオペコードは見ない。表が見ないと決めているもの (インデックスレジスタ) は 3. から外す。
 struct LogBus : m68k::Bus {
@@ -2069,13 +2131,13 @@ void testTableAgainstExecution() {
     };
     for (int opi = 0; opi < 65536; opi++) {
         const uint16_t op = (uint16_t)opi;
-        const uint16_t t = Cpu020::cyc060_[op];
+        const uint16_t t = Cpu020::cyc060(op);
         const bool lead = (t & 0x0800) != 0, pair = (t & 0x0400) != 0; // T_LEAD、T_PAIR
         if (!lead && !pair) continue;
-        const uint32_t use = Cpu020::use060_[op], wr = Cpu020::wr060_[op];
+        const uint32_t use = Cpu020::use060(op), wr = Cpu020::wr060(op);
         const uint32_t useRegs = (use & 0xffff) | ((use >> 16 & 0xff) << 8);
         const uint32_t wrRegs = (wr & 0xffff) | ((wr >> 16 & 0xff) << 8);
-        // MOVE.L <ea>,Dn は、書く Dn を wr060_ に入れない (後の命令が演算に使っても同時に進む。10.1.6 の例外 1)
+        // MOVE.L <ea>,Dn は、書く Dn を wr060() に入れない (後の命令が演算に使っても同時に進む。10.1.6 の例外 1)
         const bool moveLongToDn = (op >> 12) == 2 && ((op >> 6) & 7) == 0;
         // インデックスつきの実効アドレス (拡張語のインデックスは D0)。表はインデックスレジスタを見ない
         const int mode = (op >> 3) & 7, dmode = (op >> 6) & 7;
@@ -2092,7 +2154,7 @@ void testTableAgainstExecution() {
                     const uint32_t after = r < 8 ? base.d[r] : base.a[r - 8];
                     if (after == before[r] || (wrRegs >> r & 1)) continue;
                     if (moveLongToDn && r == ((op >> 9) & 7)) continue;
-                    fail(op, "changes a register that is not in wr060_:", r);
+                    fail(op, "changes a register that is not in wr060():", r);
                 }
             }
             if (pair) {
@@ -2100,7 +2162,7 @@ void testTableAgainstExecution() {
                     if (useRegs >> r & 1) continue;
                     if (indexed && r == 0) continue;
                     const Outcome o = runOne(cpu, bus, op, seed, r, scratch);
-                    if (o.exception || !sameExcept(base, o, r)) fail(op, "depends on a register that is not in use060_:", r);
+                    if (o.exception || !sameExcept(base, o, r)) fail(op, "depends on a register that is not in use060():", r);
                 }
             }
         }
@@ -2142,6 +2204,7 @@ int main() {
         testBranchOnlyLoop(fast);
         testSuperscalar(fast);
         testCacheOff(fast);
+        testRunMatchesStep(fast);
         testBranchCache(fast);
         testTimingState(fast);
         testRandomSequences(fast);

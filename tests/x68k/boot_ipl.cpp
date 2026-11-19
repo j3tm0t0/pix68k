@@ -23,7 +23,7 @@
 //         SRAM を初期化させてから書き換え、電源を入れ直す
 //   --bus-wait N: 060turbo で、本体のバスの読み書き 1 回に足すサイクル数 (Config::busWait060。既定はクロックから決まる)
 //   --bus-sync ns: X68030 と 060turbo で、本体の I/O の読み書きをそろえる周期 (Config::setBusSync()。既定 1600、0 でそろえない)
-//   --bus-sync-areas n: そろえる場所 (Config::BUS_SYNC_* の和。1 = I/O、2 = スプライト、4 = VRAM。既定 3)
+//   --bus-sync-areas n: そろえる場所 (Config::BUS_SYNC_* の和。1 = I/O、2 = スプライト、4 = VRAM。既定 1)
 //   --bus-area 名前=pre,period,post: 場所の種類ごとの待ち (ns。Config::busArea。--bus-sync と --bus-sync-areas のあとに
 //         当てる)。名前は Config::busAreaName() (gvram tvram crtc palette video mfp rtc opm io sprite bgctrl pcg bg ext など)。名前のあとに .r か .w を付けると
 //         読みか書きだけを変える。値は 0 から 1000000 (1 ミリ秒)。何回でも書ける (例: --bus-area pcg=750,0,0 --bus-area rtc.r=0,1600,0)
@@ -406,7 +406,7 @@ int main(int argc, char** argv) {
     if (busSyncNs >= 0 || busSyncAreas >= 0)
         config.setBusSync(busSyncNs >= 0 ? busSyncNs : x68k::Config::BUS_SYNC_NS,
                           busSyncAreas >= 0 ? (uint8_t)busSyncAreas
-                                            : (uint8_t)(x68k::Config::BUS_SYNC_IO | x68k::Config::BUS_SYNC_SPRITE));
+                                            : x68k::Config::BUS_SYNC_DEFAULT);
     // 本体のバスの待ちの表は X68030 と 060turbo だけのもの。68000 で指定したら、黙って無視せずに断る
     if (config.cpuModel == m68k::CpuModel::M68000 && (busSyncNs >= 0 || busSyncAreas >= 0 || busAreaArgCount > 0)) {
         fprintf(stderr, "--bus-sync, --bus-sync-areas and --bus-area need --cpu 68030 or --cpu 68060\n");

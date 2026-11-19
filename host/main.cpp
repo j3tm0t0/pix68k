@@ -19,7 +19,8 @@
 //                    RTC が表せるのは 1980〜2079 年なので、その外の時刻は端 (1980-01-01 か 2079-12-31 23:59:59) にする
 //   --dump-text      終了時のテキスト画面を、読めた半角の字で書き出す (読めない字は ?。試験用)
 //   --message TEXT   ウィンドウの左上に TEXT (UTF-8。\n は改行) を重ねて出す (ベアメタル版の POST /message と同じ。
-//                    platform/osd_message.h)。--message-sec N 秒 (既定 10、0 なら出したまま) で消える
+//                    platform/osd_message.h)。1 行は半角 10 桁 (全角は 2 桁) で折り返し、4 行まで。入りきらなければ
+//                    4 行目の終わりを「…」にする。--message-sec N 秒 (既定 10、0 なら出したまま) で消える
 //   --message-dump F 試験用。--message の字の絵 (1 倍) を PPM で書き出す (CGROM の全角の字を確かめる)
 //   --test-pattern   X68000 を動かさず、M0 のテストパターンを出す (キーを押すと色が変わる)
 //   --clock 10|16    X68000 の CPU のクロック (MHz)。10 は初代〜SUPER、16 は XVI (既定)
@@ -74,6 +75,8 @@
 //   --speed060 N     060turbo の命令の速さ (選んだクロックの実機の 68060 を 100 とした %。5 から 3200、既定 100)。100 で命令の
 //                    サイクル数が MC68060UM の表どおりになる。小さくすると実機より遅くなり、ホストの負荷が下がる
 //   --max-speed-limit N  060turbo で、--max-speed が上げる速さの上限 (同じ単位。既定の 0 は上限なし。100 で実機の速さまで)
+//   --bus-sync-sprite  X68030 と 060turbo で、スプライト ($EB0000-$EBFFFF) の読み書きも、I/O と同じ 1.6 マイクロ秒ごとの
+//                    区切りにそろえる (既定はそろえない。測っていない仮定の値。設定ファイルの bus_sync_sprite=on)
 //   --sram-memsize fix|keep  fix (既定) なら起動のたびに、SRAM に書かれたメインメモリの容量をエミュレータの容量
 //                    (--ram、既定 4MB) に書き換える。keep なら SRAM の値をそのまま使う (設定ファイルの sram_memsize=)
 //   --joy-keys       カーソルキーと Z / X をジョイスティック 1 (上下左右とトリガ A / B) にする。
@@ -81,6 +84,10 @@
 //   --config FILE    設定ファイル (ベアメタル版の pix68k.cfg と同じ形式と項目。platform/settings.h)。
 //                    コマンドラインのほうが優先する。ファイル名の値は、/ で始まらなければ設定ファイルのディレクトリから。
 //                    メニューの「Save settings」はこのファイルに書く (知らない行と注釈は残す)
+//   --profile NAME   起動の組み合わせ: --config のディレクトリの pix68k-NAME.cfg を、--config のファイルの共通の項目
+//                    (ネットワーク、画面の出し方など) に重ねて読む (platform/boot_profile.h。ベアメタル版の起動時の
+//                    メニューで選ぶのと同じ)。autotype= があれば --type / --type-after (autotype_wait= 秒を 55 フレーム / 秒で
+//                    数える) にする。メニューの「Save settings」は、共通の項目を --config に、そのほかを pix68k-NAME.cfg に書く
 //   --image-dir DIR  メニューでディスクのイメージを選ぶディレクトリ (既定は --config のディレクトリ、
 //                    なければ ~/.cache/pix68k/disk)
 //   --state-dir DIR  ステートのファイル (state0.p68 から state9.p68) の場所 (既定 ~/.cache/pix68k)
@@ -116,6 +123,8 @@
 #include "host_ether.h"
 #include "host_serial.h"
 
+#include "platform/crt_effect.h"
+#include "platform/boot_profile.h"
 #include "platform/cue_sheet.h"
 #include "platform/menu.h"
 #include "platform/osd.h"
@@ -139,9 +148,15 @@
 
 namespace {
 
-// X68000 の画面の表示の縦横比 (768x512 の画面がモニタいっぱいに出るときの比)。
-// 512x512 や 256x256 の画面も横に引き伸ばして同じ比で出す
-const int kAspectW = 3, kAspectH = 2;
+// ホスト版の設定の既定の値。video_scale はウィンドウに合わせて 4:3 を保って最大 (aspect。ウィンドウが小さくても切らない)。
+// ベアメタル版は整数倍 (integer) のまま。v0.1.0 の scale= と scanline= は、v0.1.0 のホスト版と同じく読まない
+// (ベアメタル版の項目として残す。保存でも書き直さない)
+platform::Settings hostDefaultSettings() {
+    platform::Settings d;
+    d.videoScale = platform::VIDEO_SCALE_ASPECT;
+    d.legacyVideo = 0;
+    return d;
+}
 
 class SdlVideo : public platform::Video {
 public:
@@ -171,27 +186,41 @@ public:
         msg_ = g;
         msgGen_ = gen;
     }
+    // 画面の出し方 (video_scale= の VideoScale と、video_filter= の CrtPreset のビット)。次の present() から使う
+    // モニタの枠 (cz-600de、cz-600db) はホスト版では使わない (起動するときにログで知らせる)
+    void setVideo(int scale, int filter) {
+        scale_ = scale;
+        crt_ = filter & platform::CRT_EFFECT_BITS;
+    }
     ~SdlVideo() override {
+        if (crtTexture_) SDL_DestroyTexture(crtTexture_);
         if (msgTexture_) SDL_DestroyTexture(msgTexture_);
         if (osdTexture_) SDL_DestroyTexture(osdTexture_);
         if (texture_) SDL_DestroyTexture(texture_);
         if (renderer_) SDL_DestroyRenderer(renderer_);
         if (window_) SDL_DestroyWindow(window_);
     }
-    // 画面の大きさが変わったら、論理的な大きさ (縦横比 3:2) を合わせ直す
+    // X68000 の画面をウィンドウに描く。置き方はベアメタル版と同じ (platform::videoWindowFrame())。
+    // 描くのはウィンドウの画素の座標で (SDL_RenderSetLogicalSize() は使わない)
     void present(const uint32_t* pixels, int width, int height, int pitch) override {
         if (width <= 0 || height <= 0) return;
         if (width > x68k::Renderer::MAX_WIDTH) width = x68k::Renderer::MAX_WIDTH;
         if (height > x68k::Renderer::MAX_HEIGHT) height = x68k::Renderer::MAX_HEIGHT;
-        if (width != width_ || height != height_) {
-            width_ = width;
-            height_ = height;
-            SDL_RenderSetLogicalSize(renderer_, height * kAspectW / kAspectH, height);
-        }
-        SDL_Rect r = {0, 0, width, height};
-        SDL_UpdateTexture(texture_, &r, pixels, pitch * 4);
+        width_ = width;
+        height_ = height;
         SDL_RenderClear(renderer_);
-        SDL_RenderCopy(renderer_, texture_, &r, nullptr);
+        int ow = 0, oh = 0;
+        if (SDL_GetRendererOutputSize(renderer_, &ow, &oh) != 0 || ow <= 0 || oh <= 0) ow = oh = 0;
+        frame_ = platform::videoWindowFrame(scale_, ow, oh, width, height);
+        const platform::FrameScale& fs = frame_.s;
+        if (fs.dstW > 0 && !presentCrt(pixels, pitch)) {
+            // 効果がなければ SDL に拡大させる (整数倍でない枠も、いちばん近い画素を取る)
+            SDL_Rect r = {0, 0, width, height};
+            SDL_UpdateTexture(texture_, &r, pixels, pitch * 4);
+            const SDL_Rect src = {fs.srcX, fs.srcY, fs.srcW, fs.srcH};
+            const SDL_Rect dst = {fs.dstX, fs.dstY, fs.dstW, fs.dstH};
+            SDL_RenderCopy(renderer_, texture_, &src, &dst);
+        }
         osdRect_ = platform::OsdRect();
         if (osd_.valid()) drawOsd();
         if (msg_ != nullptr && msg_->lines != 0) drawMessage();
@@ -199,6 +228,50 @@ public:
     }
 
 private:
+    // 効果 (video_filter=) を掛けた絵を、表 (frame_.cw x frame_.ch) の大きさで CPU で作り、SDL に絵の大きさまで拡大させて
+    // 描く (ベアメタル版と同じ platform/crt_effect.h)。掛けなかったら (効果がない、表を作れない) false を返す。
+    // X68000 の画面 (pixels) は変えない (--screenshot とステートには入らない)。右上の数字と左上のメッセージはこのあとに
+    // 描くので、ゆがまない
+    bool presentCrt(const uint32_t* pixels, int pitch) {
+        if (crt_ <= platform::CRT_OFF || crt_ >= platform::CRT_PRESET_COUNT) return false;
+        const platform::FrameScale& fs = frame_.s;
+        const int cw = frame_.cw, ch = frame_.ch;
+        if (cw == 0) return false;
+        // 表の大きさで描くか (1 画素が 1 画素)、SDL に拡大させるか
+        const bool scaled = cw != fs.dstW || ch != fs.dstH;
+        if (!crtMap_.tried(crt_, fs.srcW, fs.srcH, cw, ch)) {
+            if (cw > crtMap_.maxW || ch > crtMap_.maxH) {
+                crtMem_.assign(platform::crtMapBytes(cw, ch) / 4 + 1, 0);
+                platform::crtMapInit(crtMap_, crtMem_.data(), cw, ch);
+                crtLine_[0].assign((size_t)cw + 4, 0);
+                crtLine_[1].assign((size_t)cw + 4, 0);
+            }
+            platform::crtBuildMap(crtMap_, crt_, fs.srcW, fs.srcH, cw, ch);
+        }
+        if (!crtMap_.valid) return false;
+        if (!crtTexture_ || crtTexW_ != cw || crtTexH_ != ch) {
+            if (crtTexture_) SDL_DestroyTexture(crtTexture_);
+            crtTexture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, cw, ch);
+            if (!crtTexture_) return false;
+            crtTexW_ = cw;
+            crtTexH_ = ch;
+        }
+        // 1 画素が 1 画素に出るときは混ぜない (アパーチャーグリルの縦じまをそのまま出す)
+        SDL_SetTextureScaleMode(crtTexture_, scaled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        void* tex = nullptr;
+        int texPitch = 0;
+        if (SDL_LockTexture(crtTexture_, nullptr, &tex, &texPitch) != 0) return false;
+        const uint32_t* src = pixels + (size_t)fs.srcY * pitch + fs.srcX;
+        for (int y = 0; y < ch; y++) {
+            const uint32_t* line = platform::crtRenderRow(crtMap_, src, pitch, y, crtLine_[0].data(), crtLine_[1].data());
+            memcpy((uint8_t*)tex + (size_t)y * texPitch, line, (size_t)cw * 4);
+        }
+        SDL_UnlockTexture(crtTexture_);
+        const SDL_Rect dst = {fs.dstX, fs.dstY, fs.dstW, fs.dstH};
+        SDL_RenderCopy(renderer_, crtTexture_, nullptr, &dst);
+        return true;
+    }
+
     // 画面の隅の数字を、ウィンドウの右上に描く (X68000 の画面の外の余白に入ればそこ、入らなければ重ねる)。
     // 大きさはウィンドウの画素で決める (論理的な大きさで描くと、256 ラインの画面では大きくなりすぎる)。
     // 文字は数字が変わったときだけ小さなテクスチャに描き直す。X68000 の画面 (screen) には描かない
@@ -206,14 +279,14 @@ private:
     void drawOsd() {
         int ow = 0, oh = 0;
         if (SDL_GetRendererOutputSize(renderer_, &ow, &oh) != 0 || ow <= 0 || oh <= 0) return;
-        // SDL_RenderSetLogicalSize() と同じく、縦横比 3:2 で真ん中に置いた X68000 の画面の位置
-        const int lw = height_ * kAspectW / kAspectH, lh = height_;
-        const float k = (float)ow / lw < (float)oh / lh ? (float)ow / lw : (float)oh / lh;
-        const int pw = (int)(lw * k), ph = (int)(lh * k);
+        // 真ん中に置いた X68000 の画面の位置 (video_scale= の枠。present())
+        const platform::FrameScale& fs = frame_.s;
         const int scale = oh / 512 < 1 ? 1 : oh / 512 > 4 ? 4 : oh / 512;
-        // 横 1 行の文字数は出す項目で決める (ホスト版は THR とファンを出さないので OSD_CHARS_BASE)
-        const int chars = platform::osdChars(osd_);
-        const platform::OsdRect rect = platform::placeOsd(ow, oh, (ow - pw) / 2, (oh - ph) / 2, pw, ph, scale, chars);
+        // 横 1 行の文字数は出す項目で決める (ホスト版は THR とファンを出さないので OSD_CHARS_BASE)。
+        // テクスチャの幅は OSD_CHARS なので、それより長くしない (ホスト版は IP アドレスを入れないが、念のため)
+        const int n = platform::osdChars(osd_);
+        const int chars = n < platform::OSD_CHARS ? n : platform::OSD_CHARS;
+        const platform::OsdRect rect = platform::placeOsd(ow, oh, fs.dstX, fs.dstY, fs.dstW, fs.dstH, scale, chars);
         if (rect.w <= 0 || (rect.overlay && !osdOverlay_)) return;
         osdRect_ = rect;
         const int tw = platform::OSD_CHARS * 8, th = 16;
@@ -231,13 +304,10 @@ private:
             SDL_UpdateTexture(osdTexture_, nullptr, pixels, tw * 4);
             osdDrawn_ = osd_;
         }
-        // 論理的な大きさをいったん外して、ウィンドウの画素で描く (余白にも描けるように)
-        SDL_RenderSetLogicalSize(renderer_, 0, 0);
         const SDL_Rect dst = {rect.x, rect.y, rect.w, rect.h};
         // 文字は右寄せなので、テクスチャの右の chars 文字分を写す
         const SDL_Rect src = {tw - chars * 8, 0, chars * 8, th};
         SDL_RenderCopy(renderer_, osdTexture_, &src, &dst);
-        SDL_RenderSetLogicalSize(renderer_, lw, lh);
     }
 
     // 左上のメッセージを、ウィンドウの左上に描く (置き方はベアメタル版と同じ platform::placeMessage()。右上の数字と
@@ -245,12 +315,10 @@ private:
     void drawMessage() {
         int ow = 0, oh = 0;
         if (SDL_GetRendererOutputSize(renderer_, &ow, &oh) != 0 || ow <= 0 || oh <= 0) return;
-        const int lw = height_ * kAspectW / kAspectH, lh = height_;
-        const float k = (float)ow / lw < (float)oh / lh ? (float)ow / lw : (float)oh / lh;
-        const int pw = (int)(lw * k), ph = (int)(lh * k);
+        const platform::FrameScale& fs = frame_.s;
         const int scale = oh / 512 < 1 ? 1 : oh / 512;
         const int limitX = platform::messageLimitX(ow, oh, osdRect_, *msg_, scale);
-        const platform::OsdRect r = platform::placeMessage(ow, oh, (ow - pw) / 2, (oh - ph) / 2, pw, ph, *msg_, scale, limitX);
+        const platform::OsdRect r = platform::placeMessage(ow, oh, fs.dstX, fs.dstY, fs.dstW, fs.dstH, *msg_, scale, limitX);
         if (r.w <= 0) return;
         const int tw = platform::MSG_COLS * 8, th = platform::MSG_LINES * 16;
         if (!msgTexture_) {
@@ -268,11 +336,9 @@ private:
             SDL_UpdateTexture(msgTexture_, nullptr, pixels, tw * 4);
             msgDrawn_ = msgGen_;
         }
-        SDL_RenderSetLogicalSize(renderer_, 0, 0);
         const SDL_Rect src = {0, 0, r.w / r.scale, r.h / r.scale};
         const SDL_Rect dst = {r.x, r.y, r.w, r.h};
         SDL_RenderCopy(renderer_, msgTexture_, &src, &dst);
-        SDL_RenderSetLogicalSize(renderer_, lw, lh);
     }
 
     SDL_Window* window_ = nullptr;
@@ -280,6 +346,14 @@ private:
     SDL_Texture* texture_ = nullptr;
     SDL_Texture* osdTexture_ = nullptr;
     SDL_Texture* msgTexture_ = nullptr;
+    // 画面の出し方 (setVideo())
+    int scale_ = platform::VIDEO_SCALE_ASPECT;
+    int crt_ = 0;
+    platform::CrtWindowFrame frame_; // 最後の present() の置き方
+    SDL_Texture* crtTexture_ = nullptr;
+    int crtTexW_ = 0, crtTexH_ = 0;
+    platform::CrtMap crtMap_;
+    std::vector<uint32_t> crtMem_, crtLine_[2];
     platform::OsdRect osdRect_; // 最後に描いた右上の数字の場所 (描かなければ w = 0)
     const platform::MessageGlyphs* msg_ = nullptr;
     uint32_t msgGen_ = 0, msgDrawn_ = 0;
@@ -721,16 +795,21 @@ struct Options {
     bool maxSpeed = false;
     int speed060 = 100;    // --speed060 (060turbo の命令の速さ。選んだクロックの実機の 68060 を 100 とした %)
     int maxSpeedLimit = 0; // --max-speed-limit (060turbo の最高速モードの上限。0 は上限なし)
+    bool busSyncSprite = false; // --bus-sync-sprite (スプライトの読み書きも 1.6 マイクロ秒ごとにそろえる)
     int osd = 2;                // osd= (画面の隅の数字。メニューで変えるとすぐに反映する)
+    int videoScale = platform::VIDEO_SCALE_ASPECT; // video_scale= (メニューで変えるとすぐに反映する。既定は hostDefaultSettings())
+    int videoFilter = 0;                            // video_filter= (同じ)
     bool sramGiven = false;
     bool fixSramMemorySize = true; // --sram-memsize (false なら keep)
     char config[1024] = {0};    // --config (空ならなし)
+    char profile[64] = {0};     // --profile (空ならなし)
+    char profilePath[1024] = {0}; // --profile のファイル (--config のディレクトリの pix68k-NAME.cfg)
     char imageDir[1024] = {0};  // --image-dir
     char stateDir[1024] = {0};  // --state-dir
     char press[1024] = {0};     // --press
     long pressAfter = 60;
     // 設定ファイルを読んだときの値 (メニューの「Save settings」は、これと違う項目だけを書く)
-    platform::Settings fileSettings;
+    platform::Settings fileSettings = hostDefaultSettings();
     // ディスクのイメージの名前 (-0 / -1 / -h か設定ファイル。メニューで替えると書き換える)
     char diskPath[2][1024] = {{0}, {0}};
     char hdfPath[1024] = {0};
@@ -862,7 +941,10 @@ void applySettings(const platform::Settings& s, Options& opt) {
     opt.maxSpeed = s.maxSpeed != 0;
     opt.speed060 = s.speed060;
     opt.maxSpeedLimit = s.maxSpeedLimit;
+    opt.busSyncSprite = s.busSyncSprite != 0;
     opt.osd = s.osd;
+    opt.videoScale = s.videoScale;
+    opt.videoFilter = s.videoFilter;
     opt.fixSramMemorySize = s.fixSramMemsize != 0;
     opt.scsiEx = s.scsiEx != 0;
     configPath(opt.config, s.scsiExRom, opt.scsiExRom, sizeof opt.scsiExRom);
@@ -979,7 +1061,10 @@ platform::Settings runningSettings(const Options& opt) {
     s.maxSpeed = opt.maxSpeed;
     s.speed060 = opt.speed060;
     s.maxSpeedLimit = opt.maxSpeedLimit;
+    s.busSyncSprite = opt.busSyncSprite ? 1 : 0;
     s.osd = opt.osd;
+    s.videoScale = opt.videoScale;
+    s.videoFilter = opt.videoFilter;
     s.fixSramMemsize = opt.fixSramMemorySize;
     s.scsiEx = opt.scsiEx;
     platform::copyString(s.scsiExRom, sizeof s.scsiExRom, opt.scsiExRom);
@@ -1004,32 +1089,64 @@ platform::Settings runningSettings(const Options& opt) {
     return settingsForFile(opt, s);
 }
 
-// 設定ファイルを読み、Options と opt.fileSettings に入れる。読めなければ false
+// 設定ファイルを読み、Options と opt.fileSettings に入れる。読めなければ false。
+// --profile があれば、そのファイルを設定ファイルの共通の項目に重ねて読む (platform/boot_profile.h)
 bool readConfigFile(Options& opt) {
     size_t size = 0;
     uint8_t* data = loadWhole(opt.config, size);
-    if (!data) return false;
-    platform::ConfigText text;
+    if (!data) {
+        fprintf(stderr, "--config: cannot read %s\n", opt.config);
+        return false;
+    }
+    platform::ConfigText text, prof;
     text.load((const char*)data, size);
     free(data);
+    if (opt.profile[0]) {
+        char name[64], dir[1024];
+        if (!platform::profileFileName(opt.profile, name, sizeof name)) {
+            fprintf(stderr, "--profile: %s: use letters, digits, - and _ (up to %d)\n", opt.profile,
+                    platform::PROFILE_NAME_MAX);
+            return false;
+        }
+        dirName(opt.config, dir, sizeof dir);
+        snprintf(opt.profilePath, sizeof opt.profilePath, "%s/%s", dir, name);
+        data = loadWhole(opt.profilePath, size);
+        if (!data) {
+            fprintf(stderr, "--profile: cannot read %s\n", opt.profilePath);
+            return false;
+        }
+        prof.load((const char*)data, size);
+        free(data);
+    }
     platform::Settings s;
-    platform::readSettings(
-        text, s,
+    platform::readProfileSettings(
+        text, opt.profile[0] ? &prof : nullptr, s, true,
         // net_token の値は出さない (ベアメタル版と同じ。platform/setting_warning.h)
-        [&](const char* key, const char* value, platform::SettingResult r) {
+        [&](bool fromProfile, const char* key, const char* value, platform::SettingResult r) {
             char msg[384];
             platform::formatSettingWarning(msg, sizeof msg, key, value, r);
-            fprintf(stderr, "%s: %s\n", opt.config, msg);
+            fprintf(stderr, "%s: %s\n", fromProfile ? opt.profilePath : opt.config, msg);
         },
-        [&](const char* line) {
+        [&](bool fromProfile, const char* line) {
             char msg[384];
             platform::formatIgnoredLine(msg, sizeof msg, line);
-            fprintf(stderr, "%s: %s\n", opt.config, msg);
-        });
+            fprintf(stderr, "%s: %s\n", fromProfile ? opt.profilePath : opt.config, msg);
+        },
+        hostDefaultSettings());
+    // autotype= (起動したあとに打つ文字列)。コマンドラインの --type / --type-after のほうが勝つ (あとで読む)
+    if (s.autotype[0]) {
+        platform::unescapeTyped(s.autotype, strlen(s.autotype), opt.typeText, sizeof opt.typeText);
+        opt.typeAfter = (long)s.autotypeWait * 55;
+    }
     if (!x68k::Config().setCpu(s.cpu)) {
-        fprintf(stderr, "%s: cpu=%d: this build has no 68030 / 68060; using 68000\n", opt.config, s.cpu);
+        fprintf(stderr, "%s: cpu=%d: this build has no 68030 / 68060; using 68000\n",
+                opt.profile[0] ? opt.profilePath : opt.config, s.cpu);
         s.cpu = 68000;
     }
+    // モニタの枠 (video_filter= の cz-600de / cz-600db) はベアメタル版だけ。設定は残し (保存しても消さない)、使わない
+    if (const char* bz = platform::videoBezelName(s.videoFilter))
+        fprintf(stderr, "%s: video_filter=%s: the bezel is not supported by the host version; ignored\n",
+                opt.profile[0] ? opt.profilePath : opt.config, bz);
     applySettings(s, opt);
     // ファイル名は Options と同じ形 (設定ファイルのディレクトリから) にしておく (メニューの値と比べるため)
     for (int d = 0; d < 2; d++) platform::copyString(s.fd[d], sizeof s.fd[d], opt.diskPath[d]);
@@ -1344,6 +1461,31 @@ public:
         text.load(data ? (const char*)data : "", data ? size : 0);
         free(data);
         const platform::Settings fileValues = settingsForFile(opt_, s);
+        if (opt_.profile[0]) {
+            // --profile のときは、共通の項目を --config に、そのほかを組み合わせのファイルに書く (platform/boot_profile.h)
+            data = loadWhole(opt_.profilePath, size);
+            if (!data) {
+                msg.add("cannot read the profile");
+                fprintf(stderr, "menu: cannot read %s; settings not saved\n", opt_.profilePath);
+                return false;
+            }
+            platform::ConfigText prof;
+            prof.load((const char*)data, size);
+            free(data);
+            bool changedBase = false, changedProfile = false;
+            if (!platform::writeProfileSettings(text, prof, fileValues, opt_.fileSettings, changedBase, changedProfile,
+                                               hostDefaultSettings()) ||
+                (changedProfile && !saveFile(opt_.profilePath, (const uint8_t*)prof.data(), prof.size())) ||
+                (changedBase && !saveFile(opt_.config, (const uint8_t*)text.data(), text.size()))) {
+                msg.add("cannot write the settings file");
+                return false;
+            }
+            opt_.fileSettings = fileValues;
+            printf("menu: settings saved to %s%s%s\n", changedProfile ? opt_.profilePath : "",
+                   changedProfile && changedBase ? " and " : "", changedBase ? opt_.config : "");
+            msg.add("settings saved");
+            return true;
+        }
         if (!platform::writeSettings(text, fileValues, opt_.fileSettings) ||
             !saveFile(opt_.config, (const uint8_t*)text.data(), text.size())) {
             msg.add("cannot write the settings file");
@@ -1360,6 +1502,12 @@ public:
     }
     const platform::Settings& restartSettings() const { return restart_; }
     void osdChanged(int osd) override { opt_.osd = osd; }
+    // ホスト版はどの組み合わせも選べる
+    bool hasVideo() const override { return true; }
+    void videoChanged(int scale, int filter) override {
+        opt_.videoScale = scale;
+        opt_.videoFilter = filter;
+    }
     // uart はベアメタル版の行き先。ホスト版は --midi-dump でバイト列をファイルに書くときだけ使える
     bool hasMidiOut(int out) const override { return out != 1 || opt_.midiDump[0] != 0; }
 
@@ -1534,6 +1682,7 @@ int runMachine(Options& opt) {
     x68k::Config config;
     config.setCpu(opt.cpu);
     config.setClockMHz(platform::Settings::clockFor(opt.cpu, opt.clockMHz));
+    config.setBusSyncSprite(opt.busSyncSprite);
     config.highMemSize = (uint32_t)opt.highMemMB << 20;
     config.localMemSize = (uint32_t)opt.localMemMB << 20;
     config.ramSize = (uint32_t)opt.ramMB << 20;
@@ -1800,6 +1949,8 @@ int runMachine(Options& opt) {
             makeTitle((uint8_t)shownLeds, shownCapture, title, sizeof title);
             video->setTitle(title);
         }
+        // 効果は、メニューを開いている間も掛ける (メニューで変えると、すぐに見た目が変わる)
+        video->setVideo(opt.videoScale, opt.videoFilter);
         if (menu.isOpen()) {
             // メニューを開いている間は X68000 を止め、止めたときの画面にメニューを重ねて出す
             menuWasOpen = true;
@@ -1963,8 +2114,8 @@ void usage(const char* argv0) {
             "          [--no-audio] [--wav out.wav] [--time seconds] [--dump-text] [--test-pattern] [--joy-keys] [--clock 10|16|50|75]\n"
             "          [--sram-memsize fix|keep] [--cpu 68000|68030|68060] [--ipl file] [--high-mem MB]\n"
             "          [--local-mem MB] [--ram MB] [--max-speed] [--scsi-ex | --no-scsi-ex] [--scsi-ex-rom file]\n"
-            "          [--speed060 percent] [--max-speed-limit percent]\n"
-            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--config file] [--image-dir dir]\n"
+            "          [--speed060 percent] [--max-speed-limit percent] [--bus-sync-sprite]\n"
+            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--config file] [--profile name] [--image-dir dir]\n"
             "          [--neptune] [--neptune-link echo|loopback|pcap:IF|tap:NAME] [--neptune-mac MAC]\n"
             "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT]\n"
             "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none]\n"
@@ -1996,17 +2147,22 @@ int main(int argc, char** argv) {
     snprintf(opt.romDir, sizeof opt.romDir, "%s/.cache/pix68k/rom", home ? home : ".");
     snprintf(opt.sram, sizeof opt.sram, "%s/.cache/pix68k/sram.dat", home ? home : ".");
     snprintf(opt.stateDir, sizeof opt.stateDir, "%s/.cache/pix68k", home ? home : ".");
-    // 設定ファイルを先に読む (コマンドラインのほうを優先する)。ほかのオプションの値 (--type "--config" など) を
+    // 設定ファイル (--config) と組み合わせ (--profile) を先に読む (コマンドラインのほうを優先する)。ほかのオプションの値 (--type "--config" など) を
     // 拾わないよう、値を取るオプションはその値を飛ばす
     static const char* const kTakesValue[] = {
         "--frames", "-r", "-0", "-1", "-h", "--sram", "--screenshot", "--type", "--type-after", "--wav", "--time",
         "--sram-memsize", "--cpu", "--ipl", "--high-mem", "--local-mem", "--ram", "--clock", "--scsi-ex-rom",
         "--cd", "--cd-id", "--image-dir", "--state-dir", "--press", "--press-after", "--midi-sf2", "--midi-voices", "--midi-out",
         "--midi-mt32-ctrl", "--midi-mt32-pcm", "--midi-sc55", "--midi-dump", "--midi-uart-family", "--speed060",
-        "--max-speed-limit", "--message", "--message-sec", "--message-dump"};
+        "--max-speed-limit", "--message", "--message-sec", "--message-dump", "--profile"};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sc")) {
             i += 2;
+            continue;
+        }
+        if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+            snprintf(opt.profile, sizeof opt.profile, "%s", argv[i + 1]);
+            i++;
             continue;
         }
         bool skip = false;
@@ -2017,17 +2173,18 @@ int main(int argc, char** argv) {
         }
         if (strcmp(argv[i], "--config") != 0 || i + 1 >= argc) continue;
         snprintf(opt.config, sizeof opt.config, "%s", argv[i + 1]);
-        if (!readConfigFile(opt)) {
-            fprintf(stderr, "--config: cannot read %s\n", opt.config);
-            return 2;
-        }
         i++;
     }
+    if (opt.profile[0] && !opt.config[0]) {
+        fprintf(stderr, "--profile needs --config (the profile is pix68k-NAME.cfg next to it)\n");
+        return 2;
+    }
+    if (opt.config[0] && !readConfigFile(opt)) return 2;
     bool clockGiven = false; // --clock を書いた (CPU に合わなければ警告する)
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         bool hasArg = i + 1 < argc;
-        if (!strcmp(a, "--config") && hasArg) {
+        if ((!strcmp(a, "--config") || !strcmp(a, "--profile")) && hasArg) {
             i++; // 上で読んだ
         } else if (!strcmp(a, "--image-dir") && hasArg) {
             snprintf(opt.imageDir, sizeof opt.imageDir, "%s", argv[++i]);
@@ -2197,6 +2354,8 @@ int main(int argc, char** argv) {
             }
         } else if (!strcmp(a, "--max-speed")) {
             opt.maxSpeed = true;
+        } else if (!strcmp(a, "--bus-sync-sprite")) {
+            opt.busSyncSprite = true;
         } else if (!strcmp(a, "--speed060") && hasArg) {
             opt.speed060 = atoi(argv[++i]);
             if (opt.speed060 < 5 || opt.speed060 > 3200) {

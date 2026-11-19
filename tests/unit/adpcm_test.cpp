@@ -682,6 +682,7 @@ void testRateControl() {
             }
         }
         CHECK_EQ(s.ring().underruns(), 0u);
+        CHECK_EQ(s.latencyGoal(), target); // 速さのずれだけでは目標は変わらない
         CHECK(minFill > target / 4);
         CHECK(maxFill < target * 2 + 512 + 100);
         printf("  consumer %+.1f%%: fill %u..%u\n", sign * 0.1, minFill, maxFill);
@@ -731,6 +732,195 @@ void testLatencyRecovery() {
     CHECK(lowered > before + 48 * 10);   // 減らすのは少しずつ (一度に元へは戻さない)
 }
 
+// エミュレータが実時間に間に合わない間の音 (#217)。ベアメタル版のコア 1 の進め方をまねる: 1 フレーム (18ms) 分の
+// X68000 の時間を busy の時間をかけて作り (音は 0.25ms 分ずつ増える)、フレームの時刻まで待つ。遅れは 250ms までは
+// あとで取り戻し (待たずに次のフレームを作る)、それを超えたら基準を取り直す (その分の時間は捨てる)。読む側は HDMI と
+// 同じく 768 フレーム (16ms) ずつ読む。busyUs(フレームの番号) が、そのフレームを作るのにかかる時間 (us) を返す。
+// 間に合わない間は、Sound が補間の刻みを小さくして多くのフレームを作るので (Sound::stretchIfLow())、足りなくならない
+struct LagResult {
+    unsigned underruns;    // from 秒より後に足りなくなった回数
+    unsigned maxFill;      // from 秒より後のたまり具合の最大
+    unsigned maxStretch;   // 刻みを小さくした割合の最大 (千分率)
+    unsigned stretchedMs;  // 0.5% を超えて小さくしていた X68000 の時間 (全体)
+    unsigned lateStretchedMs; // そのうち最後の 10 秒
+    unsigned goal;         // 終わったときのたまり具合の目標
+    unsigned goalAfterCalm; // そのあと間に合う速さで calmSeconds 秒動かしたあとの目標
+    unsigned underrunsAfterCalm; // そこまでに足りなくなった回数 (from 秒より後)
+};
+template <typename Busy> LagResult runLag(int seconds, int from, Busy busyUs, int calmSeconds = 0) {
+    static x68k::Sound s;
+    s = x68k::Sound();
+    s.setOutputRate(48000);
+    s.setLatency(960); // 20ms (ベアメタル版と同じ)
+    LagResult r = {};
+    r.goalAfterCalm = 0;
+    static int16_t buf[2 * 768];
+    static constexpr int FRAME_US = 18000, SLICE_US = 250;
+    const int64_t endUs = (int64_t)seconds * 1000000;
+    int64_t now = 0, due = 0, nextRead = 0; // 実時間 (us)、今のフレームの時刻、次に読む時刻
+    unsigned underAtStart = 0;
+    bool counting = false;
+    unsigned stretchedSlices = 0, lateSlices = 0;
+    for (int frame = 0; now < endUs; frame++) {
+        const int busy = busyUs(frame);
+        for (int i = 0; i < FRAME_US / SLICE_US; i++) {
+            now += busy / (FRAME_US / SLICE_US);
+            for (; nextRead <= now; nextRead += 16000) s.ring().readAudio(buf, 768);
+            s.advance(SLICE_US * 4);
+            const unsigned st = s.stretchPermille();
+            if (st > r.maxStretch) r.maxStretch = st;
+            if (st > 5) {
+                stretchedSlices++;
+                if (now >= endUs - 10000000) lateSlices++;
+            }
+            if (!counting && now >= (int64_t)from * 1000000) {
+                counting = true;
+                underAtStart = s.ring().underruns();
+            }
+            if (counting && s.ring().fill() > r.maxFill) r.maxFill = s.ring().fill();
+        }
+        due += FRAME_US;
+        if (now < due) {
+            for (; nextRead <= due; nextRead += 16000) s.ring().readAudio(buf, 768);
+            now = due; // フレームの時刻まで待つ
+        } else if (now - due > 250000) {
+            due = now; // 基準を取り直す
+        }
+    }
+    r.underruns = s.ring().underruns() - underAtStart;
+    r.stretchedMs = stretchedSlices * SLICE_US / 1000;
+    r.lateStretchedMs = lateSlices * SLICE_US / 1000;
+    r.goal = s.latencyGoal();
+    // このあと calmSeconds 秒、間に合う速さ (1 フレーム 8ms) で動かしたあとの目標
+    for (int64_t until = now + (int64_t)calmSeconds * 1000000; now < until;) {
+        for (int i = 0; i < FRAME_US / SLICE_US; i++) {
+            now += 8000 / (FRAME_US / SLICE_US);
+            for (; nextRead <= now; nextRead += 16000) s.ring().readAudio(buf, 768);
+            s.advance(SLICE_US * 4);
+        }
+        due += FRAME_US;
+        if (now < due) {
+            for (; nextRead <= due; nextRead += 16000) s.ring().readAudio(buf, 768);
+            now = due;
+        } else if (now - due > 250000) {
+            due = now;
+        }
+    }
+    r.goalAfterCalm = s.latencyGoal();
+    r.underrunsAfterCalm = s.ring().underruns() - underAtStart;
+    return r;
+}
+
+void printLag(const char* what, const LagResult& r) {
+    printf("  %s: %u underrun(s), fill up to %u, goal %u, stretched %u ms (%u ms in the last 10 s), at most %u.%u%%\n",
+           what, r.underruns, r.maxFill, r.goal, r.stretchedMs, r.lateStretchedMs, r.maxStretch / 10,
+           r.maxStretch % 10);
+}
+
+void testLag() {
+    printf("emulator behind real time\n");
+    // ふだん (1 フレーム 8ms): 刻みは 0.5% までしか変えず、目標も変わらない
+    LagResult calm = runLag(60, 5, [](int) { return 8000; });
+    printLag("8 ms frames", calm);
+    CHECK_EQ(calm.underruns, 0u);
+    CHECK(calm.maxStretch <= 5u);
+    CHECK_EQ(calm.goal, 960u);
+    // ときどき 1 フレームか 2 フレームが 22ms かかる (平均では間に合う)。2 フレーム続くと 8ms 遅れ、たまり具合が
+    // 15ms を切ることがあるので、刻みを少し (5% まで) 小さくすることがある。目標に足すのは 5ms まで
+    LagResult jitter = runLag(60, 5, [](int f) { return f % 50 == 0 || f % 170 <= 1 ? 22000 : 8000; });
+    printLag("one or two 22 ms frames now and then", jitter);
+    CHECK_EQ(jitter.underruns, 0u);
+    CHECK(jitter.maxStretch <= 60u);
+    CHECK(jitter.stretchedMs <= 200u);
+    CHECK_EQ(jitter.lateStretchedMs, 0u);
+    CHECK(jitter.goal <= 960u + 240u);
+    // 2 秒ごとに 10 フレーム続けて 22ms かかり (40ms 遅れる)、そのあと取り戻す。はじめの何回かは刻みを小さくし、
+    // 多く作った分だけ目標が上がると、あとはためた分で足りる (最後の 10 秒は小さくしない)
+    LagResult burst = runLag(60, 5, [](int f) { return f % 111 < 10 ? 22000 : 8000; });
+    printLag("ten 22 ms frames every 2 s", burst);
+    CHECK_EQ(burst.underruns, 0u);
+    CHECK(burst.stretchedMs > 0u);
+    CHECK_EQ(burst.lateStretchedMs, 0u);
+    CHECK(burst.goal > 960u && burst.goal < 960u + 48 * 60); // 足すのは遅れの分 (40ms) ほどまで
+    // 22ms のフレームが続く (速さは 82%。遅れが 250ms を超えるたびに時間を捨てる)。10 秒から 40 秒まで
+    // そのあと 5 分、間に合う速さで動かすと、上がった目標が下がる (30 秒ごとに 1/8 ずつ。元の 20ms までは戻りきらない)
+    LagResult steady = runLag(60, 10, [](int f) { return f >= 555 && f < 555 + 1364 ? 22000 : 8000; }, 300);
+    printLag("22 ms frames for 30 s", steady);
+    printf("  goal after 5 more minutes at full speed: %u\n", steady.goalAfterCalm);
+    CHECK(steady.goal > 960u && steady.goal <= x68k::AudioRing::SIZE / 2); // 多く作った分だけ上がる (上限はリングバッファの半分)
+    CHECK(steady.goalAfterCalm < steady.goal - steady.goal / 4);          // 5 分で 1/4 より多く下がる
+    CHECK(steady.goalAfterCalm >= 960u);
+    CHECK_EQ(steady.underrunsAfterCalm, 0u);
+    CHECK_EQ(steady.underruns, 0u);
+    CHECK(steady.maxStretch >= 150u && steady.maxStretch <= 250u);
+    CHECK(steady.stretchedMs > 20000u);
+    CHECK_EQ(steady.lateStretchedMs, 0u); // 間に合うようになれば戻る
+    // 19ms のフレームが続く (95%)
+    LagResult mild = runLag(60, 10, [](int f) { return f >= 555 && f < 555 + 1580 ? 19000 : 8000; });
+    printLag("19 ms frames for 30 s", mild);
+    CHECK_EQ(mild.underruns, 0u);
+    CHECK(mild.goal > 960u && mild.goal <= x68k::AudioRing::SIZE / 2);
+    CHECK_EQ(mild.lateStretchedMs, 0u);
+    // リングバッファ (16384 フレーム) からあふれない
+    CHECK(burst.maxFill < 16000u && steady.maxFill < 16000u && mild.maxFill < 16000u);
+    // 刻みを小さくするのは 25% まで。それより遅いと途切れる (止まりはしない)
+    LagResult tooSlow = runLag(60, 10, [](int f) { return f >= 555 && f < 555 + 1000 ? 30000 : 8000; });
+    printLag("30 ms frames for 30 s", tooSlow);
+    CHECK(tooSlow.underruns > 0u);
+    CHECK(tooSlow.maxStretch >= 240u && tooSlow.maxStretch <= 250u);
+}
+
+// 出力の周波数が高いときと低いときも、0.25 秒ごとの調整と、間に合わない間の調整が働く (#217 の見直し)。
+// 0.25 秒のフレーム数は、262144Hz 以上では 16 ビットに入らない (SDL は、開いたデバイスの周波数をそのまま渡す)。
+// 32Hz より低いと、1/32 秒のフレーム数が 0 になる (0 で割らない)
+void testRateRange() {
+    printf("output rates outside the usual range\n");
+    static int16_t buf[2 * 4096];
+    // rate Hz で、読む側が 1ms ごとに rate/1000 フレームを読む。作る側は stallFrom <= ms < stallTo の間だけ止まり、
+    // slowFrom <= ms の間は 4 回に 1 回休む (75% の速さ)
+    struct Result {
+        unsigned goalAfterStall, goalAtEnd, underruns, maxStretch;
+    };
+    auto run = [&](int rate, unsigned latency, int stallFrom, int stallTo, int slowFrom, int until) {
+        static x68k::Sound s;
+        s = x68k::Sound();
+        s.setOutputRate(rate);
+        s.setLatency(latency);
+        Result r = {};
+        double owed = 0;
+        for (int ms = 0; ms < until; ms++) {
+            const bool stalled = ms >= stallFrom && ms < stallTo;
+            const bool slow = slowFrom >= 0 && ms >= slowFrom && ms % 4 == 0;
+            if (!stalled && !slow) s.advance(4000);
+            for (owed += rate / 1000.0; owed >= 1; owed -= 1) s.ring().readAudio(buf, 1);
+            if (ms == stallTo + 2000) r.goalAfterStall = s.latencyGoal();
+            if (slowFrom >= 0 && ms >= slowFrom && s.stretchPermille() > r.maxStretch) r.maxStretch = s.stretchPermille();
+        }
+        r.goalAtEnd = s.latencyGoal();
+        r.underruns = s.ring().underruns();
+        return r;
+    };
+    // 384kHz、目標は 20ms (7680 フレーム)。5 秒のところで 30ms 止まると足りなくなり、0.25 秒ごとの調整が目標を上げる。
+    // そのあと 100 秒足りなくならなければ、目標を下げる。どちらも、0.25 秒のフレーム数 (96000) まで数えられないと起きない
+    {
+        const Result r = run(384000, 7680, 5000, 5030, -1, 110000);
+        printf("  384000 Hz: %u underrun(s), goal %u after a stall, %u after 100 s\n", r.underruns, r.goalAfterStall,
+               r.goalAtEnd);
+        CHECK(r.underruns > 0u);
+        CHECK(r.goalAfterStall > 7680u);
+        CHECK(r.goalAtEnd < r.goalAfterStall);
+    }
+    // 31Hz と 3Hz、目標は 8 フレーム。5 秒から 75% の速さにすると、たまり具合が目標の 3/4 を切り、刻みを小さくする
+    for (int rate : {31, 3}) {
+        const Result r = run(rate, 8, -1, -1, 5000, 60000);
+        printf("  %d Hz: stretched at most %u.%u%%, goal %u\n", rate, r.maxStretch / 10, r.maxStretch % 10, r.goalAtEnd);
+        CHECK(r.maxStretch > 5u && r.maxStretch <= 250u);
+        CHECK(r.goalAtEnd >= 8u);
+    }
+    // 大きさと並びは #217 の前と同じ (ステートには入らない変数だが、Machine の中の並びを変えない)
+    printf("  sizeof(Sound) = %u\n", (unsigned)sizeof(x68k::Sound));
+}
+
 } // namespace
 
 int main() {
@@ -747,6 +937,8 @@ int main() {
     testDcBlock();
     testRateControl();
     testLatencyRecovery();
+    testLag();
+    testRateRange();
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;

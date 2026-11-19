@@ -20,6 +20,15 @@
 // 30 秒間足りなくならなければ、足した量を 1/8 ずつ減らす。ただし減らすのは、その 30 秒のたまり具合の最小値が
 // setLatency() の量を超えた分まで (ときどき止まってたまり具合が下がっているなら、足した量はまだ要るので減らさない)。
 // この調整は Sound::tuneLatency() (目標に足す量) と Sound::output() (補間の刻み) にある。
+// エミュレータが実時間に間に合わない間 (重い場面) は、作る音が足りないので、上の調整では途切れる。たまり具合が
+// setLatency() の量の 3/4 を切ったら、補間の刻みを最大 25% 小さくして多くのフレームを作る (Sound::stretchIfLow())。
+// その間、Sound が 62.5kHz のサンプルから作る音 (OPM、ADPCM、まーきゅりーゆにっと、CD-ROM 装置のオーディオ) は、
+// 最大 25% 遅く、低く鳴る (25% で約 5 半音) が、途切れない。MIDI の音源 (MT-32、SF2、SC-55) は出力のフレームごとに
+// 音を作るので、音の高さは変わらず、演奏が遅くなるだけ。OPM と MIDI を一緒に鳴らす曲では、その間だけ音の高さがずれる。
+// エミュレータの遅れそのものは、この調整では縮まらない (取り戻すのは Machine を動かす側)。多く作った分は目標に足すので、
+// 遅れを取り戻したあとは、足した分だけ多くたまり、音の遅延が長くなる (足した量は上の決まりで少しずつ減らす)。
+// setLatency() を呼んでいれば働くので、ベアメタル版だけでなく、ホスト版の SDL の音でも同じになる
+// (WAV に書くときは setLatency() を呼ばないので、働かない)。
 // 出力の周波数が 0 (既定) なら音は作らない (OPM のタイマと ADPCM の転送の要求は動かす)。
 //
 // 音の合成を別のコア (スレッド) で行うとき (sound_replay.h): X68000 を動かす側の Sound は出力の周波数を 0 にし、
@@ -79,6 +88,8 @@ public:
         __atomic_load(&prebuffer_, &frames, __ATOMIC_RELAXED);
         return frames;
     }
+    // 読み手が鳴らしているか (prebuffer フレームたまるのを待っている間は false)。書き手が見る
+    bool playing() const { return __atomic_load_n(&primed_, __ATOMIC_RELAXED); }
     // 足りなくなった回数 (読み手が数える)
     unsigned underruns() const { return __atomic_load_n(&underruns_, __ATOMIC_RELAXED); }
     // 足りなくなってから鳴らし直すまでに無音で埋めたフレーム数 (鳴らし直したときに足す) を返して 0 に戻す
@@ -94,8 +105,8 @@ private:
     uint32_t buf_[SIZE]; // 下位 16 ビットが L、上位が R
     unsigned head_ = 0;  // 書き手だけが書く
     unsigned tail_ = 0;  // 読み手だけが書く
+    bool primed_ = false; // 読み手だけが書く (playing())
     // 読み手だけが使う
-    bool primed_ = false;
     bool starved_ = false; // 足りなくなってから、まだ鳴らし直していない
     int32_t lastL_ = 0, lastR_ = 0;
     unsigned prebuffer_ = 0;
@@ -118,12 +129,22 @@ public:
     // リングバッファのたまり具合の最小値の目標 (フレーム)。音を出し始める前にはこの 2 倍をため、
     // その後はたまり具合の最小値がこの量になるよう、作る速さを少し変える。0 なら速さを変えない (WAV に書くときなど)
     void setLatency(unsigned frames) {
-        target_ = frames;
+        __atomic_store_n(&target_, frames, __ATOMIC_RELAXED);
         ring_.setPrebuffer(frames * 2);
-        extra_ = 0; // 足した量は捨てる
+        setExtra(0); // 足した量は捨てる
         ring_.takeMissing();
         lastUnderruns_ = ring_.underruns(); // ここから数える
         restartCalm();
+    }
+    // 今のたまり具合の最小値の目標 (setLatency() の量に、足りなくなったときなどに足した量を加えたもの)。
+    // ほかのコアやスレッドからログ用に読んでよい (おおよその値)。target_ と extra_ は、読むのも書くのもいつも
+    // アトミックにする (target()、extra()、setExtra())。書くのは setLatency() と音を作る側だけ。setLatency() は、
+    // 音を作り始める前に呼ぶ (ベアメタル版は音を作るコアを動かす前、ホスト版は SDL の音を始める前)
+    unsigned latencyGoal() const { return target() + extra(); }
+    // 補間の刻みを、出力の周波数から決まる値よりどれだけ小さくしているか (千分率。大きくしているときは 0)。
+    // 5 までは速さのずれの調整、それより大きければ間に合わない間の調整 (stretchIfLow())。音を作る側が読む (試験用)
+    unsigned stretchPermille() const {
+        return step_ < baseStep_ ? (unsigned)((uint64_t)(baseStep_ - step_) * 1000 / baseStep_) : 0;
     }
     // OPM のクロック (4MHz) で clocks だけ進める。mercury はつないだまーきゅりーゆにっと (なければ nullptr)。
     // midi は MIDI の音源 (なければ nullptr)。音を作るときは、出力のフレームごとにその音を足す。
@@ -247,9 +268,19 @@ private:
         }
     }
     void output(int32_t l, int32_t r, MidiOut* midi, CdMixer* cd);
+    // 遅れを吸収するために刻みを小さくする割合の上限 (1/4 = 25%。実時間の 75% の速さまで途切れない)
+    static constexpr uint32_t STRETCH_MAX_DIV = 4;
+    void stretchIfLow(); // 1/32 秒ごとに、たまり具合が少なければ刻みを小さくする (sound.cpp)
     void tuneLatency(); // 0.25 秒ごとに、足りなくなったかを見て目標に足す量を決める (sound.cpp)
     // 足りなくならない区間の数と、その間のたまり具合の最小値を初めの値に戻す
     void restartCalm() { calm_ = 0; calmMin_ = UINT16_MAX; }
+    // extra_ を書く (latencyGoal() をほかのコアが読むので、アトミックに書く)
+    void setExtra(unsigned frames) { __atomic_store_n(&extra_, frames, __ATOMIC_RELAXED); }
+    unsigned target() const { return __atomic_load_n(&target_, __ATOMIC_RELAXED); }
+    unsigned extra() const { return __atomic_load_n(&extra_, __ATOMIC_RELAXED); }
+    // 0.25 秒と 1/32 秒のフレーム数 (出力の周波数が低くても 1 以上。0 で割らないため)
+    unsigned quarterFrames() const { return (unsigned)rate_ >= 4 ? (unsigned)rate_ / 4 : 1; }
+    unsigned shortFrames() const { return (unsigned)rate_ >= 32 ? (unsigned)rate_ / 32 : 1; }
 
     Opm opm_;
     Adpcm adpcm_;
@@ -262,10 +293,13 @@ private:
     int32_t prev_[2] = {};       // 補間の前のサンプル
     uint32_t pos_ = 0;           // 補間の位置 (16.16、前のサンプルからの距離)
     uint32_t step_ = 0, baseStep_ = 0; // 出力 1 フレームあたりに進む OPM のサンプル数 (16.16)
-    unsigned target_ = 0;
-    unsigned adjustCount_ = 0;
-    unsigned minFill_ = ~0u; // 今の区間のたまり具合の最小値
-    unsigned extra_ = 0;         // 目標に足している量 (フレーム)
+    unsigned target_ = 0;        // setLatency() の量 (読むときは target())
+    uint32_t adjustCount_ = 0;   // 0.25 秒の区切りまでに作ったフレーム数 (出力の周波数の 1/4 まで数えるので 32 ビット)
+    // 次の 2 つは合わせて 4 バイト (前は minFill_ が 4 バイト。Sound の大きさと並びを変えない)。どちらも
+    // たまり具合 (AudioRing::SIZE 以下) なので 16 ビットで足りる
+    uint16_t minFill_ = UINT16_MAX;  // 今の区間 (0.25 秒) のたまり具合の最小値
+    uint16_t shortMin_ = UINT16_MAX; // この 1/32 秒のたまり具合の最小値 (stretchIfLow())
+    unsigned extra_ = 0;         // 目標に足している量 (フレーム。読むときは extra()、書くときは setExtra())
     unsigned lastUnderruns_ = 0; // 前に見たときの AudioRing::underruns()
     uint16_t calm_ = 0;      // 足りなくならなかった区間 (0.25 秒) の数
     uint16_t calmMin_ = 0xffff; // 足りなくならなかった間のたまり具合の最小値 (AudioRing::SIZE 以下なので 16 ビットで足りる)

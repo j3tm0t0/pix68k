@@ -52,7 +52,7 @@ public:
     bool is060() const { return model_ == CpuModel::M68060; }
     // 命令の処理と、そこから呼ぶ関数のうち、よく使うものは 2 つに分けてコンパイルする (#170):
     //   M060 = true   68060 専用。68060 では結果が決まっている検査 (tick() の cost_、is060() の model_) を消す。
-    //                 68060 の表 (table060_) の thunk からだけ呼ぶ
+    //                 68060 の表 (ops060_) の thunk からだけ呼ぶ
     //   M060 = false  両方の機種で使える (検査を実行時に行う)。68030 の表のほか、68060 でも、分けていない命令、FPU、
     //                 68060 にない命令の肩代わり (opUnimpInt() が 68030 の表の処理を呼ぶ) から使う
     // 中では tick(n) を if (!M060) tick(n)、is060() を on060<M060>() と書く。結果とサイクル数はどちらも同じ。
@@ -182,7 +182,7 @@ public:
     int fcProg() const { return sflag_ ? FC_SUPER_PROG : FC_USER_PROG; }
 
     // サイクル数: 68000 で n サイクルかかる分を足す (機種の係数を掛ける)。68060 では係数が 0 で、何も足さない
-    // (68060 は下の tick060() と、命令ごとの表 cyc060_ で数える)
+    // (68060 は下の tick060() と、命令ごとの表 ops060_ で数える)
     // 係数が 0 (68060) なら、sub_ を読み書きしない (足しても変わらない)
     void tick(int n) {
         if (cost_) sub_ += (uint64_t)(n * cost_);
@@ -355,7 +355,7 @@ public:
         return op;
 #endif
     }
-    // 表 (table030_ / table060_) に入れる関数。M060 は 68060 の表に入れるもの。
+    // 表 (table030_ / ops060_) に入れる関数。M060 は 68060 の表に入れるもの。
     // 2 つ目は、68060 用に分けてコンパイルする命令の処理 (引数に For<M060> がある) のもので、M060 を処理に渡す
     template <void (Cpu020::*M)(uint16_t), int U = U_FULL, bool M060 = false, unsigned SPEC = 0>
     static void thunk(Cpu020* c, uint16_t op) {
@@ -668,7 +668,13 @@ public:
     // 0 でなければ、次の命令の前に、止まっているか (halted_、stopped_)、割り込みを受け付けるか (ipl_、lastIpl_、
     // imask_、nmiPending_)、トレースするか (trace_) を調べる。0 の間は、どれも前に調べたときから変わっておらず、
     // 調べなくても結果が同じなので、命令ごとの検査を省く (runUntil())。これらを変える所 (setIPL()、setSR()、reset()、
-    // setRegisters()、ステートの読み込み)、step() の始め、命令を打ち切ったあと (longjmp) で 1 にする。ステートには入れない
+    // setRegisters()、ステートの読み込み)、step() の始め、命令を打ち切ったあと (longjmp) で 1 にする。ステートには入れない。
+    // 上の検査は ATTN_CHECK (ビット 0。「1 にする」と書いた所はこのビット)。
+    // ATTN_FETCH (ビット 1) は、68060 の命令キャッシュが無効 (fetchWaitOn_) の間だけ立つ。命令ごとに fetchWaitOn_ を
+    // 調べるかわりに、その間は runLoop() が取り出しの時間を足す経路で実行する (検査は省いたまま)。ATTN_CHECK を
+    // 決め直すときに一緒に決める (runLoop())。fetchWaitOn_ を変える updateCacheCosts() は attn_ を ATTN_CHECK にして、
+    // 次の命令の前に決め直させる
+    static constexpr uint8_t ATTN_CHECK = 1, ATTN_FETCH = 2;
     uint8_t attn_ = 1;
     // run() を、今の命令が終わったところで打ち切る (endRun())。run() の中でだけ立ち、ステートには入れない
     uint8_t endRun_ = 0;
@@ -694,19 +700,26 @@ public:
     uint32_t extStart_ = 0, extSize_ = 0;
     uint8_t* ext_ = nullptr;
 
-    const Handler* table_ = nullptr;
     static Handler table030_[65536];
-    static Handler table060_[65536];
+    // 68060 の表。命令ごとに引くものを 1 項目 (16 バイト) にまとめ、1 回の読み込みで済ませる (#224)。
+    // meta は下位から: ビット 0-15 サイクル数と同時実行の分類 (cyc060())、16-39 命令が書くレジスタ (wr060())、
+    // 40-63 命令が使うレジスタ (use060())。値の意味は cpu060_cycles.inc
+    struct Op060 {
+        Handler fn;
+        uint64_t meta;
+    };
+    static Op060 ops060_[65536];
+    static uint16_t cyc060(uint16_t op) { return (uint16_t)ops060_[op].meta; }
+    static uint32_t wr060(uint16_t op) { return (uint32_t)(ops060_[op].meta >> 16) & 0xffffffu; }
+    static uint32_t use060(uint16_t op) { return (uint32_t)(ops060_[op].meta >> 40); }
+    Handler handlerOf(uint16_t op) const { return is060() ? ops060_[op].fn : table030_[op]; }
     static bool tablesReady_;
     static void buildTables();
 
     // ---- 68060 のサイクル数 (cpu060_cycles.inc) ----
-    static uint16_t cyc060_[65536]; // 命令ごとのサイクル数と、同時実行の分類
-    static uint32_t use060_[65536]; // 命令が使うレジスタ
-    static uint32_t wr060_[65536];  // 命令が書くレジスタ (use060_ と同じ並び)
     static void buildCycles060();
-    // 前の命令が、次の命令を sOEP に入れられるなら 0 でない (その命令の cyc060_ の値)。pairDest_ は、前の命令の
-    // 結果のレジスタを use060_ の下位 24 ビットの並びにしたもの (後の命令がこれを使うなら同時に進まない)
+    // 前の命令が、次の命令を sOEP に入れられるなら 0 でない (その命令の cyc060() の値)。pairDest_ は、前の命令の
+    // 結果のレジスタを use060() の並びにしたもの (後の命令がこれを使うなら同時に進まない)
     uint32_t pairLead_ = 0, pairDest_ = 0;
     static constexpr int BCACHE060 = 256;
     // 分岐キャッシュ: 命令のアドレス (全部のビット) と、状態 (ビット 0-1 は 2 ビットの飽和カウンタ、BC_VALID は
@@ -719,10 +732,13 @@ public:
         for (uint8_t& st : bcacheState060_)
             if (!userOnly || (st & BC_USER)) st = 0;
     }
-    int predict060(bool taken);
-    void bcc060(bool taken, bool backward);
+    // predict060()、fold060()、bcc060() は、呼ぶ所に展開する (#224)。Bcc の関数 (opBcc()) は条件と変位の大きさごとに
+    // 分けてコンパイルされていて、分岐するかどうか (taken) が呼ぶ所で決まっているので、展開すると場合分けが消える。
+    // 定義は cpu060_cycles.inc (cpu020.cpp が、使う所より前に読む)
+    CPU020_INLINE int predict060(bool taken);
+    CPU020_INLINE void bcc060(bool taken, bool backward);
     void jump060(int predicted);
-    int fold060();
+    CPU020_INLINE int fold060();
     // 分岐でない命令を実行してから、まだ分岐 (Bcc / BRA / BSR / DBcc / JMP / JSR) を実行していない。予測が当たって分岐する
     // Bcc / BRA / JMP を 0 サイクルに折りたためるのは、このときだけ (fold060())
     bool foldOk060_ = false;
@@ -738,7 +754,7 @@ public:
     }
     static Handler decode(uint16_t op, CpuModel model);
     template <bool M060> void execOne();
-    template <bool M060> void execInstr(int traceMode, bool fast);
+    template <bool M060> void execInstr(int traceMode, bool fast, bool fetchWait);
     template <bool M060> void stopUntil(uint64_t endSub);
     template <bool M060> void runLoop(uint64_t endSub);
     void runUntil(uint64_t endSub);

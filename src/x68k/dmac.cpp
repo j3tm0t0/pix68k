@@ -225,10 +225,13 @@ bool Dmac::startChain(int ch, Host& host) {
     return loadChain(ch, host);
 }
 
-void Dmac::runChannel(int ch, Host& host, int maxBytes) {
+void Dmac::runChannel(int ch, Host& host, int maxBytes, LinkGuard* guard) {
     if (pendingChain_[ch] && !startChain(ch, host)) return;
     int budget = maxBytes;
-    while (active(ch) && !(reg_[ch][CCR] & CCR_HLT) && budget > 0) {
+    // runBusHolders() から呼ばれたときは、転送が DMAC のレジスタを書いたら、そのオペランドの後始末 (MTC、ブロックの
+    // 終わり) まで済ませたところで戻る
+    const bool* wrote = guard ? guard->wrote : nullptr;
+    while (active(ch) && !(reg_[ch][CCR] & CCR_HLT) && budget > 0 && !(wrote && *wrote)) {
         int reqg = reg_[ch][OCR] & 3;
         // REQG = 11 は最初の 1 オペランドだけオートリクエストで転送し、そのあとは外部要求を待つ
         bool external = reqg == 2 || (reqg == 3 && !firstOperand_[ch]);
@@ -272,9 +275,22 @@ void Dmac::runChannel(int ch, Host& host, int maxBytes) {
                 return;
             }
         } else if ((ocr & 0x0c) == 0x0c) { // リンクチェーン
-            if ((get32(ch, BAR) & 0xffffff) != 0) {
-                if (loadChain(ch, host)) continue;
-                return;
+            const uint32_t next = get32(ch, BAR) & 0xffffff;
+            if (next != 0) {
+                if (!loadChain(ch, host)) return;
+                if (guard) {
+                    // 前に読んだ表の番地にもう一度来たら輪。表は読んであるので、ここで戻っても run() が続きを進められる
+                    if (guard->power != 0 && next == guard->saved) {
+                        guard->ring = true;
+                        return;
+                    }
+                    if (guard->power == 0 || ++guard->count == guard->power) {
+                        guard->saved = next;
+                        guard->power = guard->power ? guard->power * 2 : 1;
+                        guard->count = 0;
+                    }
+                }
+                continue;
             }
         } else if (reg_[ch][CCR] & CCR_CNT) { // コンティニュー: 次のブロックは BAR / BTC / BFC
             reg_[ch][CSR] |= CSR_BTC;
@@ -306,6 +322,33 @@ void Dmac::run(Host& host, int maxBytes) {
             if (!active(ch) || priority(ch) != pri) continue;
             runChannel(ch, host, maxBytes);
             lastRun_ = ch;
+        }
+    }
+    notify(host);
+}
+
+void Dmac::runBusHolders(Host& host, const bool* wrote) {
+    notify(host);
+    auto selfWrite = [wrote] { return wrote && *wrote; };
+    // 全部のチャネルを合わせて runChannel() を 65,536 回 (2 の 32 乗オペランド) まで
+    uint32_t calls = 0;
+    for (int pri = 0; pri < 4 && !selfWrite(); pri++) {
+        for (int ch = 0; ch < 4 && !selfWrite(); ch++) {
+            if (!holdsBus(ch) || priority(ch) != pri) continue;
+            // オートリクエストの最大速度は要求を待たないので、runChannel() は 1 回ごとに必ず進む
+            // (転送するか、終わるか、エラーで止まる)。終わらない転送は 2 種類で、どちらも気づいたところで戻る:
+            // - リンクチェーンの輪 (guard.ring)
+            // - 転送が DMAC のレジスタを書く (*wrote)。自分の MTC を書き戻す、CCR に CNT を立て直す、
+            //   BTC を書き戻すなど。レジスタは write() でしか外から変わらないので、書き込みがなければ
+            //   上の 2 つのほかに終わらない転送はない。書き込みがあったら、終わる転送かどうかは調べずに戻る
+            //   (ほかのチャネルのレジスタでも、まだ転送していないチャネルが残っていても)
+            // 念のため、合わせたオペランドの数にも上限を置く
+            LinkGuard guard;
+            guard.wrote = wrote;
+            while (holdsBus(ch) && !guard.ring && !selfWrite() && calls < 65536) {
+                runChannel(ch, host, 65536, &guard);
+                calls++;
+            }
         }
     }
     notify(host);

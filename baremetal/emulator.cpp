@@ -222,6 +222,11 @@ unsigned Emulator::AudioProxy::underruns() const {
     return r ? r->underruns() : 0;
 }
 
+unsigned Emulator::AudioProxy::fill() const {
+    x68k::AudioRing* r = ring();
+    return r ? r->fill() : 0;
+}
+
 void Emulator::runRender() {
     if (replayer_ == nullptr) return;
     __atomic_store_n(&renderCoreEntered_, 1u, __ATOMIC_RELEASE);

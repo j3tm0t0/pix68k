@@ -93,6 +93,24 @@ public:
         return true;
     }
 
+    // key の行をすべて消す (行の注釈と改行も)。消した行の数を返す
+    int removeLines(const char* key) {
+        const size_t klen = strlen(key);
+        int count = 0;
+        size_t pos = 0;
+        while (pos < len_) {
+            const Line l = parseLine(pos);
+            if (l.eq >= 0 && l.keyEnd - l.keyStart == klen && memcmp(buf_ + l.keyStart, key, klen) == 0) {
+                memmove(buf_ + pos, buf_ + l.next, len_ - l.next);
+                len_ -= l.next - pos;
+                count++;
+                continue;
+            }
+            pos = l.next;
+        }
+        return count;
+    }
+
     // key の (最後の行の) 値を out に入れる。なければ false
     bool get(const char* key, char* out, size_t size) const {
         bool found = false;

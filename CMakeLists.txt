@@ -7,6 +7,17 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Release ではフレームポインタを持たない (#224)。aarch64 の GCC と Apple clang は、指定しなければ関数を呼ぶ関数ごとに
+# x29 を設定する (Pi 5 の Linux の GCC 14.2 で、060turbo の OutRun の命令数が 1.1〜1.3% 減った)。
+# perf record -g などでフレームポインタをたどって呼び出し元を見たいときは -DPIX68K_FRAME_POINTER=ON でビルドする
+option(PIX68K_FRAME_POINTER "Release でもフレームポインタを持つ (perf record -g などのため)" OFF)
+if(PIX68K_FRAME_POINTER)
+  # 既定でフレームポインタを省くコンパイラ (x86_64 の clang の -O3 など) でも持たせる
+  add_compile_options($<$<CONFIG:Release>:-fno-omit-frame-pointer>)
+else()
+  add_compile_options($<$<CONFIG:Release>:-fomit-frame-pointer>)
+endif()
+
 # ベアメタル (Circle) と同じ制約でビルドできることを確かめるため、コアは例外と RTTI なしでビルドする
 # 68030 / 68060 のコア (cpu020.cpp) と FPU (fpu.cpp) も同じライブラリに入れる
 add_library(m68k STATIC src/m68k/m68k.cpp src/m68k/cpu020.cpp src/m68k/fpu.cpp src/m68k/fpu_core.cpp
@@ -326,6 +337,21 @@ add_executable(frame_scale_test tests/unit/frame_scale_test.cpp)
 target_include_directories(frame_scale_test PRIVATE src)
 target_compile_options(frame_scale_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
 add_test(NAME frame_scale_test COMMAND frame_scale_test)
+add_executable(crt_effect_test tests/unit/crt_effect_test.cpp)
+target_include_directories(crt_effect_test PRIVATE src)
+target_compile_options(crt_effect_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+add_test(NAME crt_effect_test COMMAND crt_effect_test)
+# 同じ試験を、NEON の命令を使わない書き方で (aarch64 のホストでも、ほかの CPU と同じコードを確かめる)
+add_executable(crt_effect_scalar_test tests/unit/crt_effect_test.cpp)
+target_include_directories(crt_effect_scalar_test PRIVATE src)
+target_compile_definitions(crt_effect_scalar_test PRIVATE PIX68K_CRT_NO_NEON)
+target_compile_options(crt_effect_scalar_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+add_test(NAME crt_effect_scalar_test COMMAND crt_effect_scalar_test)
+
+add_executable(bezel_test tests/unit/bezel_test.cpp)
+target_include_directories(bezel_test PRIVATE src)
+target_compile_options(bezel_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+add_test(NAME bezel_test COMMAND bezel_test)
 
 add_executable(osd_test tests/unit/osd_test.cpp)
 target_include_directories(osd_test PRIVATE src)
@@ -380,8 +406,9 @@ add_test(NAME fetch_musashi_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/fetc
 add_test(NAME usb_guard_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/usb_guard_test.sh ${CMAKE_SOURCE_DIR})
 
 # pix68k.cfg の読み書きと項目の表 (platform/config_text.h、settings.h)、設定メニュー (platform/menu.h)、
-# ベアメタル版のネットワークの口の部品 (platform/net_*.h、key_type.h)、読み書きするドライブの選び方 (platform/boot_drive.h)
-foreach(t config_test menu_test file_replace_test net_test boot_drive_test)
+# ベアメタル版のネットワークの口の部品 (platform/net_*.h、key_type.h)、読み書きするドライブの選び方 (platform/boot_drive.h)、
+# 起動の組み合わせ (platform/boot_profile.h)
+foreach(t config_test menu_test file_replace_test net_test boot_drive_test boot_profile_test)
   add_executable(${t} tests/unit/${t}.cpp)
   target_link_libraries(${t} x68k)
   target_compile_options(${t} PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
@@ -517,6 +544,8 @@ foreach(v abc -1 1x)
 endforeach()
 # --time の値の検査 (先頭の空白や +、桁あふれを断り、0 と int64_t の最大は受け付ける。pix68k と同じ試験)
 add_test(NAME x68k_boot_time_args COMMAND sh ${CMAKE_SOURCE_DIR}/tests/host/time_args_test.sh $<TARGET_FILE:x68k_boot> 1 "cannot read .*IPLROM.DAT" -f 1)
+# tools/qemu_human68k.sh が見る video_scale=、video_filter= と前の書き方 (scale=、crt=、scanline=) のログの期待 (tools/qemu_crt_expect.sh) を確かめる
+add_test(NAME qemu_crt_expect COMMAND sh ${CMAKE_SOURCE_DIR}/tests/host/qemu_crt_expect_test.sh)
 
 # Human68k を起動し、RAM に置いたプログラムから IOCS のマウスの呼び出しを使い、ホストのマウスの動きと
 # ボタンが届くかを見る。ROM か起動ディスクがなければ飛ばす
@@ -673,6 +702,8 @@ if(PIX68K_HOST)
     set_tests_properties(host_time PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # --time の値の検査 (ROM なしで動く)
     add_test(NAME host_time_args COMMAND sh ${CMAKE_SOURCE_DIR}/tests/host/time_args_test.sh $<TARGET_FILE:pix68k> 0 "showing the test pattern" --frames 1 --no-sram --no-audio)
+    # --profile: ほかのオプションの値 (--type "--profile") を拾わない。組み合わせのファイルがなければ終了コード 2 (#231)
+    add_test(NAME host_profile_args COMMAND sh ${CMAKE_SOURCE_DIR}/tests/host/profile_args_test.sh $<TARGET_FILE:pix68k>)
     add_test(NAME host_menu COMMAND sh ${CMAKE_SOURCE_DIR}/tests/host/menu_test.sh $<TARGET_FILE:pix68k>)
     set_tests_properties(host_menu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # CUE シートの CD-ROM のイメージをつなぎ、メニューで媒体を入れ替える (X68030 の IPL ROM がなければ飛ばす)

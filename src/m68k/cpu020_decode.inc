@@ -560,7 +560,7 @@ Cpu020::Handler Cpu020::decode(uint16_t op, CpuModel model) { return decodeOp(op
 void Cpu020::buildTables() {
     for (int op = 0; op < 65536; op++) {
         table030_[op] = decode((uint16_t)op, CpuModel::M68030);
-        table060_[op] = decode((uint16_t)op, CpuModel::M68060);
+        ops060_[op].fn = decode((uint16_t)op, CpuModel::M68060);
     }
 }
 

@@ -977,7 +977,8 @@ TShutdownMode CKernel::RunM0() {
         if (count % 100 == 0) DrawTestPattern();
         m_Screen.Rotor(0, count);
         // Ctrl + Alt + Delete で再起動する (X68000 を動かしていないので、書き戻すものはない)
-        if (m_RebootRequest.take()) {
+        // POST /reboot?profile= の書き込みに失敗して once が残っているかもしれず、取り消せなければ再起動しない
+        if (m_RebootRequest.take() && CancelProfileChoiceForRestart("Ctrl+Alt+Delete")) {
             m_Logger.Write(FromKernel, LogNotice, "restarting (Ctrl+Alt+Delete)");
             if (m_DeploySeconds != 0) FinishDeploy(false);
             return ShutdownReboot;
@@ -985,6 +986,7 @@ TShutdownMode CKernel::RunM0() {
         if (m_DeploySeconds != 0) {
             if (count % 100 == 0) KeepAlive();
             if (count >= deployTicks) {
+                CancelProfileChoice();
                 FinishDeploy();
                 return ShutdownReboot;
             }
@@ -1061,6 +1063,9 @@ void CKernel::UpdateUsbDevices() {
         m_PadSent[slot] = -1;
         m_PadHat[slot].reset(HatBase(pad, m_PadKnown[slot]));
         m_pGamePad[slot] = pad;
+        m_PadAttachTicks[slot] = CTimer::GetClockTicks64();
+        m_BootPadBits[slot] = 0; // 起動の組み合わせのメニュー (boot_menu.cpp の PadStartFilter)
+        m_BootPadReports[slot] = 0;
         pad->RegisterRemovedHandler(GamePadRemovedHandler);
         pad->RegisterStatusHandler(GamePadStatusHandler);
         m_Logger.Write(FromKernel, LogNotice, "gamepad attached (%s, joystick %d%s)", (const char*)name, slot + 1,
@@ -1203,7 +1208,7 @@ void CKernel::GamePadStatusHandler(unsigned index, const TGamePadState* state) {
     for (int s = 0; s < 2; s++)
         if (k->m_pGamePad[s] != nullptr && k->m_PadIndex[s] == index) slot = s;
     if (slot < 0) return;
-    if (k->m_pEmulator != nullptr) {
+    if (k->m_pEmulator != nullptr || k->m_BootMenuActive) {
         platform::GamePadInput in;
         in.known = k->m_PadKnown[slot];
         in.buttons = state->buttons;
@@ -1214,6 +1219,11 @@ void CKernel::GamePadStatusHandler(unsigned index, const TGamePadState* state) {
             in.value[a] = state->axes[a].value;
             in.minimum[a] = state->axes[a].minimum;
             in.maximum[a] = state->axes[a].maximum;
+        }
+        if (k->m_pEmulator == nullptr) { // 起動の組み合わせのメニュー (boot_menu.cpp)
+            k->m_BootPadBits[slot] = platform::joystickBits(in);
+            k->m_BootPadReports[slot] = k->m_BootPadReports[slot] + 1;
+            return;
         }
         k->m_PadWant[slot] = platform::joystickBits(in);
         // 設定メニューを開いている間は送らない (閉じたあとに主ループが送る)
@@ -1231,6 +1241,7 @@ void CKernel::GamePadRemovedHandler(CDevice* device, void*) {
     for (int s = 0; s < 2; s++) {
         if (k->m_pGamePad[s] != (CUSBGamePadDevice*)device) continue;
         k->m_pGamePad[s] = nullptr;
+        k->m_BootPadBits[s] = 0; // 起動の組み合わせのメニューで、離したことにする
         if (k->m_pEmulator != nullptr) {
             // ジョイスティックを離したことにする
             EnterCritical();

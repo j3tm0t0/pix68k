@@ -118,7 +118,7 @@ struct Config {
     // 060turbo.sys の説明書のキャッシュモードの節)、このエミュレータはキャッシュに当たったものとしてサイクル数を足さない。
     // CACR でキャッシュを切っている間のメモリの読み書きは、ここの値ではなく Cpu020::updateCacheCosts() の値を足す。
     // サイクル数を足すのは Cpu020 の setFastPage() のメモリでないところ (I/O、グラフィック VRAM、テキスト VRAM への
-    // 書き込み) だけ。I/O とスプライトは、このあと busArea の表の区切りまで待つ。VRAM は、本体のバスの側で延びる分が
+    // 書き込み) だけ。I/O は、このあと busArea の表の区切りまで待つ (スプライトは bus_sync_sprite=on のときだけ)。VRAM は、本体のバスの側で延びる分が
     // 分からないので入れていない (最短の見積もり)
     int busWait060 = 6;
     // X68030 と 060turbo の本体のバスの待ち。場所の種類 (BusArea) ごとに、読みと書きで別に 3 つの値 (ns) を持つ:
@@ -240,7 +240,7 @@ struct Config {
         return area >= 0 && area < BUS_AREAS ? names[area] : "";
     }
     // 表を、areas (BUS_SYNC_* の和) の場所の読み書きが ns ごとの区切りで終わる値にする (ns が 0 なら、どこも待たせない)。
-    // 既定は 1600ns で I/O とスプライト。
+    // 既定は 1600ns で I/O だけ (BUS_SYNC_DEFAULT)。スプライトもそろえるなら setBusSyncSprite(true)。
     // 実機の si.r の system performance (RTC の $E8A001 を読むループ) は、X68030、040turbo、060turbo のどれでも、
     // 命令キャッシュ / データキャッシュの有効 / 無効によらず 177.82% で、1 周がちょうど 1.6 マイクロ秒 (毎秒 625000 周)
     // になる。CPU の側の時間 (1 周 0.04 から約 1 マイクロ秒) を足した値にならないので、I/O の読み書きは CPU が出した
@@ -248,14 +248,17 @@ struct Config {
     // 読み書き 1 回は、060turbo では busWait060 (最短のバスサイクル) を足したあと、次の区切りまで待つ
     // (Machine::busWait()。出どころと仮定は docs/060turbo.md の「X68030 と 060turbo の本体のバス」)。68030 では、最短のバスサイクル
     // (3 クロック = 120ns) を pre に入れる (足さないと、32 ビットの読み書きの 2 回目が 1 回目と同じ区切りで終わってしまう)。
-    // 実機の値があるのは RTC だけで、ほかの I/O ($E80000-$EAFFFF、$EC0000-$ECFFFF) とスプライト ($EB0000-$EBFFFF) は
-    // RTC と同じとした (68000 の機種でも、スプライトのウェイトは RTC より長い。setupBusWaits())。グラフィック VRAM と
-    // テキスト VRAM は、実機の値がないので入れていない (busWait060 だけ。試験と測定のために BUS_SYNC_VRAM で入れられる)
+    // 実機の値があるのは RTC だけで、ほかの I/O ($E80000-$EAFFFF、$EC0000-$ECFFFF) は RTC と同じとした。
+    // スプライト ($EB0000-$EBFFFF) も RTC と同じとする値 (BUS_SYNC_SPRITE) は、測っていない仮定で、既定では入れない:
+    // 入れると、スプライトを多く書くゲーム (CBX68) が 1 フレームの間に書き終えられず、画面が崩れた (#218)。
+    // pix68k.cfg の bus_sync_sprite=on (ホスト版は --bus-sync-sprite) で入れられる。グラフィック VRAM と
+    // テキスト VRAM も、実機の値がないので入れていない (busWait060 だけ。試験と測定のために BUS_SYNC_VRAM で入れられる)
     static constexpr uint8_t BUS_SYNC_IO = 1;
     static constexpr uint8_t BUS_SYNC_SPRITE = 2;
     static constexpr uint8_t BUS_SYNC_VRAM = 4;
+    static constexpr uint8_t BUS_SYNC_DEFAULT = BUS_SYNC_IO;
     static constexpr int BUS_SYNC_NS = 1600;
-    void setBusSync(int ns, uint8_t areas = BUS_SYNC_IO | BUS_SYNC_SPRITE) {
+    void setBusSync(int ns, uint8_t areas = BUS_SYNC_DEFAULT) {
         BusTiming t;
         if (ns > 0) {
             t.period = ns;
@@ -266,6 +269,12 @@ struct Config {
                                 : i >= BUS_AREA_SPRITE && i <= BUS_AREA_BG ? BUS_SYNC_SPRITE : BUS_SYNC_IO;
             busArea[i].read = busArea[i].write = areas & bit ? t : BusTiming();
         }
+    }
+    // スプライト ($EB0000-$EBFFFF) の読み書きも I/O と同じ 1.6 マイクロ秒ごとの区切りにそろえるか (既定はそろえない)。
+    // 表を既定の値に作り直すので、setCpu() のあと、busArea を書き換える前に呼ぶ。68000 では何もしない
+    void setBusSyncSprite(bool on) {
+        if (cpuModel == m68k::CpuModel::M68000) return;
+        setBusSync(BUS_SYNC_NS, on ? (uint8_t)(BUS_SYNC_IO | BUS_SYNC_SPRITE) : BUS_SYNC_DEFAULT);
     }
     // 060turbo の 68060 の命令の速さ (選んだクロック (cpuHz) の実機の 68060 を 100 とした %。SPEED060_MIN から
     // Machine::SPEED_MAX)。100 で、命令のサイクル数が MC68060UM 10 章の表どおりになる (m68k/cpu060_cycles.inc)。
@@ -676,6 +685,7 @@ private:
     Sound sound_; // OPM と ADPCM
     Dmac dmac_;
     bool inDma_ = false; // dmac_.run() / notify() の途中
+    bool dmaWroteDmac_ = false; // dmac_.runBusHolders() の転送が DMAC のレジスタを書いた (その呼び出しの間だけ使う)
     bool dmaBlock_ = true; // DMA の転送をまとめる (setDmaBlock())
     Scc scc_;
     Mouse mouse_;

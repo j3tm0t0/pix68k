@@ -29,7 +29,7 @@ int AudioRing::drain(int16_t* out, int maxFrames) {
 void AudioRing::readAudio(int16_t* out, int frames) {
     int n = 0;
     if (!primed_ && fill() >= prebuffer()) {
-        primed_ = true;
+        __atomic_store_n(&primed_, true, __ATOMIC_RELAXED);
         if (starved_) { // 鳴らし直すときに、無音で埋めた分をまとめて渡す
             __atomic_fetch_add(&missing_, starvedFrames_, __ATOMIC_RELAXED);
             starved_ = false;
@@ -42,7 +42,7 @@ void AudioRing::readAudio(int16_t* out, int frames) {
             lastR_ = out[2 * n - 1];
         }
         if (n < frames) {
-            primed_ = false;
+            __atomic_store_n(&primed_, false, __ATOMIC_RELAXED);
             starved_ = true;
             starvedFrames_ = 0;
             __atomic_store_n(&underruns_, underruns_ + 1, __ATOMIC_RELAXED);
@@ -245,14 +245,14 @@ void Sound::tuneLatency() {
     // 超える分を埋めたとき (設定のメニューなどで長く止まったとき) は、目標を上げても足りるようにはならないので、
     // setLatency() の量だけ足す。埋めた分は鳴らし直したときに渡されるので、足りなくなった回数とは別に見る
     unsigned add = ring_.takeMissing();
-    if (add && (add < target_ || target_ >= cap || add > cap - target_)) add = target_;
+    if (add && (add < target() || target() >= cap || add > cap - target())) add = target();
     // 読み手が数えた、足りなくなった回数が前に見たときから増えたか
     const unsigned seen = lastUnderruns_;
     lastUnderruns_ = ring_.underruns();
     const bool under = lastUnderruns_ != seen;
     if (add) {
-        unsigned room = target_ + extra_ < cap ? cap - target_ - extra_ : 0;
-        extra_ += add < room ? add : room;
+        unsigned room = target() + extra() < cap ? cap - target() - extra() : 0;
+        setExtra(extra() + (add < room ? add : room));
     }
     if (under) {
         restartCalm(); // 足りなくならない区間を数え直す
@@ -262,13 +262,43 @@ void Sound::tuneLatency() {
     if (++calm_ >= 120) {
         // 減らすのは、この 30 秒のたまり具合の最小値が目標 (setLatency()) を超えた分まで。ときどき止まって
         // たまり具合が下がっているなら、足した量はまだ要るので減らさない
-        unsigned room = calmMin_ > target_ ? calmMin_ - target_ : 0;
-        unsigned dec = extra_ / 8 + 1;
-        if (dec > extra_) dec = extra_;
+        unsigned room = calmMin_ > target() ? calmMin_ - target() : 0;
+        unsigned dec = extra() / 8 + 1;
+        if (dec > extra()) dec = extra();
         if (dec > room) dec = room;
-        extra_ -= dec;
+        setExtra(extra() - dec);
         restartCalm();
     }
+}
+
+// 1/32 秒ごとに output() から呼ぶ。エミュレータが実時間に間に合わない間は、作る音が出す音より少なく、
+// リングバッファが空になって音が途切れる (#217)。0.5% の調整では追いつかないので、この 1/32 秒のたまり具合の
+// 最小値が setLatency() の量の 3/4 を切ったら、切った分に比例して刻みを小さくし (最大 25%。3/8 以下で最大)、
+// 同じ X68000 の時間から多くのフレームを作る。その間は音の高さと速さが下がる (途切れる代わりに、遅くなった分だけ
+// 低く鳴る)。下がるのは Sound が作る音 (OPM、ADPCM、まーきゅりーゆにっと、CD-ROM 装置のオーディオ) だけで、出力の
+// フレームごとに音を作る MIDI の音源は、音の高さが変わらない (sound.h の先頭の説明)。0.5% の調整と違い、たまり具合が足した量を含む目標より少ないだけでは働かない (ためた分は、
+// 遅れを吸収するために使う)。読み手が鳴らしていない間 (鳴らし始める前と、足りなくなって鳴らし直すのを待つ間) も働かない。
+// 多く作った分は、足りなくなったときと同じく目標に足す (遅れを取り戻したあと、その分だけ多くたまっているので)
+void Sound::stretchIfLow() {
+    const uint32_t low = target() * 3 / 4, slowest = baseStep_ / 200; // 0.5% の調整で一番小さい刻みとの差
+    const uint32_t seen = shortMin_;
+    shortMin_ = UINT16_MAX;
+    if (seen >= low || !ring_.playing()) {
+        // 働かせていたら、0.5% の調整の範囲に戻す (次の 0.25 秒の区切りで決め直す)
+        if (step_ < baseStep_ - slowest) step_ = baseStep_ - slowest;
+        return;
+    }
+    const uint32_t most = baseStep_ / STRETCH_MAX_DIV;
+    uint32_t cut = (uint32_t)((uint64_t)most * (low - seen) * 2 / low);
+    if (cut > most) cut = most;
+    if (cut < slowest) cut = slowest;
+    step_ = baseStep_ - cut;
+    // 次の 1/32 秒に多く作るフレーム数 (おおよそ)
+    const unsigned more = (unsigned)((uint64_t)shortFrames() * cut / baseStep_);
+    const unsigned cap = AudioRing::SIZE >> 1;
+    const unsigned room = target() + extra() < cap ? cap - target() - extra() : 0;
+    setExtra(extra() + (more < room ? more : room));
+    restartCalm(); // 足りなくなったときと同じく、足りなくならない区間を数え直す
 }
 
 // 62.5kHz の 1 サンプルを、フィルタを通して出力の周波数に直す。
@@ -309,21 +339,25 @@ void Sound::output(int32_t l, int32_t r, MidiOut* midi, CdMixer* cd) {
         ring_.push((int16_t)ol, (int16_t)orr);
         pos_ += step_;
         // たまり具合の最小値が目標より多ければ刻みを大きく (作る量を少なく)、少なければ小さくする
-        if (target_) {
+        if (target()) {
             unsigned fill = ring_.fill();
-            if (fill < minFill_) minFill_ = fill;
-            if (++adjustCount_ >= (unsigned)rate_ / 4) {
+            if (fill < minFill_) minFill_ = (uint16_t)fill;
+            if (fill < shortMin_) shortMin_ = (uint16_t)fill;
+            ++adjustCount_;
+            if (adjustCount_ % shortFrames() == 0) stretchIfLow();
+            if (adjustCount_ >= quarterFrames()) {
                 adjustCount_ = 0;
                 tuneLatency();
                 int32_t maxAdj = (int32_t)(baseStep_ / 200); // 0.5%
                 // 目標は setLatency() の値に、足りなくなったときに足した量を加えたもの
-                const int32_t goal = (int32_t)target_ + (int32_t)extra_;
+                const int32_t goal = (int32_t)target() + (int32_t)extra();
                 // 最小値と目標の差に比例させ、差が目標と同じ大きさで 0.5% にする (それより大きい差でも 0.5% で止める)
                 int32_t adj = (int32_t)(((int64_t)minFill_ - goal) * maxAdj / goal);
                 if (adj > maxAdj) adj = maxAdj;
                 if (adj < -maxAdj) adj = -maxAdj;
-                step_ = (uint32_t)((int32_t)baseStep_ + adj);
-                minFill_ = ~0u;
+                // 遅れを吸収するために刻みを小さくしている間 (stretchIfLow()) は、そのままにする
+                if (step_ >= baseStep_ - (uint32_t)maxAdj) step_ = (uint32_t)((int32_t)baseStep_ + adj);
+                minFill_ = UINT16_MAX;
             }
         }
     }

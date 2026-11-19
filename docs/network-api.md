@@ -38,6 +38,7 @@ HTTP の口:
 | `GET /thermal` | 温度、ARM のクロック、ファームウェアがクロックを下げているか、ファン (Pi 5)。`名前=値` を 1 行ずつ返す (下に詳しく書いた) |
 | `GET /screen.ppm` | X68000 の画面 (PPM)。X68000 が動いていれば、次に合成し終えたフレームを待って返す (下に詳しく書いた) |
 | `POST /reboot` | ディスクと SRAM を書いてから再起動する (トークンが要る。Ctrl + Alt + Delete と同じ手順。書けなければ断り、60 秒以内にもう一度頼むと書かずに再起動する) |
+| `POST /reboot?profile=<名前>` | `/pix68k/pix68k-<名前>.cfg` の起動の組み合わせで再起動する (トークンが要る。手順は `POST /reboot` と同じ)。`pix68k.cfg` は書き換えない。次の起動はメニューを出さない。`profile=` が空なら組み合わせなし (`pix68k.cfg` だけ)。名前が正しくなければ 400、ファイルがなければ 404、`/pix68k/profile.sel` に書けなければ 500、起動したドライブがなければ 503 を返し、再起動しない。組み合わせのファイルの数が一覧の上限 (30) を超えていても、ファイルがあれば使う。起動時のメニューを出している間は、HTTP のサーバはまだ動いていない (メニューが終わってから待ち受ける)。受け付けたあとディスクを書き戻せずに再起動を断ったときは、`profile.sel` を前回の選択に戻す。戻せなかったときは、次の `profile=` なしの `POST /reboot` (Ctrl + Alt + Delete と設定メニューの Restart の前にも) でもう一度戻し、それでも戻せなければ 500 を返して再起動しない (SD カードに書けない間は、60 秒以内の 2 回目で書かずに再起動する手順も使えない)。選んだものは前回の選択 (`/pix68k/profile.sel`) にもなる ([README](../README.md) の「起動の組み合わせ」) |
 | `POST /type` | リクエストの本体 (ボディ) の文字列を X68000 のキーとして打つ (トークンが要る。JIS 配列。押してから 40ms で離し、40ms 空けて次を打つ。`\n` は Enter、`\t` は TAB、`\b` は BS、`\e` は ESC。4096 バイトまで) |
 | `POST /key?down=XX&mod=YY`、`POST /key?up=XX`、`POST /key?up` | USB キーボードの usage ID (16 進) でキーを押す / 離す / すべて離す (トークンが要る。`mod=` は USB の修飾キーのビット。01 左 Ctrl、02 左 Shift、04 左 Alt、08 左 GUI) |
 | `POST /message?sec=N` | 本体の文字列 (UTF-8) を画面の左上に重ねて N 秒出す (トークンが要る。既定 10 秒、`sec=0` なら消すまで、上限 86400)。本体が空 (空白と改行だけ) なら消す。下に詳しく書いた |
@@ -47,6 +48,8 @@ HTTP の口:
 # カーネルを入れ替えて再起動する (カーネルを置いた手元の機械から)
 curl -H 'X-Pix68k-Token: 好きな文字列' -T kernel8.img http://pix68k/files/kernel8.img
 curl -H 'X-Pix68k-Token: 好きな文字列' -X POST http://pix68k/reboot
+# 起動の組み合わせ pix68k-gr2.cfg で再起動する
+curl -H 'X-Pix68k-Token: 好きな文字列' -X POST 'http://pix68k/reboot?profile=gr2'
 # 設定を読む / 書く
 curl -H 'X-Pix68k-Token: 好きな文字列' http://pix68k/files/pix68k/pix68k.cfg
 curl -H 'X-Pix68k-Token: 好きな文字列' --data-binary @pix68k.cfg http://pix68k/files/pix68k/pix68k.cfg
@@ -59,23 +62,29 @@ curl -H 'X-Pix68k-Token: 好きな文字列' --data 'dir\n' http://pix68k/type
 curl -H 'X-Pix68k-Token: 好きな文字列' -X POST 'http://pix68k/key?down=4c&mod=09'
 curl -H 'X-Pix68k-Token: 好きな文字列' -X POST 'http://pix68k/key?up'
 # 画面の左上にメッセージを出す (30 秒) / 消す
-curl -H 'X-Pix68k-Token: 好きな文字列' --data-binary '案1 (OutRun)\nいまの版' 'http://pix68k/message?sec=30'
+curl -H 'X-Pix68k-Token: 好きな文字列' --data-binary '案1 OutRun\nいまの版' 'http://pix68k/message?sec=30'
 curl -H 'X-Pix68k-Token: 好きな文字列' -X POST http://pix68k/message
 ```
 
+curl の代わりに、この口を操作するコマンド `pix68kcli` (Go、macOS / Linux / Windows 向け) がある。宛先と token を設定ファイルに名前付きで書いておき、
+`pix68kcli --host pi3 log -f`、`pix68kcli screen`、`pix68kcli files put kernel8.img /`、`pix68kcli reboot` のように使う。
+作り方と使い方は [tools/pix68kcli/README.md](../tools/pix68kcli/README.md) にある。
+
 `POST /message` のメッセージ (`src/platform/osd_message.h`):
 
-- 4 行、1 行 40 桁 (半角の桁。全角は 2 桁) まで。はみ出した分は字の切れ目で捨てる。本体は 1024 バイトまで (超えれば 413)。
+- 1 行は半角 10 桁 (全角は 2 桁と数えるので 5 字) で、超えた字は次の行へ折り返す (入らない半角の空白は捨てるので、折り返した行の頭に空白は来ない。全角の空白は字として扱う)。
+  行は 4 行まで。入りきらない分は字の切れ目で捨て、4 行目の終わりを「…」(全角。10 桁に収まるよう、要るだけ 4 行目の右の字を消す)
+  にする。X68000 の画面 (Human68k の 1 行目など) に大きく重ならないよう、桁を少なくしてある。本体は 1024 バイトまで (超えれば 413)。
   `/type` と同じく `\n` で改行できる (`curl --data` は本体の改行を消すので、改行は `\n` か `--data-binary` で送る)
 - 半角 (ASCII) は設定メニューと同じ 8x16 の字で出す。半角カタカナと全角 (JIS 第 1・第 2 水準と記号) は、X68000 の CGROM の字で出す
-  (CGROM がなければ、全角は四角、半角カタカナは `?`)。JIS X 0208 にない字 (丸数字、絵文字など) は四角
+  (CGROM がなければ、全角は四角、半角カタカナは `?`。ただし「…」は点を 3 つ描く)。JIS X 0208 にない字 (丸数字、絵文字など) は四角
 - 白い字に黒の背景で、右上の数字 (`osd=`) と同じく X68000 の画面をフレームバッファに写すところで重ねる。X68000 の画面の中身には
   書かないので、`/screen.ppm` には出ない。フレームバッファの高さが 900 ライン以上 (1080 ラインのモニタなど) なら 2 倍の大きさ。右上の数字と同じ行に並ぶときは、数字にかからない
   よう右を切る。設定メニューを開いている間は出さない
-- 新しいメッセージは前のメッセージを置き換える。ログに `message: "案1 (OutRun)\nいまの版" (30 s)` の 1 行を残す (改行は `\n`、
+- 新しいメッセージは前のメッセージを置き換える。ログに `message: "案1 OutRun\nいまの版" (30 s)` の 1 行を残す (改行は `\n`、
   ほかの制御文字は `?` にする。160 バイトを超えれば切る)
 - 消す時刻は Pi を起動してからの時計で数える。カーネルを入れ替えて再起動すると消える
-- ホスト版は `--message TEXT` (`--message-sec N`) で、同じものをウィンドウの左上に出せる (HTTP の口はない)
+- ホスト版は `--message TEXT` (`--message-sec N`) で、同じものをウィンドウの左上に出せる (折り返しと「…」も同じ。HTTP の口はない)
 
 - X68000 につないでいるディスクのイメージ (`fd0=` などで指定したファイル) は書き換えと削除を断る (409)。書くときに使う `<パス>.part` と
   `<パス>.old` がそのイメージに当たる場合も断る。名前は、続いた `/` や大文字と小文字の違い、短い名前 (`HUMAN~1.XDF`) をそろえてから比べる

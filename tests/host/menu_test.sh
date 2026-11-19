@@ -5,6 +5,8 @@
 #   3. メニューを続けて開いたり閉じたりしても止まらない
 #   4. 設定ファイルの中のディレクトリ (images/) に置いたイメージを選んで保存すると、設定ファイルからの相対パスで書く
 #   5. 拡張ボード (FPU board、Mercury Unit、MIDI board、MIDI out) を変えて保存し、Restart でつないで作り直す
+#   6. 画面の出し方 (Display のページの Scale、Scanlines、Mask) を変えて保存する。ホスト版では、前の crt= も scanline= も
+#      保存時に残す (crt= は知らせて無視し、scanline= は v0.1.0 のホスト版と同じく読まない)
 # 使い方: menu_test.sh <pix68k> 。ROM がなければ 77 (ctest の SKIP_RETURN_CODE)
 set -eu
 PIX68K=$1
@@ -54,10 +56,10 @@ grep -q '^fd1=GAME.XDF$' images/pix68k.cfg || { echo "NG: fd1 path"; cat images/
 "$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --no-sram --no-wait --frames 3 > out.txt 2>&1 || { cat out.txt; echo "NG: second run"; exit 1; }
 grep -qi 'cannot' out.txt && { cat out.txt; echo "NG: cannot load"; exit 1; }
 
-# 拡張ボード: 主のページの Boards (下から Close Restart Save-settings Reset Load-state Save-state State-slot OSD Boards) で
+# 拡張ボード: 主のページの Boards (下から Close Restart Save-settings Reset Load-state Save-state State-slot OSD Display Boards) で
 # Enter。そのページは FPU-board Mercury-Unit Neptune-X MIDI-board (MIDI-out) Back。FPU board と Mercury Unit を on、
 # MIDI board を on、MIDI out を mt32 (ホスト版は uart を飛ばすので、sf2 から右に 2 回) にし、Esc で戻って保存し、Restart で作り直す
-run 200 menu,end,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,down,right,right,esc,end,up,up,enter,end,up,enter
+run 200 menu,end,up,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,down,right,right,esc,end,up,up,enter,end,up,enter
 want 'menu: settings saved to images/pix68k.cfg'
 for line in fpu_board=on mercury=on midi=on midi_out=mt32; do
   grep -q "^$line\$" images/pix68k.cfg || { echo "NG: $line not written"; cat images/pix68k.cfg; exit 1; }
@@ -73,4 +75,24 @@ sed '/restarting with the new settings/,$d' out.txt | grep -qF 'FPU board' && { 
 "$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --no-sram --no-wait --frames 3 > out.txt 2>&1 || { cat out.txt; echo "NG: third run"; exit 1; }
 want 'FPU board (CZ-6BP1, MC68881) at $E9E000'
 want 'Mercury Unit at $ECC080'
+
+# 画面の出し方: 主のページの Display (下から 9 つ目) で Enter。そのページは Scale Scanlines Curve Mask Back。
+# Scale を full に (ホスト版の既定の aspect の次)、Scanlines と Mask を on にし、Esc で戻って保存する。
+# 次の起動でも設定ファイルから読む (読めない値なら bad value と出る)
+run 200 menu,end,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,esc,end,up,up,enter,esc
+want 'menu: settings saved to images/pix68k.cfg'
+grep -q '^video_scale=full$' images/pix68k.cfg || { echo "NG: video_scale=full not written"; cat images/pix68k.cfg; exit 1; }
+grep -q '^video_filter=scanline,mask$' images/pix68k.cfg || { echo "NG: video_filter not written"; cat images/pix68k.cfg; exit 1; }
+"$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --no-sram --no-wait --frames 3 > out.txt 2>&1 || { cat out.txt; echo "NG: fourth run"; exit 1; }
+grep -qF 'bad value' out.txt && { cat out.txt; echo "NG: video settings not read"; exit 1; }
+
+# crt= (公開版に出ていない) は読み替えずに知らせて無視する。v0.1.0 の scale= と scanline= は、v0.1.0 のホスト版と同じく
+# 読まない (知らせない)。どちらも保存で書き直さない (ベアメタル版と共用の pix68k.cfg を変えない)
+printf 'clock=10\ncrt = geom  # 前の書き方\nscanline=on\n' > images/pix68k.cfg
+run 200 menu,end,up,up,enter,esc
+want 'crt=geom is no longer supported; use video_filter= and video_scale= (ignored)'
+grep -qF 'scanline=on' out.txt && { cat out.txt; echo "NG: scanline= warned on the host"; exit 1; }
+want 'menu: settings saved to images/pix68k.cfg'
+printf 'clock=10\ncrt = geom  # 前の書き方\nscanline=on\n' > want.cfg
+cmp -s want.cfg images/pix68k.cfg || { echo "NG: legacy lines rewritten on the host"; cat images/pix68k.cfg; exit 1; }
 echo OK

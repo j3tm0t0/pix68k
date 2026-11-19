@@ -11,6 +11,7 @@
 //              GET  /log                 起動からのログ (最新 64KB。UART と同じ内容)
 //              GET  /screen.ppm          いま出している X68000 の画面 (PPM)
 //              POST /reboot              ディスクと SRAM を書き戻してから再起動する
+//              POST /reboot?profile=名前  起動の組み合わせ pix68k-<名前>.cfg で再起動する (空なら pix68k.cfg だけ)
 //              POST /type                本体の文字列を X68000 のキーとして打つ (\n などのエスケープを使える)
 //              POST /key?down=XX&mod=YY  USB のキー XX (16 進の usage) を押したままにする。mod は修飾キーのビット
 //              POST /key?up=XX / /key?up キー XX を離す / すべて離す
@@ -37,6 +38,7 @@
 #include <circle/string.h>
 #include <circle/types.h>
 
+#include "platform/boot_profile.h"
 #include "platform/net_files.h"
 #include "platform/serial_ring.h"
 #include "platform/settings.h"
@@ -86,6 +88,9 @@ public:
     virtual void netIdleUntil(u64 deadline) = 0;            // 時刻 deadline (CTimer::GetClockTicks64()) まで眠る
     virtual bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) = 0;
     virtual void netRequestReboot() = 0;                    // 少し後に再起動する (応答を送り終えるため)
+    // 次の再起動で使う起動の組み合わせ (POST /reboot?profile=。空なら pix68k.cfg だけ)。名前とファイルを確かめ、
+    // profile.sel に書く。nullptr なら前に頼まれたものを取り消す
+    virtual platform::ProfileRequest netBootProfile(const char* name) = 0;
     virtual bool netKeyReport(u8 modifiers, const u8 keys[6]) = 0; // USB キーボードのレポートと同じ経路で送る
     virtual unsigned netLog(char* out) = 0;                 // CLogRing::Snapshot()
     virtual unsigned netLogRead(u64& pos, char* out, unsigned max, u64& lost) = 0; // CLogRing::ReadFrom()
@@ -113,6 +118,9 @@ public:
     bool Start();
     // コア 0 の主ループから呼ぶ。ネットワークのタスクを動かす (waitUs の間、Yield() を繰り返す。0 なら 1 回)
     void Service(unsigned waitUs);
+    // いまの IP アドレス (192.168.1.27 なら 0xc0a8011b)。リンクが切れているか、DHCP の答えを待っているときは 0
+    // (画面の隅の数字に出す。コア 0 から呼ぶ。ネットワークのタスクと同じコアなので、読む間に書き換わらない)
+    u32 IPv4() const;
 
 private:
     void CheckRunning();

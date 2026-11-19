@@ -21,8 +21,16 @@ PC につながずに、ディスクの入れ替えや設定の変更ができ�
     - MIDI out (MIDI board が on のとき): MIDI の行き先 (`midi_out`、SoundFont / UART / none / MT-32 / SC-55)。次の起動から。その環境で使えないもの
       (Raspberry Pi 3 のビルドの SC-55、`--midi-dump` を付けていないホスト版の UART) は選べない。SoundFont や ROM のファイル名 (`midi_sf2` など)、
       Neptune-X の MAC アドレスと送受信の先はメニューでは変えられないので、pix68k.cfg に書く (ファイル名を書いていない行き先を選ぶと、要るキーを出す)
-  - Scale (ベアメタル版だけ): 画面の拡大とスキャンライン (`scale` と `scanline`。off / auto (integer) / auto + scanlines)。変えるとすぐに反映する (保存するには Save settings)
-  - OSD: 画面の右上の数字 (`osd`、off / on / fps)。メニューを開いている間は出さず、on か fps にしてメニューを閉じると 1〜2 秒で出る (数え直すため)。保存するには Save settings を選ぶ
+  - Display: Enter で画面の出し方のページに入る (Esc か Back で戻る)。主のページには「aspect + scanline,curve」のようにまとめて出す。
+    どの項目も変えるとすぐに反映する (保存するには Save settings)
+    - Scale: 画面の拡大の仕方 (`video_scale`、off / integer / aspect / full)
+    - Scanlines、Curve、Mask: ブラウン管のように見せる効果 (`video_filter` の `scanline`、`curve`、`mask`) の on / off。自由に組み合わせられる。
+      その機種で選べない組み合わせ (Raspberry Pi 3 の Curve など) は選ばない。Scale はその値を飛ばし、効果は変えずに
+      「not available on this machine」と出す (README の「画面の出し方」)
+    - Bezel: モニタの枠 (`video_filter` の `cz-600de` / `cz-600db`)。off、cz-600de (グレー)、cz-600db (黒) の順に替える。ベアメタル版だけに出す。
+      初めて選んだときに起動したドライブの `/pix68k/bezel-cz-600de.bin` などを読み、読めなければ選ばない。枠があるときは、主のページの Display は
+      「cz-600de + scanline,curve,mask」のように、拡大の代わりに枠の名前を出す (枠はガラスの部分に写し、Scale を使わない)
+  - OSD: 画面の右上の数字 (`osd`、off / on / fps)。ベアメタル版は余白が足りなければ on でも X68000 の画面に重ねる (ホスト版は fps のときだけ重ねる)。メニューを開いている間は出さず、on か fps にしてメニューを閉じると 1〜2 秒で出る (数え直すため)。保存するには Save settings を選ぶ
   - State slot、Save state、Load state: ステートの保存と読み込み (下を参照)
   - Reset: X68000 をリセットする (電源を入れ直したときと同じ)
   - Save settings: pix68k.cfg に書く。変えた項目の行だけを書き換え (なければ最後に足す)、ほかの行、注釈、知らないキー、改行の形 (CRLF) はそのまま残す。

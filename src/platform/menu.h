@@ -9,14 +9,18 @@
 // 操作: ↑↓ で項目を選ぶ、←→ で値を変える、Enter で決める、Esc (か BS) で戻る / 閉じる。
 // 値を変えただけでは保存しない。「Save settings」で pix68k.cfg に書く。電源を入れ直さないと反映されない項目
 // (SettingKey::restart) は、動いている値と違えば「*」を付け、「Restart」で反映する。
-// 拡張ボードは別のページにある (主のページの「Boards」で Enter。Esc か「Back」で戻る)。主のページの行を増やすと
+// 拡張ボードと画面の出し方は別のページにある (主のページの「Boards」「Display」で Enter。Esc か「Back」で戻る)。主のページの行を増やすと
 // 768x512 に入りきらず、下の状態の行が出なくなるため。FPU board、Mercury Unit、Neptune-X、MIDI board は on / off を
 // 切り替える。MIDI の行き先 (MIDI out) は、MIDI ボードをつないだときだけ出し、この環境で選べないもの (MenuHost::hasMidiOut()) は飛ばす。
 // 音源の ROM や SoundFont のファイル名はメニューでは変えない (pix68k.cfg に書く)。
 // ディスクの入れ替えと取り出し、リセット、ステートの保存と読み込みは、選んだときに MenuHost に頼む。
-// 画面の拡大 (Scale。ベアメタル版だけ) は、変えたときに MenuHost::scaleChanged() を呼び、すぐに反映する。
-// スキャンライン (scanline=) は Scale の行で「off」「auto (integer)」「auto + scanlines」の 3 つから選ぶ (off では scanline= を変えない。拡大しないときは
-// 暗くしないのと、主のページの行は 768x512 に入りきる数で増やせないため)。変えたときは MenuHost::scanlineChanged() も呼ぶ。
+// 画面の出し方は別のページにある (主のページの「Display」で Enter。値は「aspect + scanline,curve」のようにまとめて出す)。
+// Scale (video_scale=。off、integer、aspect、full) と、ブラウン管のように見せる効果 (video_filter=。platform/crt_effect.h) の
+// Scanlines、Curve、Mask (それぞれ on / off) を切り替える。この環境で選べない組み合わせ (MenuHost::videoAllowed()。
+// Pi 3 の curve と、full と mask の組) は選ばない (Scale は飛ばし、効果は変えずに状態の行で知らせる)。
+// モニタの枠 (Bezel。video_filter= の cz-600de / cz-600db。platform/bezel.h) は、off → cz-600de → cz-600db の順に替える
+// (MenuHost::hasBezel() が true のときだけ出す。選べない枠 (絵のファイルがないなど) は飛ばす)。
+// 変えたときは MenuHost::videoChanged() を呼び、すぐに反映する。
 // 画面の隅の数字 (OSD) も、変えたときに MenuHost::osdChanged() を呼び、すぐに反映する。
 //
 // 文字は platform/menu_font.h の 8x16 (ASCII)。描く先は XRGB8888 の画素の並び (draw())。
@@ -331,14 +335,30 @@ public:
     virtual bool restart(const Settings& s, MenuText& msg) = 0;
     // この環境の CPU (68030 / 68060 が使えるか)
     virtual bool has020() const { return x68k::Config::has020(); }
-    // 画面の拡大 (scale=) を選べるか (ベアメタル版だけ)
-    virtual bool hasScale() const { return false; }
-    // メニューで画面の拡大を変えた (すぐに反映する。同じキーの列でメニューが閉じても、閉じる前に呼ぶ)
-    virtual void scaleChanged(int scale) { (void)scale; }
-    // メニューで画面の隅の数字 (osd=) を変えた (すぐに反映する。呼ぶ時機は scaleChanged() と同じ)
+    // 画面の出し方 (video_scale=、video_filter=) をメニューで変えられるか
+    virtual bool hasVideo() const { return false; }
+    // モニタの枠 (video_filter= の cz-600de / cz-600db) をメニューで選べるか (ホスト版は使わない)
+    virtual bool hasBezel() const { return false; }
+    // 枠 filter (CRT_BEZEL_DE か CRT_BEZEL_DB を含む) の絵を使えるか (ベアメタル版は初めて聞かれたときに読む)。
+    // 聞くのは Bezel で枠を替えるときと、Display の行に枠の名前を出すかを決めるときだけ。ほかの項目 (Scale や効果) は
+    // 聞かない (設定に枠があって絵が読めなくても、枠なしで写しているので、変えられるようにする)
+    virtual bool bezelAvailable(int filter) const {
+        (void)filter;
+        return true;
+    }
+    // video_scale= の scale と video_filter= の filter の組み合わせを、この環境で選べるか
+    virtual bool videoAllowed(int scale, int filter) const {
+        (void)scale;
+        (void)filter;
+        return true;
+    }
+    // メニューで画面の出し方を変えた (すぐに反映する。同じキーの列でメニューが閉じても、閉じる前に呼ぶ)
+    virtual void videoChanged(int scale, int filter) {
+        (void)scale;
+        (void)filter;
+    }
+    // メニューで画面の隅の数字 (osd=) を変えた (すぐに反映する。呼ぶ時機は videoChanged() と同じ)
     virtual void osdChanged(int osd) { (void)osd; }
-    // メニューでスキャンライン (scanline=) を変えた (呼ぶ時機は scaleChanged() と同じ。ベアメタル版だけ)
-    virtual void scanlineChanged(int scanline) { (void)scanline; }
     // MIDI の行き先 (Settings::midiOut の値) をこの環境で選べるか (Pi 3 の sc55、ホスト版の uart は選べない)
     virtual bool hasMidiOut(int out) const {
         (void)out;
@@ -364,8 +384,8 @@ public:
         // フロッピーディスクはいま入っているものを出す (メニューの外で替わることはない)
         for (int d = 0; d < 2; d++) copyString(pending_.fd[d], Settings::PATH_SIZE, host_.diskName(d));
         // 画面の拡大もすぐに反映する項目なので、いまの値を出す
-        pending_.scale = running.scale;
-        pending_.scanline = running.scanline;
+        pending_.videoScale = running.videoScale;
+        pending_.videoFilter = running.videoFilter;
         pending_.osd = running.osd;
         open_ = true;
         page_ = MAIN;
@@ -389,9 +409,9 @@ public:
             fileKey(u);
             return open_;
         }
-        // 拡張ボードのページでは、Esc (か BS) は主のページに戻る
-        if (page_ == BOARDS && (u == menu_key::ESC || u == menu_key::BACKSPACE)) {
-            leaveBoards();
+        // 拡張ボードと画面の出し方のページでは、Esc (か BS) は主のページに戻る
+        if (page_ != MAIN && (u == menu_key::ESC || u == menu_key::BACKSPACE)) {
+            leavePage();
             return open_;
         }
         const int n = itemCount();
@@ -525,13 +545,15 @@ public:
     int stateSlot() const { return slot_; }
 
 private:
-    enum Page { MAIN, FILES, BOARDS };
+    enum Page { MAIN, FILES, BOARDS, DISPLAY };
     enum Item {
         I_FD0, I_FD1, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
-        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_SCALE, I_OSD,
+        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_OSD,
         I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_RESTART, I_CLOSE,
         // ここから拡張ボードのページの項目
-        I_FPU_BOARD, I_MERCURY, I_NEPTUNE, I_MIDI, I_MIDI_OUT, I_BACK, I_COUNT
+        I_FPU_BOARD, I_MERCURY, I_NEPTUNE, I_MIDI, I_MIDI_OUT, I_BACK,
+        // ここから画面の出し方のページの項目
+        I_SCALE, I_SCANLINE, I_CURVE, I_MASK, I_BEZEL, I_DISPLAY_BACK, I_COUNT
     };
     static constexpr int MAX_ROWS = 40;
     static constexpr int FOOTER = 2; // どのページも、最後の 2 行は「*」の説明 (か空行) と状態の行
@@ -539,7 +561,7 @@ private:
     // 主のページの行の数 (見出し、空行、項目、「*」の説明、状態)。文字の倍率を決める (draw())
     int mainRows() const {
         int n = 4;
-        for (int i = 0; i < I_COUNT; i++) n += usable((Item)i) && !boardItem((Item)i) ? 1 : 0;
+        for (int i = 0; i < I_COUNT; i++) n += usable((Item)i) && pageOf((Item)i) == MAIN ? 1 : 0;
         return n;
     }
 
@@ -554,13 +576,21 @@ private:
         case I_HIGH_MEM: return pending_.cpu == 68030;
         case I_LOCAL_MEM: return pending_.cpu == 68060;
         case I_MIDI_OUT: return pending_.midi != 0;
-        case I_SCALE: return host_.hasScale();
+        case I_DISPLAY:
+        case I_SCALE:
+        case I_SCANLINE:
+        case I_CURVE:
+        case I_MASK: return host_.hasVideo();
+        case I_BEZEL: return host_.hasVideo() && host_.hasBezel();
         default: return true;
         }
     }
-    static bool boardItem(Item it) { return it >= I_FPU_BOARD && it <= I_BACK; }
+    // 項目を出すページ
+    static Page pageOf(Item it) {
+        return it >= I_SCALE ? DISPLAY : it >= I_FPU_BOARD ? BOARDS : MAIN;
+    }
     // いま開いているページに出す項目か
-    bool shown(Item it) const { return usable(it) && boardItem(it) == (page_ == BOARDS); }
+    bool shown(Item it) const { return usable(it) && pageOf(it) == page_; }
     int itemCount() const {
         int n = 0;
         for (int i = 0; i < I_COUNT; i++) n += shown((Item)i) ? 1 : 0;
@@ -571,14 +601,15 @@ private:
             if (!shown((Item)i)) continue;
             if (index-- == 0) return (Item)i;
         }
-        return page_ == BOARDS ? I_BACK : I_CLOSE;
+        return page_ == BOARDS ? I_BACK : page_ == DISPLAY ? I_DISPLAY_BACK : I_CLOSE;
     }
-    static const char* label(Item it) {
+    const char* label(Item it) const {
         static const char* const kLabels[I_COUNT] = {
             "FD0", "FD1", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
-            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Scale", "OSD",
+            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "OSD",
             "State slot", "Save state", "Load state", "Reset", "Save settings", "Restart", "Close",
             "FPU board", "Mercury Unit", "Neptune-X", "MIDI board", "MIDI out", "Back",
+            "Scale", "Scanlines", "Curve", "Mask", "Bezel", "Back",
         };
         return kLabels[it];
     }
@@ -606,7 +637,11 @@ private:
         case I_NEPTUNE: return "neptune";
         case I_MIDI: return "midi";
         case I_MIDI_OUT: return "midi_out";
-        case I_SCALE: return "scale";
+        case I_SCALE: return "video_scale";
+        case I_SCANLINE:
+        case I_CURVE:
+        case I_MASK:
+        case I_BEZEL: return "video_filter";
         case I_OSD: return "osd";
         default: return nullptr;
         }
@@ -707,11 +742,38 @@ private:
         case I_MIDI_OUT:
             t.add(midiOutName(pending_.midiOut));
             break;
-        case I_SCALE:
-            t.add(!pending_.scale ? "off" : pending_.scanline ? "auto + scanlines" : "auto (integer)");
+        case I_DISPLAY:
+            // 拡大と効果をまとめて出す (「integer」「aspect + scanline,curve」など)。枠があれば、拡大の代わりに枠の名前
+            // (枠はガラスの矩形に写し、video_scale= を使わない。「cz-600de + scanline,curve,mask」)
+            // 枠を使えないとき (ホスト版、絵が読めない) は、枠なしで写しているので、拡大と効果だけを出す
+            if (const char* bezel = videoBezelName(pending_.videoFilter);
+                bezel != nullptr && host_.hasBezel() && host_.bezelAvailable(pending_.videoFilter)) {
+                t.add(bezel);
+                if ((pending_.videoFilter & CRT_EFFECT_BITS) != 0)
+                    t.add(" + ").add(videoFilterName(pending_.videoFilter & CRT_EFFECT_BITS));
+            } else {
+                t.add(videoScaleName(pending_.videoScale));
+                const int effect = pending_.videoFilter & CRT_EFFECT_BITS;
+                if (effect != CRT_OFF) t.add(" + ").add(videoFilterName(effect));
+            }
             break;
+        case I_SCALE:
+            t.add(videoScaleName(pending_.videoScale));
+            break;
+        case I_SCANLINE:
+        case I_CURVE:
+        case I_MASK:
+            t.add((pending_.videoFilter & filterBit(it)) ? "on" : "off");
+            break;
+        case I_BEZEL: {
+            const char* b = videoBezelName(pending_.videoFilter);
+            t.add(b != nullptr ? b : "off");
+            break;
+        }
         case I_OSD:
-            t.add(pending_.osd == 0 ? "off" : pending_.osd == 1 ? "fps (overlay)" : "on (margin)");
+            // on: 余白に出す。ベアメタル版は余白が足りなければ X68000 の画面に重ねる (IP アドレスをいつも出すため)。
+            // ホスト版は重ねない。fps: どちらも重ねる (platform/osd.h の chooseOsd())
+            t.add(pending_.osd == 0 ? "off" : pending_.osd == 1 ? "fps" : "on");
             break;
         case I_SLOT:
             t.add((long)slot_);
@@ -729,7 +791,9 @@ private:
         char buf[COLS + 1];
         MenuText t(buf, sizeof buf);
         if (page_ != FILES) {
-            line(page_ == BOARDS ? "Expansion boards  (Esc: back)" : "pix68k menu  (X68000 is paused)");
+            line(page_ == BOARDS    ? "Expansion boards  (Esc: back)"
+                 : page_ == DISPLAY ? "Display  (Esc: back)"
+                                    : "pix68k menu  (X68000 is paused)");
             line("");
             const int count = itemCount();
             for (int i = 0; i < count; i++) {
@@ -749,7 +813,7 @@ private:
             // 項目のすぐ下に「*」の説明 (なければ空行)、その下に状態。主のページは 68000 のベアメタル版で 26 項目あり、
             // 768x512 に出せる 30 行 (draw() の fit) に入れるため、ここに空行をもう 1 つは置かない
             line(anyChanged() ? "* = applied after Restart" : "");
-            line(page_ == BOARDS && strcmp(status_.str(), HELP) == 0 ? HELP_BOARDS : status_.str());
+            line(page_ != MAIN && strcmp(status_.str(), HELP) == 0 ? HELP_BOARDS : status_.str());
         } else {
             t.clear();
             if (fileKind_ == MenuFileKind::FLOPPY) t.add(fileDrive_ ? "FD1: " : "FD0: ");
@@ -848,16 +912,51 @@ private:
             break;
         }
         case I_SCALE: {
-            // off → auto (integer) → auto + scanlines の順。戻るキーは逆の順。off にするときは scanline= は変えない
-            // (拡大しないので暗くしない。一周しても scanline=on が off に書き換わらないように)。
-            // pix68k.cfg に scale=off と scanline=on が書いてあれば off と出す
-            int i = !pending_.scale ? 0 : pending_.scanline ? 2 : 1;
-            i = (i + dir + 3) % 3;
-            const int scale = i != 0, scanline = i == 0 ? pending_.scanline : i == 2;
-            if (scale != pending_.scale) host_.scaleChanged(scale);
-            if (scanline != pending_.scanline) host_.scanlineChanged(scanline);
-            pending_.scale = scale;
-            pending_.scanline = scanline;
+            // off → integer → aspect → full の順 (戻るキーは逆)。この環境で選べない組み合わせは飛ばす
+            int v = pending_.videoScale;
+            for (int k = 0; k < VIDEO_SCALE_COUNT - 1; k++) {
+                v = (v + dir + VIDEO_SCALE_COUNT) % VIDEO_SCALE_COUNT;
+                if (host_.videoAllowed(v, pending_.videoFilter)) break;
+            }
+            if (v == pending_.videoScale || !host_.videoAllowed(v, pending_.videoFilter)) {
+                notAvailable();
+                break;
+            }
+            pending_.videoScale = v;
+            host_.videoChanged(pending_.videoScale, pending_.videoFilter);
+            break;
+        }
+        case I_SCANLINE:
+        case I_CURVE:
+        case I_MASK: {
+            const int f = pending_.videoFilter ^ filterBit(it);
+            if (!host_.videoAllowed(pending_.videoScale, f)) {
+                notAvailable();
+                break;
+            }
+            pending_.videoFilter = f;
+            host_.videoChanged(pending_.videoScale, pending_.videoFilter);
+            break;
+        }
+        case I_BEZEL: {
+            // off → cz-600de → cz-600db の順 (戻るキーは逆)。選べない枠 (組み合わせが選べない、絵が読めない) は飛ばす
+            static const int kBezels[3] = {0, CRT_BEZEL_DE, CRT_BEZEL_DB};
+            const int cur = videoBezel(pending_.videoFilter), effect = pending_.videoFilter & ~CRT_BEZEL_BITS;
+            auto usable = [&](int f) {
+                return host_.videoAllowed(pending_.videoScale, f) && ((f & CRT_BEZEL_BITS) == 0 || host_.bezelAvailable(f));
+            };
+            int i = cur, f = pending_.videoFilter;
+            for (int k = 0; k < 2; k++) {
+                i = (i + dir + 3) % 3;
+                f = effect | kBezels[i];
+                if (usable(f)) break;
+            }
+            if (i == cur || !usable(f)) {
+                notAvailable();
+                break;
+            }
+            pending_.videoFilter = f;
+            host_.videoChanged(pending_.videoScale, pending_.videoFilter);
             break;
         }
         case I_OSD:
@@ -872,6 +971,13 @@ private:
         default:
             break;
         }
+    }
+    // Scanlines、Curve、Mask の項目が切り替える効果のビット
+    static int filterBit(Item it) { return it == I_SCANLINE ? CRT_SCANLINE : it == I_CURVE ? CRT_CURVE : CRT_MASK; }
+    // 画面の出し方で、選べない組み合わせを選ぼうとした
+    void notAvailable() {
+        status_.clear();
+        status_.add("not available on this machine");
     }
     // MIDI の行き先の名前 (Settings::midiOut の値)
     static const char* midiOutName(int out) {
@@ -891,12 +997,12 @@ private:
         if (hint) status_.add(hint);
         midiHint_ = hint;
     }
-    void enterBoards() {
+    void enterPage(Page page) {
         mainCursor_ = cursor_;
-        page_ = BOARDS;
+        page_ = page;
         cursor_ = 0;
     }
-    void leaveBoards() {
+    void leavePage() {
         page_ = MAIN;
         cursor_ = mainCursor_;
     }
@@ -904,7 +1010,7 @@ private:
 
     void activate(Item it) {
         // ページを移るだけなら状態の行は残す (拡張ボードのページで出した案内を、戻ったあとも読めるように)
-        if (it != I_BOARDS && it != I_BACK) status_.clear();
+        if (it != I_BOARDS && it != I_BACK && it != I_DISPLAY && it != I_DISPLAY_BACK) status_.clear();
         // ファイルの一覧を開くのは操作に数えない (FD の取り出しは一覧の中で選ぶ)。値を変える項目は change() が呼ぶ
         if (it == I_SAVE_STATE || it == I_LOAD_STATE || it == I_RESET || it == I_SAVE_SETTINGS || it == I_CLOSE)
             host_.beginAction(MENU_ACTION_OTHER);
@@ -931,10 +1037,14 @@ private:
             openFiles(MenuFileKind::SCSI_DISK, it - I_SC0);
             break;
         case I_BOARDS:
-            enterBoards();
+            enterPage(BOARDS);
+            break;
+        case I_DISPLAY:
+            enterPage(DISPLAY);
             break;
         case I_BACK:
-            leaveBoards();
+        case I_DISPLAY_BACK:
+            leavePage();
             break;
         case I_SAVE_STATE:
             if (host_.saveState(slot_, status_) && status_.str()[0] == 0) status_.add("state saved");
@@ -1074,7 +1184,7 @@ private:
     bool restartPending_ = false;
     Page page_ = MAIN;
     int cursor_ = 0;
-    int mainCursor_ = 0;               // 拡張ボードのページに入る前のカーソル
+    int mainCursor_ = 0;               // 拡張ボードか画面の出し方のページに入る前のカーソル
     const char* midiHint_ = nullptr;   // 状態の行に出した midiHint() の案内 (出していなければ nullptr)
     int slot_ = 0;
     Settings running_, pending_;

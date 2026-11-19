@@ -733,7 +733,7 @@ void loadStoppedCpu(int cpu) {
     CHECK_EQ(scene::jumpTo(*b.m, scene::kCpuLoop, sizeof scene::kCpuLoop / 2), true);
     b.frames(1);
     b.m->run(1000);
-    CHECK_EQ(b.m->cpu020()->attn_, 0); // 検査を省いている
+    CHECK_EQ(b.m->cpu020()->attn_ & m68k::Cpu020::ATTN_CHECK, 0); // 検査を省いている
     const char* err = nullptr;
     CHECK_EQ(x68k::loadState(*b.m, saved.data, saved.size, err), true);
     b.frames(2);

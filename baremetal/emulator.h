@@ -259,6 +259,12 @@ public:
         machine_->setMidiOut(out, true);
     }
     unsigned audioUnderruns() const { return audioProxy_.underruns(); }
+    // 音のリングバッファに今たまっているフレーム数と、たまり具合の最小値の目標 (ログ用。x68k::Sound::latencyGoal())
+    unsigned audioFill() const { return audioProxy_.fill(); }
+    unsigned audioGoal() const {
+        const unsigned go = __atomic_load_n(&soundCoreGo_, __ATOMIC_ACQUIRE);
+        return go == 1 ? synth_->latencyGoal() : go == 2 ? machine_->sound().latencyGoal() : 0;
+    }
     // 合成したフレームの数と、そのうちコア 0 が取る前に次のフレームで置き換わった (画面に出なかった) 数
     void frameCounts(uint32_t& published, uint32_t& dropped) const {
         published = handoff_.published();
@@ -328,6 +334,7 @@ private:
         explicit AudioProxy(Emulator& owner) : owner_(owner) {}
         void readAudio(int16_t* out, int frames) override;
         unsigned underruns() const;
+        unsigned fill() const;
 
     private:
         x68k::AudioRing* ring() const;

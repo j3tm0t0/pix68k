@@ -11,7 +11,7 @@ X68K_OBJS = x68k_machine.o x68k_mfp.o x68k_rtc.o x68k_video.o x68k_devices.o x68
 	x68k_fpu_board.o x68k_mercury.o x68k_neptune.o x68k_ym3802.o
 
 # FPU の計算の部分 (FpuCore) は、68000 の機種の数値演算プロセッサボード (x68k/fpu_board.h) も使うので、常に入れる
-OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o net_bridge.o host_net.o pi5_fan.o m68k.o m68k_fpu_core.o m68k_fpu_math.o $(X68K_OBJS) \
+OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o net_bridge.o host_net.o pi5_fan.o m68k.o m68k_fpu_core.o m68k_fpu_math.o $(X68K_OBJS) \
 	platform_sf2_synth.o platform_mt32_synth.o munt_libc.o $(MUNT_OBJS) platform_sc55_synth.o $(NUKED_OBJS)
 
 # MT-32 の音源 Munt (external/munt、LGPL 2.1 以降)。ソースは変えずに、C++ の標準ライブラリと libm のかわりに
@@ -63,6 +63,13 @@ endif
 OPTIMIZE = -O3
 
 include $(CIRCLEHOME)/Rules.mk
+
+# アプリの部分はフレームポインタを持たない (#224。ホスト版の Release と同じ)。Circle の Rules.mk は、KASAN のとき
+# だけ -fno-omit-frame-pointer を付け、ふだんは何も付けないので、aarch64 の GCC の既定で、関数を呼ぶ関数ごとに x29 を
+# 設定している。Circle のライブラリは変えない (この Makefile がビルドするものだけ)。例外のときに Circle が出す
+# スタックの表示 (lib/debug.cpp の DebugStackTrace()) は、スタックの中のコードのアドレスらしい値を並べるもので、
+# x29 をたどらないので変わらない
+CFLAGS += -fomit-frame-pointer
 
 # Circle の Rules.mk は -ffreestanding を付けるので、memcpy / memset などが、大きさが定数の 4 バイトや 8 バイトの
 # ものも Circle の関数の呼び出しになる。builtin_mem.h をすべてのソースに読ませて、大きさが定数の小さいものを
@@ -154,8 +161,8 @@ platform_sc55_synth.o: $(PIX68K_SRC)/platform/sc55_synth.cpp $(PIX68K_SRC)/platf
 	@$(CPP) $(CPPFLAGS) $(NUKED_INCLUDE) -fcheck-new -c -o $@ $<
 
 kernel.o: $(wildcard $(PIX68K_SRC)/bench/*.h $(PIX68K_SRC)/m68k/*.h)
-kernel.o emulator.o machine_run.o machine_menu.o host_net.o pi5_fan.o: $(X68K_DEPS) $(wildcard $(PIX68K_SRC)/platform/*.h) emulator.h kernel.h sound_out.h host_net.h pi5_fan.h
+kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o host_net.o pi5_fan.o: $(X68K_DEPS) $(wildcard $(PIX68K_SRC)/platform/*.h) emulator.h kernel.h sound_out.h host_net.h pi5_fan.h
 # Machine など (pi5_fan.o は CGPIOClock と CGPIOPin) を new するので、確保の失敗を nullptr で受け取れるようにする
-kernel.o emulator.o machine_run.o machine_menu.o pi5_fan.o: CPPFLAGS += -fcheck-new
+kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o pi5_fan.o: CPPFLAGS += -fcheck-new
 
 -include $(DEPS)

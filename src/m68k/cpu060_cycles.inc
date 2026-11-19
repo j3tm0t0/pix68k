@@ -35,7 +35,7 @@ namespace m68k {
 
 namespace {
 
-// cyc060_ の 1 個: 下位 10 ビットがサイクル数、上位が下のフラグ
+// cyc060() の 1 個 (ops060_ の meta の下位 16 ビット): 下位 10 ビットがサイクル数、上位が下のフラグ
 enum : uint16_t {
     T_CYC = 0x03ff,
     T_PAIR = 0x0400, // sOEP に入れる (pOEP|sOEP の分類で、sOEP で使えないモードでない)
@@ -46,8 +46,8 @@ enum : uint16_t {
     // サイクル数は命令の中で足す) execOne() が状態を進める
     T_BRANCH = 0x2000,
 };
-// use060_ の 1 個: 命令が使うレジスタ。ビット 0-15 は演算に使うレジスタ (D0-D7、A0-A7)、16-23 はアドレスの計算に使う An。
-// wr060_ の 1 個: 命令が書くレジスタを、同じ並びにしたもの。前の命令の wr060_ と後の命令の use060_ に同じビットがあれば、
+// use060() の 1 個: 命令が使うレジスタ。ビット 0-15 は演算に使うレジスタ (D0-D7、A0-A7)、16-23 はアドレスの計算に使う An。
+// wr060() の 1 個: 命令が書くレジスタを、同じ並びにしたもの。前の命令の wr060() と後の命令の use060() に同じビットがあれば、
 // 2 つは同時に進まない (10.1.5、10.1.6)。結果を書くレジスタは、演算に使う側とアドレスに使う側の両方に立てる。
 // MOVE.L <ea>,Rx の Rx は、演算に使う側には立てない (10.1.6 の例外 1)。(An)+ / -(An) で動かす An も両方に立てる
 
@@ -55,8 +55,8 @@ struct Timing060 {
     int c = 0;   // サイクル数
     int cls = 0; // 0 pOEP-only、1 pOEP|sOEP、2 pOEP-until-last、3 pOEP-but-allows-sOEP
     bool mem = false, pcrel = false, branch = false;
-    uint32_t iee = 0, agu = 0; // 使うレジスタ (use060_)
-    uint32_t wr = 0;           // 書くレジスタ (wr060_)
+    uint32_t iee = 0, agu = 0; // 使うレジスタ (use060())
+    uint32_t wr = 0;           // 書くレジスタ (wr060())
 
     // 結果を書くレジスタ (0-7 は Dn、8-15 は An)。fwd は MOVE.L <ea>,Rx
     void dest(int r, bool fwd = false) {
@@ -416,9 +416,8 @@ void Cpu020::buildCycles060() {
             if (t.mem) v |= T_MEM;
         }
         if (t.branch) v |= T_BRANCH;
-        cyc060_[i] = v;
-        use060_[i] = (t.iee & 0xffff) | ((t.agu & 0xff) << 16);
-        wr060_[i] = t.wr;
+        const uint32_t use = (t.iee & 0xffff) | ((t.agu & 0xff) << 16);
+        ops060_[i].meta = (uint64_t)v | ((uint64_t)(t.wr & 0xffffffu) << 16) | ((uint64_t)use << 40);
     }
 }
 
@@ -427,7 +426,7 @@ void Cpu020::buildCycles060() {
 // CACR に CABC を書くと全部、CUBC を書くとユーザモードで入れたものを消す (opMovec)。CINV / CPUSH が命令キャッシュを
 // 無効にするときに一緒に消えること (5.11) は入れていない。
 // 戻り値: 0 予測なし、1 予測が当たった、2 予測が外れた。CACR の EBC が 0 なら、いつも予測なし
-int Cpu020::predict060(bool taken) {
+CPU020_INLINE int Cpu020::predict060(bool taken) {
     if (!(cacr_ & 0x00800000u)) return 0;
     const unsigned i = (pc0_ >> 1) & (BCACHE060 - 1);
     uint8_t& e = bcacheState060_[i];
@@ -446,8 +445,23 @@ int Cpu020::predict060(bool taken) {
     return pred == taken ? 1 : 2;
 }
 
+// 予測が当たって分岐する Bcc / BRA / JMP の 0 サイクル (表 10-17、10-18) は、分岐がほかの命令と同じサイクルに
+// 折りたたまれる場合の値 (10.1.2: 「instruction folding techniques allow one or two instructions to be
+// simultaneously executed with a predicted taken Bcc (also for BRA and JMP instructions)」)。1 サイクルに進むのは
+// 1 つか 2 つの命令と、それに折りたたまれる分岐 1 つまでなので、折りたたむ相手になる分岐でない命令が、前の分岐の
+// あとに実行されていないとき (foldOk060_ が false) は、1 サイクルかかるものとする。命令の取り出しの側でも、分岐
+// キャッシュは取り出すアドレスごとに引くので (5.11)、1 サイクルに向きを変えられるのは 1 回。
+// どの分岐の命令 (Bcc / BRA / BSR / DBcc / JMP / JSR) もここを通って foldOk060_ を false にするので、分岐だけが
+// 続く間は、どの組み合わせでも 0 サイクルの分岐が出ない。
+// 戻り値は、この分岐を折りたたむときのサイクル数 (0 か 1)
+CPU020_INLINE int Cpu020::fold060() {
+    const int c = foldOk060_ ? 0 : 1;
+    foldOk060_ = false;
+    return c;
+}
+
 // Bcc (表 10-17)。予測が当たって分岐しない Bcc は、前の 1 サイクルの命令と同時に進む (10.1.2)
-void Cpu020::bcc060(bool taken, bool backward) {
+CPU020_INLINE void Cpu020::bcc060(bool taken, bool backward) {
     const int r = predict060(taken);
     const int fold = fold060();
     if (r == 1 && taken) {
@@ -480,21 +494,6 @@ void Cpu020::jump060(int predicted) {
     const bool hit = predict060(true) == 1;
     const int fold = fold060();
     tick060(!hit ? 3 : predicted ? predicted : fold);
-}
-
-// 予測が当たって分岐する Bcc / BRA / JMP の 0 サイクル (表 10-17、10-18) は、分岐がほかの命令と同じサイクルに
-// 折りたたまれる場合の値 (10.1.2: 「instruction folding techniques allow one or two instructions to be
-// simultaneously executed with a predicted taken Bcc (also for BRA and JMP instructions)」)。1 サイクルに進むのは
-// 1 つか 2 つの命令と、それに折りたたまれる分岐 1 つまでなので、折りたたむ相手になる分岐でない命令が、前の分岐の
-// あとに実行されていないとき (foldOk060_ が false) は、1 サイクルかかるものとする。命令の取り出しの側でも、分岐
-// キャッシュは取り出すアドレスごとに引くので (5.11)、1 サイクルに向きを変えられるのは 1 回。
-// どの分岐の命令 (Bcc / BRA / BSR / DBcc / JMP / JSR) もここを通って foldOk060_ を false にするので、分岐だけが
-// 続く間は、どの組み合わせでも 0 サイクルの分岐が出ない。
-// 戻り値は、この分岐を折りたたむときのサイクル数 (0 か 1)
-int Cpu020::fold060() {
-    const int c = foldOk060_ ? 0 : 1;
-    foldOk060_ = false;
-    return c;
 }
 
 // DBcc (表 10-17)。dbra は条件が F (DBRA の列)

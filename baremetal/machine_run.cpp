@@ -26,6 +26,8 @@
 //                                           100 で命令のサイクル数が MC68060UM の表どおり。小さくすると実機より
 //                                           遅くなり、ホストの負荷が下がる
 //                         max_speed_limit=0 060turbo で、max_speed=on が上げる速さの上限 (同じ単位。0 は上限なし)
+//                         bus_sync_sprite=off  on なら X68030 と 060turbo で、スプライト ($EB0000-$EBFFFF) の読み書きも I/O と同じ
+//                                           1.6 マイクロ秒ごとの区切りにそろえる (測っていない仮定の値。x68k/machine.h の setBusSync())
 //                         render_core=on    画面の合成をコア 2 で行う (既定)。off ならコア 1 が X68000 と合成の両方をする
 //                         sound_core=on     音 (OPM と ADPCM) の合成をコア 3 で行う (既定)。off ならコア 1 が行う
 //                         hat=auto          ゲームパッドのハットの値の範囲: auto (レポート記述子か値から決める、既定)、
@@ -84,6 +86,11 @@
 //                                           イメージは、書いた内容を残せないので書き込み禁止にする)
 //                         write_protect=    書き込み禁止にするディスク (「fd1,sc0」のように fd0 fd1 hd0 sc0〜sc6 を並べる)。
 //                                           ファイルの読み取り専用の属性と、D88 のヘッダの書き込み禁止でも書き込み禁止になる
+//                         autotype=         X68000 を動かし始めて autotype_wait= 秒 (既定 10) たったら打つ文字列
+//                                           (POST /type と同じエスケープ。boot_menu.cpp)
+//                         profile_wait=5    起動の組み合わせのメニューで待つ秒数 (0 ならメニューを出さない)
+//   /pix68k/pix68k-<名前>.cfg  起動の組み合わせ。1 つでもあれば起動時にメニューで選ぶ (boot_menu.cpp、platform/boot_profile.h)
+//   /pix68k/profile.sel 前回選んだ起動の組み合わせの名前
 //   /pix68k/hd0.hdf     hd0= がないときの SASI ID 0 のイメージ。kMaxHardDiskBytes まで
 //   /pix68k/SRAM.DAT    SRAM (16KB)。起動時に読み、書き換えられたら書き戻す (5 秒に 1 回まで)。
 //   /pix68k/SRAM.BAK    電源が切れても前の内容が残るよう、SRAM.DAT と交互に書く (x68k/sram_file.h)
@@ -104,6 +111,8 @@
 //   pix68k_stream_min=N 試験用。N MB より大きいハードディスクのイメージは、使うチャンクだけを読む (既定 kStreamMinMB)
 //   pix68k_gpu_scale=N  フレームバッファを表示の 1/N (AxB なら横 1/A、縦 1/B) にし、表示への拡大を GPU に任せる (kernel.cpp の
 //                       InitScreen())。既定は使わない
+//   pix68k_crt_all=1    試験用。Pi 3 でも video_scale= と video_filter= のどの組み合わせも選べるようにする (時間を測るため。
+//                       CKernel::VideoAllowed())
 //   pix68k_fb_rows=0    試験用。変わっていない行も毎回フレームバッファに写す (platform/frame_scale.h の FrameRowCache)
 //   pix68k_wfe=0        試験用。待つ間 (コア 0 の主ループ、コア 1 が次のフレームの時刻を待つ間) を wfe で眠らせず、空回りで待つ
 //                       (event_wait.h。温度や速さを比べるため)
@@ -137,10 +146,10 @@ namespace {
 const unsigned kSramSaveInterval = 5;   // SRAM を書き戻す間隔の下限 (秒)
 const unsigned kSpeedReportInterval = 10; // 速さをログに出す間隔 (秒)
 const unsigned kMaxSpeedReportInterval = 2; // 最高速モードの CPU の速さをログに出す間隔 (秒)
-// 画面の隅の数字の絵 (platform::renderOsd())。396KB あるので、CKernel の中 (main() のスタックに置かれる。
+// 画面の隅の数字の絵 (platform::renderOsd())。68KB あるので、CKernel の中 (main() のスタックに置かれる。
 // スタックは 128KB) には置かない。書くのは、写す役を持っているコアだけ (CKernel::ShowFrame())
 alignas(16) u32 s_OsdImage[platform::OSD_IMAGE_PIXELS];
-// 画面の左上のメッセージ (POST /message。platform/osd_message.h) に使うメモリ (330KB ほど)。初めて POST /message が来たときに
+// 画面の左上のメッセージ (POST /message。platform/osd_message.h) に使うメモリ (85KB ほど)。初めて POST /message が来たときに
 // コア 0 がヒープに確保し、s_pMsg に置く (.bss に置くと、aarch64-linux-gnu-gcc のビルドでカーネルの大きさの上限を超えるため。
 // 使わなければ確保しない)。一度確保したら放さない。
 // box はコア 0 が書き、写す役のコアが読む (seqlock)。shown (写した字形) と image (絵) は写す役のコアだけ、
@@ -279,6 +288,19 @@ struct CFatOps {
     }
     platform::FsResult remove(const char* path) { return conv(f_unlink(path)); }
     platform::FsResult rename(const char* from, const char* to) { return conv(f_rename(from, to)); }
+    // 頭から cap バイトまで読む (platform::readProfileChoice())
+    platform::FsResult read(const char* path, char* buf, unsigned cap, unsigned& n) {
+        n = 0;
+        FIL f;
+        const platform::FsResult o = conv(f_open(&f, path, FA_READ));
+        if (o != platform::FsResult::OK) return o;
+        UINT got = 0;
+        const FRESULT r = f_read(&f, buf, cap, &got);
+        f_close(&f);
+        if (r != FR_OK) return conv(r);
+        n = got;
+        return platform::FsResult::OK;
+    }
     // 途中で止まった置き換えを戻す名前の変更の前に、platform::replaceFile() が聞く。boot ドライブが USB メモリのときは、
     // ディレクトリが伸びても空きが残るときだけ (CKernel::CanRenameFile())
     bool canRename(const char*, const char* to) { return CKernel::CanRenameFile(to); }
@@ -451,6 +473,41 @@ FRESULT CKernel::WriteFileReplacing(const char* path, const char* tmp, const voi
     return fs.last != FR_OK ? fs.last : FR_DENIED;
 }
 
+// POST /reboot?profile= の要求を profile.sel に once 付きで書く / 取り消す (platform::ProfileChoiceStore)
+bool CKernel::RequestProfileChoice(const char* name) {
+    CFatOps fs;
+    CString path, tmp;
+    path.Format("%s/pix68k/%s", m_BootDrive, platform::PROFILE_CHOICE_FILE);
+    tmp.Format("%s/pix68k/%s", m_BootDrive, platform::PROFILE_CHOICE_TMP);
+    if (m_ProfileChoice.request(fs, path, tmp, name)) return true;
+    m_Logger.Write(FromMachine, LogWarning, "%s: write failed (FRESULT %d)%s", (const char*)path, (int)fs.last,
+                   m_ProfileChoice.pending() ? "; the request may be used at the next boot" : "");
+    return false;
+}
+
+// 再起動 (Ctrl + Alt + Delete、設定メニューの Restart) の前に取り消す。取り消せなければログと画面の左上に出して false
+bool CKernel::CancelProfileChoiceForRestart(const char* who) {
+    if (CancelProfileChoice()) return true;
+    m_Logger.Write(FromMachine, LogWarning,
+                   "%s: not restarting (the refused POST /reboot?profile= is still in %s and would be used)", who,
+                   platform::PROFILE_CHOICE_FILE);
+    static const char kMsg[] = "再起動中止";
+    netMessage(kMsg, sizeof kMsg - 1, 10);
+    return false;
+}
+
+bool CKernel::CancelProfileChoice() {
+    if (!m_ProfileChoice.pending() || m_BootDrive == nullptr) return true;
+    CFatOps fs;
+    CString path, tmp;
+    path.Format("%s/pix68k/%s", m_BootDrive, platform::PROFILE_CHOICE_FILE);
+    tmp.Format("%s/pix68k/%s", m_BootDrive, platform::PROFILE_CHOICE_TMP);
+    if (m_ProfileChoice.cancel(fs, path, tmp)) return true;
+    m_Logger.Write(FromMachine, LogWarning, "%s: cannot cancel the network request (FRESULT %d)", (const char*)path,
+                   (int)fs.last);
+    return false;
+}
+
 // WriteFileReplacing() で書いたファイルを読む。path がないときだけ tmp を読む (path があれば、空でも path)
 // (手順は platform/file_replace.h の readWithFallback())
 FRESULT CKernel::ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size, bool& usedTmp) {
@@ -483,48 +540,82 @@ u8* CKernel::ReadRom(const char* name, unsigned size) {
     return nullptr;
 }
 
-// /pix68k/pix68k.cfg を読む。項目の表は platform/settings.h。
-// 書き直しの途中で止まって pix68k.cfg がなく pix68k.new だけがあるとき (SaveConfig() を参照) は、pix68k.new を読む
-void CKernel::ReadConfig() {
+// /pix68k の name を読んで text に入れる。書き直しの途中で止まって name がなく tmpName だけがあるとき
+// (SaveConfig() を参照) は、tmpName を読む。path に読んだファイルを入れる。読めなければ text は空
+FRESULT CKernel::LoadConfigText(const char* name, const char* tmpName, platform::ConfigText& text, CString& path) {
     CString cfg, tmp;
-    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);
-    tmp.Format("%s/pix68k/pix68k.new", m_BootDrive);
+    cfg.Format("%s/pix68k/%s", m_BootDrive, name);
+    tmp.Format("%s/pix68k/%s", m_BootDrive, tmpName);
     u8* data = nullptr;
     unsigned size = 0;
     bool usedTmp = false;
     const FRESULT r = ReadWithFallback(cfg, tmp, data, size, usedTmp);
-    if (r != FR_OK) {
-        if (r != FR_NO_FILE && r != FR_NO_PATH)
-            m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d); using the defaults", (const char*)cfg,
-                           (int)r);
-        ApplySettings();
-        return;
-    }
-    const CString& path = usedTmp ? tmp : cfg;
-    m_Logger.Write(FromMachine, LogNotice, "%s", (const char*)path);
-    platform::ConfigText text;
-    text.load(data != nullptr ? (const char*)data : "", size);
+    path = usedTmp ? tmp : cfg;
+    const bool loaded = text.load(r == FR_OK && data != nullptr ? (const char*)data : "", r == FR_OK ? size : 0);
     delete[] data;
-    platform::readSettings(
-        text, m_Settings,
-        // トークンは /log (トークンなしで読める) に出さない (platform/setting_warning.h)
-        [this](const char* key, const char* value, platform::SettingResult r) {
-            char msg[384];
-            platform::formatSettingWarning(msg, sizeof msg, key, value, r);
-            m_Logger.Write(FromMachine, LogWarning, "pix68k.cfg: %s", msg);
-        },
-        [this](const char* line) {
-            char msg[384];
-            platform::formatIgnoredLine(msg, sizeof msg, line);
-            m_Logger.Write(FromMachine, LogWarning, "pix68k.cfg: %s", msg);
-        });
+    // メモリが足りずに中身を持てなければ、読めなかったことにする (空のまま書き直して、ほかの行を消さないように)
+    return r == FR_OK && !loaded ? FR_NOT_ENOUGH_CORE : r;
+}
+
+// /pix68k/pix68k.cfg を読む。項目の表は platform/settings.h。
+// 書き直しの途中で止まって pix68k.cfg がなく pix68k.new だけがあるとき (SaveConfig() を参照) は、pix68k.new を読む。
+// /pix68k に起動の組み合わせ (pix68k-<名前>.cfg) があれば、選ばせてから (ChooseProfile())、pix68k.cfg の共通の項目と
+// 組み合わせのファイルを重ねて読む (platform/boot_profile.h)
+void CKernel::ReadConfig() {
+    platform::ConfigText base;
+    CString path;
+    FRESULT r = LoadConfigText("pix68k.cfg", "pix68k.new", base, path);
+    if (r == FR_OK) {
+        m_Logger.Write(FromMachine, LogNotice, "%s", (const char*)path);
+    } else if (r != FR_NO_FILE && r != FR_NO_PATH) {
+        m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d); using the defaults", (const char*)path,
+                       (int)r);
+    }
+    // トークンは /log (トークンなしで読める) に出さない (platform/setting_warning.h)
+    const char* file = "pix68k.cfg";
+    auto warn = [this, &file](bool fromProfile, const char* key, const char* value, platform::SettingResult res) {
+        char msg[384];
+        platform::formatSettingWarning(msg, sizeof msg, key, value, res);
+        m_Logger.Write(FromMachine, LogWarning, "%s: %s", fromProfile ? file : "pix68k.cfg", msg);
+    };
+    auto bad = [this, &file](bool fromProfile, const char* line) {
+        char msg[384];
+        platform::formatIgnoredLine(msg, sizeof msg, line);
+        m_Logger.Write(FromMachine, LogWarning, "%s: %s", fromProfile ? file : "pix68k.cfg", msg);
+    };
+    platform::readProfileSettings(base, nullptr, m_Settings, true, warn, bad);
+    // メニューのキーボードとゲームパッドは pix68k.cfg の keyboard= と hat= で読む
+    ApplySettings();
+    const int keyboard = m_Settings.keyboard, hat = m_Settings.hat;
+    ChooseProfile();
+    const platform::ConfigText* fdText = &base;
+    platform::ConfigText prof;
+    char name[64];
+    if (m_Profile[0] != 0) {
+        char tmpName[64];
+        platform::profileFileName(m_Profile, name, sizeof name);
+        platform::profileFileName(m_Profile, tmpName, sizeof tmpName, true);
+        r = LoadConfigText(name, tmpName, prof, path);
+        if (r != FR_OK) {
+            m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d); using pix68k.cfg", (const char*)path,
+                           (int)r);
+            m_Profile[0] = 0;
+        } else {
+            m_Logger.Write(FromMachine, LogNotice, "profile %s: %s (shared settings from pix68k.cfg)", m_Profile,
+                           (const char*)path);
+            file = name;
+            platform::readProfileSettings(base, &prof, m_Settings, false, warn, bad);
+            fdText = &prof;
+        }
+    }
     // fd0= / fd1= を空で書いてあれば、ドライブを空にする (fd0.xdf などを探さない。メニューで取り出して保存したとき)
     for (int d = 0; d < 2; d++) {
         char v[platform::Settings::PATH_SIZE];
-        m_FdExplicit[d] = text.get(d == 0 ? "fd0" : "fd1", v, sizeof v) != 0;
+        m_FdExplicit[d] = fdText->get(d == 0 ? "fd0" : "fd1", v, sizeof v) != 0;
     }
     m_FileSettings = m_Settings;
     ApplySettings();
+    ReapplyInputSettings(keyboard, hat);
 }
 
 // 最高速モード (max_speed=on) の、今の CPU の速さ (既定のクロックの何 %) と、それをクロックに直した値をログに出す
@@ -544,7 +635,9 @@ void CKernel::ReportMaxSpeed() {
 // m_Settings を、X68000 の設定 (m_Config) と、それぞれの部分の変数に写す
 void CKernel::ApplySettings() {
     if (m_Settings.cpu != 68000 && !x68k::Config::has020()) {
-        m_Logger.Write(FromMachine, LogWarning, "pix68k.cfg: cpu=%d: this build has no 68030 / 68060; using 68000",
+        char file[64] = "pix68k.cfg";
+        if (m_Profile[0] != 0) platform::profileFileName(m_Profile, file, sizeof file);
+        m_Logger.Write(FromMachine, LogWarning, "%s: cpu=%d: this build has no 68030 / 68060; using 68000", file,
                        m_Settings.cpu);
         m_Settings.cpu = 68000;
     }
@@ -559,39 +652,72 @@ void CKernel::ApplySettings() {
                                                 : platform::KeyLayout::STANDARD;
 }
 
-// s のうち pix68k.cfg と違う項目を書く (行があれば値を書き換え、なければ足す。知らない行と注釈は残す)。
-// 書いている途中で電源が切れても前の設定が残るよう、pix68k.new に書いてから pix68k.cfg と置き換える
-// (FatFs の f_rename は上書きしないので、pix68k.cfg を消してから名前を変える。その間に切れたら、次の起動は
-// pix68k.new を読む)
-bool CKernel::SaveConfig(const platform::Settings& s) {
-    CString cfg, tmp;
-    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);
-    tmp.Format("%s/pix68k/pix68k.new", m_BootDrive);
-    u8* data = nullptr;
-    unsigned size = 0;
-    // ファイルがあるのに読めなければ書かない (空のファイルとして書くと、ほかの設定が消える)
-    bool usedTmp = false;
-    FRESULT r = ReadWithFallback(cfg, tmp, data, size, usedTmp);
+// 書き直す前に、/pix68k の name (なければ tmpName) を読む。ないファイルは空として読む。
+// ファイルがあるのに読めなければ false (空のファイルとして書くと、ほかの設定が消える)
+bool CKernel::LoadSavedConfigText(const char* name, const char* tmpName, platform::ConfigText& text) {
+    CString path;
+    const FRESULT r = LoadConfigText(name, tmpName, text, path);
     if (r != FR_OK && r != FR_NO_FILE && r != FR_NO_PATH) {
-        m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d); settings not saved", (const char*)cfg,
+        m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d); settings not saved", (const char*)path,
                        (int)r);
         return false;
     }
-    platform::ConfigText text;
-    const bool loaded = text.load(data != nullptr ? (const char*)data : "", size);
-    delete[] data;
-    if (!loaded || !platform::writeSettings(text, s, m_FileSettings)) {
-        m_Logger.Write(FromMachine, LogWarning, "pix68k.cfg: cannot write a value (out of memory, or # in a name)");
+    return true;
+}
+
+// s のうち pix68k.cfg と違う項目を書く (行があれば値を書き換え、なければ足す。知らない行と注釈は残す)。
+// 書いている途中で電源が切れても前の設定が残るよう、pix68k.new に書いてから pix68k.cfg と置き換える
+// (FatFs の f_rename は上書きしないので、pix68k.cfg を消してから名前を変える。その間に切れたら、次の起動は
+// pix68k.new を読む)。
+// 起動の組み合わせで動いているときは、共通の項目は pix68k.cfg に、そのほかは組み合わせのファイル (pix68k-<名前>.cfg、
+// 一時ファイルは pix68k-<名前>.new) に書く (platform/boot_profile.h の writeProfileSettings())
+bool CKernel::SaveConfig(const platform::Settings& s) {
+    char name[64] = "pix68k.cfg", tmpName[64] = "pix68k.new";
+    platform::ConfigText base, prof;
+    if (!LoadSavedConfigText("pix68k.cfg", "pix68k.new", base)) return false;
+    bool changedBase = true, changedProfile = false, ok;
+    if (m_Profile[0] != 0) {
+        platform::profileFileName(m_Profile, name, sizeof name);
+        platform::profileFileName(m_Profile, tmpName, sizeof tmpName, true);
+        if (!LoadSavedConfigText(name, tmpName, prof)) return false;
+        ok = platform::writeProfileSettings(base, prof, s, m_FileSettings, changedBase, changedProfile);
+        // 保存の途中で止まって .new だけが残っていれば、変えた項目がなくても書いて .cfg に戻す
+        CString cfgPath;
+        cfgPath.Format("%s/pix68k/%s", m_BootDrive, name);
+        FILINFO fi;
+        CString tmpPath;
+        tmpPath.Format("%s/pix68k/%s", m_BootDrive, tmpName);
+        if (f_stat(cfgPath, &fi) == FR_NO_FILE && f_stat(tmpPath, &fi) == FR_OK) changedProfile = true;
+    } else {
+        ok = platform::writeSettings(base, s, m_FileSettings);
+    }
+    if (!ok) {
+        m_Logger.Write(FromMachine, LogWarning, "%s: cannot write a value (out of memory, or # in a name)",
+                       m_Profile[0] != 0 ? name : "pix68k.cfg");
         return false;
     }
     MakeBootDir();
-    r = WriteFileReplacing(cfg, tmp, text.data(), (unsigned)text.size());
-    if (r != FR_OK) {
-        m_Logger.Write(FromMachine, LogWarning, "%s: write failed (FRESULT %d)", (const char*)cfg, (int)r);
-        return false;
+    // 組み合わせのファイルを先に書く (pix68k.cfg を書けなかったときに、組み合わせのほうだけが変わっているように)
+    struct {
+        bool write;
+        const char* name;
+        const char* tmp;
+        const platform::ConfigText* text;
+    } files[2] = {{changedProfile, name, tmpName, &prof}, {changedBase, "pix68k.cfg", "pix68k.new", &base}};
+    for (const auto& f : files) {
+        if (!f.write) continue;
+        CString cfg, tmp;
+        cfg.Format("%s/pix68k/%s", m_BootDrive, f.name);
+        tmp.Format("%s/pix68k/%s", m_BootDrive, f.tmp);
+        const FRESULT r = WriteFileReplacing(cfg, tmp, f.text->data(), (unsigned)f.text->size());
+        if (r != FR_OK) {
+            m_Logger.Write(FromMachine, LogWarning, "%s: write failed (FRESULT %d)", (const char*)cfg, (int)r);
+            return false;
+        }
+        m_Logger.Write(FromMachine, LogNotice, "settings saved to %s (%u bytes)", (const char*)cfg,
+                       (unsigned)f.text->size());
     }
     m_FileSettings = s;
-    m_Logger.Write(FromMachine, LogNotice, "settings saved to %s (%u bytes)", (const char*)cfg, (unsigned)text.size());
     return true;
 }
 
@@ -1360,9 +1486,13 @@ bool CKernel::StartMachine() {
     if (ipl == nullptr) {
         m_Logger.Write(FromMachine, LogWarning, "%s (128KB) not found in %s/pix68k/ or %s/; showing the test pattern",
                        iplName, m_BootDrive, m_BootDrive);
+        delete[] m_pBootCgrom; // メニューのために読んだ CGROM
+        m_pBootCgrom = nullptr;
         return false;
     }
-    u8* cg = ReadRom("CGROM.DAT", x68k::Machine::CG_SIZE);
+    // 起動の組み合わせのメニューで読んでいれば、それを使う (boot_menu.cpp)
+    u8* cg = m_pBootCgrom != nullptr ? m_pBootCgrom : ReadRom("CGROM.DAT", x68k::Machine::CG_SIZE);
+    m_pBootCgrom = nullptr;
     LogBootTime(BootRoms, "ROMs read");
     if (cg == nullptr) m_Logger.Write(FromMachine, LogWarning, "CGROM.DAT (768KB) not found; characters will be blank");
 
@@ -1455,6 +1585,7 @@ bool CKernel::StartMachine() {
     } else {
         m_Logger.Write(FromMachine, LogNotice, "screen: pix68k_fb_rows=0; copying every row to the framebuffer");
     }
+    StartCrt();
     if (m_TextDumpSeconds != 0) {
         if (!emu->canDumpText()) {
             m_Logger.Write(FromMachine, LogWarning, "pix68k_textdump needs CGROM.DAT; disabled");
@@ -1505,6 +1636,7 @@ TShutdownMode CKernel::RunMachine() {
     unsigned lastMask = 0;
     bool renderReported = false;
     LogBootTime(BootCore1, "core 1 started");
+    StartAutoType();
     // X68000 が動き出してから USB の装置を探す。探し終えるまで、コア 0 はこの下の主ループに入らないが、
     // その間は合成するコアが画面を写し、コア 0 は探している途中の待ち時間に大きなイメージのチャンクを読む
     // (WithComposerPresenting()、ServiceDuringUsbScan())
@@ -1556,6 +1688,7 @@ TShutdownMode CKernel::RunMachine() {
         ShowNextFrame();
         ExpireOsd();
         ServiceMessage();
+        ServiceAutoType();
         ServiceMenu();
         if (m_RebootRequested) {
             m_Logger.Write(FromMachine, LogNotice, "restarting (settings changed in the menu)");
@@ -1573,6 +1706,9 @@ TShutdownMode CKernel::RunMachine() {
                 m_Logger.Write(FromMachine, LogNotice, "restarting (requested over the network)");
                 return ShutdownReboot;
             }
+            // 断った: POST /reboot?profile= で once 付きで書いた profile.sel を前回の選択に戻す (ほかの再起動で
+            // 頼まれた組み合わせにならないように。60 秒以内に同じ要求を送り直せば、また書く)
+            if (m_ProfileChoice.pending()) WhileComposerPresents([this] { CancelProfileChoice(); });
         }
         if (!m_MenuActive) {
             if (m_Keys.pending()) ResendKeys();
@@ -1624,6 +1760,7 @@ TShutdownMode CKernel::RunMachine() {
                 if (const u8* sram = m_pEmulator->pendingSram()) SaveSram(sram);
                 if (PauseAndFlushDisks()) {
                     CloseDiskFiles();
+                    CancelProfileChoice(); // 断った POST /reboot?profile= が残っていれば戻す (戻せなくても時間で再起動する)
                     FinishDeploy();
                     return ShutdownReboot;
                 }
@@ -1937,8 +2074,36 @@ void CKernel::WaitComposerPresent(void* ctx) {
 void CKernel::LogShownScreen() {
     if (m_ScreenModeChanged) {
         m_ScreenModeChanged = false;
-        m_Logger.Write(FromMachine, LogNotice, "screen mode %dx%d, shown %dx%d (x%d, y%d)", m_ShownWidth, m_ShownHeight,
-                       m_ShownScale.dstW, m_ShownScale.dstH, m_ShownScale.kx, m_ShownScale.ky);
+        // kx と ky が 0 なら、整数倍でない枠 (video_scale=aspect、full。platform::videoFrameScale())
+        // 枠を写しているときは、枠の名前 (ガラスの矩形に写すので、video_scale= は使っていない)
+        const int bezelShown = __atomic_load_n(&m_BezelShown, __ATOMIC_RELAXED);
+        if (m_ShownScale.kx == 0 && bezelShown != 0)
+            m_Logger.Write(FromMachine, LogNotice, "screen mode %dx%d, shown %dx%d (bezel %s)", m_ShownWidth,
+                           m_ShownHeight, m_ShownScale.dstW, m_ShownScale.dstH,
+                           platform::videoBezelName(bezelShown == 1 ? platform::CRT_BEZEL_DE : platform::CRT_BEZEL_DB));
+        else if (m_ShownScale.kx == 0)
+            m_Logger.Write(FromMachine, LogNotice, "screen mode %dx%d, shown %dx%d (video_scale=%s)", m_ShownWidth,
+                           m_ShownHeight, m_ShownScale.dstW, m_ShownScale.dstH,
+                           platform::videoScaleName(__atomic_load_n(&m_Video, __ATOMIC_RELAXED) >> 16));
+        else
+            m_Logger.Write(FromMachine, LogNotice, "screen mode %dx%d, shown %dx%d (x%d, y%d)", m_ShownWidth,
+                           m_ShownHeight, m_ShownScale.dstW, m_ShownScale.dstH, m_ShownScale.kx, m_ShownScale.ky);
+    }
+    // 絵は読めたのに枠を出さないときは、理由が変わったときに出す (画面モードの変更とは別に見る。設定メニューで枠を
+    // 選んだときなど、写す範囲が変わらなくても理由は変わる)。画面モードを行き来するたびには出さない
+    {
+        const int skip = __atomic_load_n(&m_BezelSkip, __ATOMIC_ACQUIRE);
+        if (m_BezelSkipLog.update(skip)) {
+            const platform::BezelImage& b = m_Bezel[(skip >> 4 == 2 ? 2 : 1) - 1];
+            const char* name = platform::videoBezelName(skip >> 4 == 2 ? platform::CRT_BEZEL_DB : platform::CRT_BEZEL_DE);
+            if ((skip & 15) == 1)
+                m_Logger.Write(FromMachine, LogWarning, "bezel: %s is not shown with pix68k_gpu_scale; showing without the bezel",
+                               name);
+            else if ((skip & 15) == 2)
+                m_Logger.Write(FromMachine, LogWarning,
+                               "bezel: %s is not shown: screen mode %dx%d does not fit in the glass (%dx%d); showing without the bezel",
+                               name, m_ShownWidth, m_ShownHeight, b.h.gw, b.h.gh);
+        }
     }
     if (m_FrameLogged || __atomic_load_n(&m_BootTicks[BootFrame], __ATOMIC_ACQUIRE) == 0) return;
     m_FrameLogged = true;
@@ -1985,29 +2150,224 @@ void CKernel::ServiceDuringUsbScan(bool insideUsbTransfer) {
     }
 }
 
-// X68000 の画面をフレームバッファの真ん中に写す。scale=auto なら整数倍で拡大し、scale=off なら拡大しない
-// (platform/frame_scale.h。フレームバッファより大きければ真ん中を切り出す)。ふだんはコア 0 が呼び、
+// 画面の出し方 (video_scale=、video_filter=) を、この機種で選べるか。
+// Pi 3 (Zero 2 W、Pi 3A+ も同じ Cortex-A53) は、写すのは合成するコア (コア 2) で、1 フレーム (約 18ms) のうちに合成と
+// 写しの両方を終える必要がある。実機で測って (docs/baremetal.md の「画面の出し方」)、収まる組み合わせだけを選べる。
+// カーネルのオプション pix68k_crt_all=1 (試験用) ならどれも選べる (測るため)。表のメモリが取れなければ、表を使わない
+// 組み合わせ (1 倍か整数倍で、効果はスキャンラインだけ) にする
+bool CKernel::VideoAllowed(int scale, int filter) const {
+    // 枠 (cz-600de、cz-600db) はガラスの矩形に写すので、表を使う
+    const bool needsMap = platform::crtNeedsMap(filter) || scale == platform::VIDEO_SCALE_ASPECT ||
+                          scale == platform::VIDEO_SCALE_FULL || (filter & platform::CRT_BEZEL_BITS) != 0;
+    if (needsMap && m_CrtMap.sx == nullptr) return false;
+#if RASPPI <= 3
+    if (m_VideoAll) return true;
+    return platform::videoAllowedPi3(scale, filter);
+#else
+    return true;
+#endif
+}
+
+// 画面の出し方の用意。表のメモリを取り、pix68k.cfg の組み合わせがこの機種で選べなければ選べるものに替える
+// (ShowFrame() はログに書けず、合成するコアからも呼ばれるので、ここで済ませる)
+void CKernel::StartCrt() {
+#if RASPPI <= 3
+    m_VideoAll = m_Options.GetAppOptionDecimal("pix68k_crt_all", 0) != 0;
+#endif
+    int maxW = (int)m_Screen.GetWidth(), maxH = (int)m_Screen.GetHeight();
+    if (maxW > ScaleLinePixels - 4) maxW = ScaleLinePixels - 4;
+    u32* mem = maxW > 0 && maxH > 0 ? new u32[platform::crtMapBytes(maxW, maxH) / 4 + 1] : nullptr;
+    if (mem != nullptr)
+        platform::crtMapInit(m_CrtMap, mem, maxW, maxH);
+    else
+        m_Logger.Write(FromMachine, LogWarning, "screen: out of memory; video_scale=aspect and full, and video_filter=curve and mask are not available");
+    int scale = m_Settings.videoScale, filter = m_Settings.videoFilter;
+    if (!VideoAllowed(scale, filter)) {
+        // curve、mask の順に外し、それでも選べなければ整数倍にする (整数倍のスキャンラインは表を使わないので、いつも選べる)
+        const int was = scale, wasFilter = filter;
+        filter &= ~platform::CRT_CURVE;
+        if (!VideoAllowed(scale, filter)) filter &= ~platform::CRT_MASK;
+        // 表のメモリがないと、枠 (表で写す) も使えない
+        if (!VideoAllowed(scale, filter)) filter &= ~platform::CRT_BEZEL_BITS;
+        if (!VideoAllowed(scale, filter)) scale = platform::VIDEO_SCALE_INTEGER;
+        m_Logger.Write(FromMachine, LogWarning,
+                       "video_scale=%s video_filter=%s is not available on this Pi; using video_scale=%s video_filter=%s",
+                       platform::videoScaleName(was), platform::videoFilterName(wasFilter), platform::videoScaleName(scale),
+                       platform::videoFilterName(filter));
+        // 動いている設定も合わせる (設定メニューは、保存してある値を出す)
+        m_Settings.videoScale = scale;
+        m_Settings.videoFilter = filter;
+    }
+    m_Logger.Write(FromMachine, LogNotice, "screen: video_scale=%s video_filter=%s", platform::videoScaleName(scale),
+                   platform::videoFilterName(filter));
+    // 枠の絵を先に読む (読めなければログに理由を出し、枠なしで写す。設定は変えない)
+    if ((filter & platform::CRT_BEZEL_BITS) != 0) LoadBezel(filter);
+    __atomic_store_n(&m_Video, scale << 16 | filter, __ATOMIC_RELAXED);
+}
+
+// モニタの枠の絵 (video_filter= の cz-600de / cz-600db) を起動したドライブの /pix68k/ から読む (platform/bezel.h)。読めたもの、
+// 読めなかったものは覚えておき、2 回目からは読まない。読めなければ (ない、形が違う、フレームバッファと大きさが違う、
+// メモリがない) ログに理由を出して nullptr を返す (枠なしで写す)。コア 0 だけが呼ぶ
+const platform::BezelImage* CKernel::LoadBezel(int filter) {
+    const int id = platform::videoBezel(filter);
+    if (id == 0) return nullptr;
+    platform::BezelImage& b = m_Bezel[id - 1];
+    if (b.pixels != nullptr) return &b;
+    if (m_BezelTried[id - 1]) return nullptr;
+    m_BezelTried[id - 1] = true;
+    const char* name = platform::bezelFileName(filter);
+    CString path; // 起動したドライブ (SD カード、NVMe、USB) の /pix68k/ (設定や ROM と同じ)
+    path.Format("%s/pix68k/%s", m_BootDrive != nullptr ? m_BootDrive : "", name);
+    FIL f;
+    if (f_open(&f, path, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        m_Logger.Write(FromMachine, LogWarning, "bezel: %s not found; showing without the bezel", (const char*)path);
+        return nullptr;
+    }
+    u8 hdr[platform::kBezelHeaderBytes];
+    UINT got = 0;
+    platform::BezelHeader h;
+    const char* err = nullptr;
+    if (f_read(&f, hdr, sizeof hdr, &got) != FR_OK)
+        err = "cannot read";
+    else // 16 バイトより短ければ、parseBezelHeader() が「not a bezel file」にする
+        err = platform::parseBezelHeader(hdr, got < sizeof hdr ? got : f_size(&f), h);
+    const int sw = (int)m_Screen.GetWidth(), sh = (int)m_Screen.GetHeight();
+    if (err == nullptr && (h.w != sw || h.h != sh)) {
+        f_close(&f);
+        m_Logger.Write(FromMachine, LogWarning, "bezel: %s is %dx%d but the screen is %dx%d; showing without the bezel",
+                       (const char*)path, h.w, h.h, sw, sh);
+        return nullptr;
+    }
+    u32* px = nullptr;
+    u16* edges = nullptr;
+    if (err == nullptr) {
+        px = new u32[(size_t)h.w * h.h];
+        edges = new u16[(size_t)h.gh * 2];
+        if (px == nullptr || edges == nullptr) err = "out of memory";
+    }
+    // 最後のバッファに直接読む (ファイル全体を別に読んで写すと、一時に 2 倍のメモリを使う)
+    if (err == nullptr && (f_read(&f, px, (UINT)((size_t)h.w * h.h * 4), &got) != FR_OK || got != (UINT)((size_t)h.w * h.h * 4)))
+        err = "cannot read";
+    f_close(&f);
+    if (err == nullptr && !platform::bezelEdges(px, h, edges, edges + h.gh)) err = "the frame has pixels inside the glass";
+    if (err != nullptr) {
+        delete[] px;
+        delete[] edges;
+        m_Logger.Write(FromMachine, LogWarning, "bezel: %s: %s; showing without the bezel", (const char*)path, err);
+        return nullptr;
+    }
+    b.left = edges;
+    b.right = edges + h.gh;
+    b.h = h;
+    b.filter = filter & platform::CRT_BEZEL_BITS;
+    __atomic_store_n(&b.pixels, (const uint32_t*)px, __ATOMIC_RELEASE);
+    m_Logger.Write(FromMachine, LogNotice, "bezel: %s (glass %dx%d at %d,%d)", (const char*)path, h.gw, h.gh, h.gx, h.gy);
+    return &b;
+}
+
+// X68000 の画面をフレームバッファの真ん中に写す。video_scale=integer (aspect、full で表ができるまでも) なら整数倍で
+// 拡大し、off なら拡大しない (platform/frame_scale.h。フレームバッファより大きければ真ん中を切り出す)。aspect、full は
+// 表を引いて写す (platform/crt_effect.h)。ふだんはコア 0 が呼び、
 // コア 0 が USB の転送で止まっている間は合成するコアが呼ぶ (PresentFromComposer()。同時に 2 つのコアが呼ぶことはない)。
 // 合成するコアからも呼ぶので、ログには書かない
 // 32 ビットのフレームバッファの画素は X68000 の Renderer と同じ XRGB の並び
-void CKernel::ShowFrame(const Emulator::Frame& frame) {
+void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     CBcmFrameBuffer* fb = m_Screen.GetFrameBuffer();
     if (fb == nullptr || fb->GetDepth() != 32 || frame.width <= 0 || frame.height <= 0) return;
     u8* base = (u8*)(uintptr)fb->GetBuffer();
     const unsigned pitch = fb->GetPitch();
     const int sw = (int)m_Screen.GetWidth(), sh = (int)m_Screen.GetHeight();
-    const platform::FrameScale scale =
-        platform::computeFrameScale(frame.width, frame.height, sw, sh, m_Settings.scale != 0, ScaleLinePixels - 4,
-                                    m_GpuScaleX, m_GpuScaleY);
-    // スキャンライン (scanline=on。縦の倍率が 2 以上のときだけ暗くする。platform/frame_scale.h)。切り替えたときは
-    // presentScaled() がすべての行を写し直す (FrameRowCache::scanline)
-    const bool scanline = __atomic_load_n(&m_Settings.scanline, __ATOMIC_RELAXED) != 0;
-    // ログ用 (コア 0 が読む)。暗くする行を入れて写したか
-    __atomic_store_n(&m_ScanlineShown, scanline && scale.ky >= 2, __ATOMIC_RELAXED);
-    if (frame.width != m_ShownWidth || frame.height != m_ShownHeight || scale != m_ShownScale) {
+    // 画面の出し方 (video_scale= は上の 16 ビット、video_filter= は下の 16 ビット。CKernel::videoChanged())
+    const int video = __atomic_load_n(&m_Video, __ATOMIC_RELAXED);
+    const int mode = video >> 16;
+    const bool scaleOn = mode != platform::VIDEO_SCALE_OFF;
+    const platform::FrameScale intScale = platform::computeFrameScale(
+        frame.width, frame.height, sw, sh, scaleOn, ScaleLinePixels - 4, m_GpuScaleX, m_GpuScaleY);
+    // 整数倍で写すと、大きさか倍率が変わる (すべての行を写すフレーム)
+    const bool intChanged = frame.width != m_ShownWidth || frame.height != m_ShownHeight || intScale != m_ShownScale;
+    platform::FrameScale scale = intScale; // 写す範囲 (表ができていれば、下で整数倍でない枠にする)
+    // ブラウン管のように見せる効果 (video_filter=)。整数倍 (か 1 倍) でスキャンラインだけなら、presentScaled() が
+    // 縦の倍率が 2 以上のときに暗くする (platform/frame_scale.h)。curve か mask があるときと、整数倍でない枠
+    // (video_scale=aspect、full。platform::videoFrameScale()) は、表を作って presentCrt() で写す (platform/crt_effect.h)。
+    // 表は、組み合わせか画面の大きさが変わったときに作り直す。ゆがみのある表は時間がかかる
+    // (Pi 3 で 39ms) ので、1 回で作ると、その間に合成するコアが次のフレームを渡し、写していないフレームが置き換わる
+    // (コア 0 が写しているとき) か、合成するコアが遅れる (合成するコアが写しているとき)。そこで、フレームを写すたびに
+    // kCrtBuildSliceUs だけ作り進め、できあがるまでは整数倍の枠に、スキャンラインだけ (なければ効果なし) で写す
+    // (どのフレームも写す)。大きさが変わったフレームは、すべての行を写すので作り進めない。X68000 が止まっていて
+    // 次のフレームが来ないとき (stopped) は、置き換わるフレームがないので最後まで作る。作れなければ整数倍の枠のままにする。
+    // 整数倍でない枠は、表ができたフレームで替える (枠の外を塗り、すべての行を写す)
+    int crt = video & (platform::CRT_PRESET_COUNT - 1);
+    platform::FrameScale target = platform::videoFrameScale(mode, intScale, frame.width, frame.height, sw, sh,
+                                                            ScaleLinePixels - 4, m_GpuScaleX, m_GpuScaleY);
+    // モニタの枠 (platform/bezel.h)。絵が読めていて、フレームバッファと同じ大きさで、画面がガラスに入るなら、
+    // video_scale= の枠の代わりにガラスの矩形に写す。読めていなければ枠なし (読むのはコア 0。LoadBezel())
+    const int bezelId = platform::videoBezel(video & 0xffff);
+    const platform::BezelImage* bezel = nullptr;
+    const bool bezelLoaded = bezelId != 0 && __atomic_load_n(&m_Bezel[bezelId - 1].pixels, __ATOMIC_ACQUIRE) != nullptr;
+    if (bezelLoaded && platform::bezelFrameScale(m_Bezel[bezelId - 1], frame.width, frame.height, sw, sh, m_GpuScaleX,
+                                                 m_GpuScaleY, target))
+        bezel = &m_Bezel[bezelId - 1];
+    // 絵は読めたのに枠を出さない理由 (ログ用。コア 0 が LogShownScreen() で、変わったときに出す)。写す範囲が変わらない
+    // 設定の変更 (768x1024 の画面で枠を選んだ、外した、替えた) でも変わるので、毎フレーム置く
+    // (置くのは、下で m_ShownWidth などを書いたあと。ログに画面モードを出すため)
+    const int bezelSkip =
+        platform::bezelSkipCode(video & 0xffff, bezelLoaded, bezel != nullptr, m_GpuScaleX != 1 || m_GpuScaleY != 1);
+    bool useMap = platform::crtNeedsMap(crt) || target.kx == 0;
+    if (useMap) {
+        const platform::FrameScale& cs = target;
+        const u64 b0 = CTimer::GetClockTicks64();
+        // 作れなかった表 (大きすぎる、区間が多すぎる) は作り直さず、ログの数にも入れない (platform::crtMapPrepare())
+        const platform::CrtPrepared prep = platform::crtMapPrepare(
+            m_CrtMap, crt, cs.srcW, cs.srcH, cs.dstW, cs.dstH, stopped,
+            intChanged ? 0 : (u64)kCrtBuildSliceUs * (CLOCKHZ / 1000000), [] { return (uint64_t)CTimer::GetClockTicks64(); });
+        if (prep.worked) {
+            // ログ用 (コア 0 が読む)。作り進めた回数、合わせた時間、1 回の最大、作り終えた表の数
+            const uint32_t us = (uint32_t)((CTimer::GetClockTicks64() - b0) * 1000000 / CLOCKHZ);
+            __atomic_store_n(&m_CrtBuildTotalUs, m_CrtBuildTotalUs + us, __ATOMIC_RELAXED);
+            __atomic_store_n(&m_CrtBuildSlices, m_CrtBuildSlices + 1, __ATOMIC_RELAXED);
+            if (us > __atomic_load_n(&m_CrtBuildUs, __ATOMIC_RELAXED)) __atomic_store_n(&m_CrtBuildUs, us, __ATOMIC_RELAXED);
+            if (prep.finished) __atomic_store_n(&m_CrtBuildsDone, m_CrtBuildsDone + 1, __ATOMIC_RELAXED);
+        }
+        if (prep.ready) {
+            scale = cs;
+            // 作り直した表で初めて写すときは、すべての行を写す
+            if (m_CrtMap.serial != m_CrtSerialShown) {
+                m_CrtSerialShown = m_CrtMap.serial;
+                m_RowCache.valid = false;
+            }
+        } else {
+            // 表ができるまで (と、作れなかったとき) は、整数倍の枠にスキャンラインだけで写す。表は組み合わせごとに作り直す
+            // ので、切り替えるとできるまで整数倍の枠を通る (枠の外を塗り直す)。切り替えるのは設定メニューだけ
+            // (CKernel::videoChanged()) で、そのときは X68000 を止めている (stopped) ので 1 回で作り、ふつうは
+            // 通らない (止まりきる前に写したフレームでは、数フレーム通ることがある)
+            crt &= platform::CRT_SCANLINE;
+            useMap = false;
+        }
+    }
+    // 大きさか倍率が変わった (下で枠の外を塗り、すべての行を写す)
+    // 枠を写すか (表ができてガラスの矩形に写すときだけ。枠を替えたときも枠の外を描き直す)
+    const int bezelShown = bezel != nullptr && platform::isBezelScale(*bezel, scale) ? bezelId : 0;
+    const bool modeChanged = frame.width != m_ShownWidth || frame.height != m_ShownHeight || scale != m_ShownScale ||
+                             bezelShown != m_BezelShown;
+    const bool scanline = !useMap && crt == platform::CRT_SCANLINE;
+    // 効果か写し方を切り替えたときは、すべての行を写し直す
+    const int shownKey = (useMap ? kCrtShownMap : 0) | crt;
+    if (shownKey != m_CrtLast) {
+        m_CrtLast = shownKey;
+        m_RowCache.valid = false;
+    }
+    // ログ用 (コア 0 が読む)。表で写したか、掛けた効果 (スキャンラインだけのときは、暗くする行を入れたときだけ)
+    __atomic_store_n(&m_CrtShown, useMap ? shownKey : scanline && scale.ky >= 2 ? (int)platform::CRT_SCANLINE : 0,
+                     __ATOMIC_RELAXED);
+    if (modeChanged) {
         // 大きさか倍率が変わったら (最初の 1 回はログの文字を消すため)、写す範囲の外を不透明の黒にする
         // (アルファが 0 の黒は、HDMI で濃い灰色に見えることがあった)
-        platform::fillOutside(base, pitch, sw, sh, scale, 0xff000000u);
+        // 枠を写すときは、枠の外を枠の絵にする
+        if (bezelShown != 0)
+            platform::drawBezelOutside(base, pitch, *bezel);
+        else
+            platform::fillOutside(base, pitch, sw, sh, scale, 0xff000000u);
+        __atomic_store_n(&m_BezelShown, bezelShown, __ATOMIC_RELAXED);
         m_OsdState.invalidate();
         m_MsgState.invalidate();
         m_RowCache.valid = false; // 写しを作り直す (すべての行を写す)
@@ -2016,6 +2376,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame) {
         m_ShownHeight = frame.height;
         m_ShownScale = scale;
     }
+    __atomic_store_n(&m_BezelSkip, bezelSkip, __ATOMIC_RELEASE);
     const u64 t0 = CTimer::GetClockTicks64();
     // 画面の隅の数字 (osd=on / fps)。数字か場所が変わったときだけ描く。X68000 の画面の枠の外に出すときは写したあとに描き、
     // 重ねるときは写すときに重なる部分だけ数字の絵を書く (X68000 の画面の中身は変えない。写したあとに上から描くと、
@@ -2023,10 +2384,11 @@ void CKernel::ShowFrame(const Emulator::Frame& frame) {
     const int osdMode = __atomic_load_n(&m_Settings.osd, __ATOMIC_RELAXED);
     const bool osdOn = osdMode != 0 && !m_MenuActive;
     const platform::OsdValue osdValue = LoadOsd();
-    // 置く場所は、X68000 の画面の右の余白 (縦に並べる) か、なければ右上の横 1 行 (osd=on なら、X68000 の画面に
-    // 重なるときは出さない。platform::chooseOsd())
-    const platform::OsdRect osdRect =
-        platform::chooseOsd(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH, platform::osdChars(osdValue));
+    // 置く場所は、X68000 の画面の右の余白 (縦に並べる) か、なければ上の余白の横 1 行。どちらも X68000 の画面に重なるときは、
+    // 縦に並べたものを右上に重ねる (platform::chooseOsd())。枠は写す範囲 (scale): video_scale=aspect、full は表ができたら
+    // platform::videoFrameScale() の枠、できるまでは整数倍の枠 (枠が替わるフレームで置き直す)
+    const platform::OsdRect osdRect = platform::chooseOsd(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH,
+                                                          platform::osdChars(osdValue), platform::osdRows(osdValue));
     // 置く場所がなければ、UpdateOsd() は温度を読まない (コア 0 が読む)
     __atomic_store_n(&m_OsdPlaced, osdRect.w > 0, __ATOMIC_RELAXED);
     const platform::OsdState::Step osd = m_OsdState.update(osdOn, osdValue, osdRect);
@@ -2048,13 +2410,21 @@ void CKernel::ShowFrame(const Emulator::Frame& frame) {
     }
     const platform::OsdState::Step msg = m_MsgState.update(msgOn, m_MsgSeqLoaded, msgRect);
     // 消すのを先にすべて済ませてから描く (消す場所が、もう一方の新しい場所に重なることがあるため)
+    // 枠を写しているときは、消した場所を枠の絵に戻す
+    const platform::BezelImage* const shownBezel = m_BezelShown != 0 ? &m_Bezel[m_BezelShown - 1] : nullptr;
+    auto erase = [&](const platform::OsdRect& r) {
+        if (shownBezel != nullptr)
+            platform::restoreBezel(base, pitch, *shownBezel, r.x, r.y, r.w, r.h);
+        else
+            platform::eraseOsd(base, pitch, r, platform::OSD_BG);
+    };
     if (osd.erase) {
-        platform::eraseOsd(base, pitch, osd.eraseRect, platform::OSD_BG);
+        erase(osd.eraseRect);
         // 消した場所に重なる X68000 の画面の行は、変わっていなくても写して元に戻す
         ForceRows(osd.eraseRect.y, osd.eraseRect.y + osd.eraseRect.h);
     }
     if (msg.erase) {
-        platform::eraseOsd(base, pitch, msg.eraseRect, platform::OSD_BG);
+        erase(msg.eraseRect);
         ForceRows(msg.eraseRect.y, msg.eraseRect.y + msg.eraseRect.h);
     }
     // 重ねる数字やメッセージを描き直したら、重なる行を写す
@@ -2077,15 +2447,35 @@ void CKernel::ShowFrame(const Emulator::Frame& frame) {
         ovMsg.w = msgRect.w;
         ovMsg.h = msgRect.h;
     }
-    platform::presentScaled(frame.pixels, Emulator::PITCH, base, pitch, scale, m_ScaleLine,
-                            m_OsdState.overlaid() ? &ov : nullptr, m_RowCache.pixels != nullptr ? &m_RowCache : nullptr,
-                            scanline, m_MsgState.overlaid() ? &ovMsg : nullptr);
+    platform::CrtBezel cb;
+    if (shownBezel != nullptr) {
+        cb.pixels = shownBezel->pixels + (size_t)scale.dstY * shownBezel->h.w + scale.dstX;
+        cb.pitch = shownBezel->h.w;
+        cb.left = shownBezel->left;
+        cb.right = shownBezel->right;
+    }
+    if (useMap)
+        platform::presentCrt(frame.pixels, Emulator::PITCH, base, pitch, scale, m_CrtMap, m_ScaleLine, m_ScaleLine2,
+                             m_OsdState.overlaid() ? &ov : nullptr, m_RowCache.pixels != nullptr ? &m_RowCache : nullptr,
+                             m_MsgState.overlaid() ? &ovMsg : nullptr, shownBezel != nullptr ? &cb : nullptr);
+    else
+        platform::presentScaled(frame.pixels, Emulator::PITCH, base, pitch, scale, m_ScaleLine,
+                                m_OsdState.overlaid() ? &ov : nullptr,
+                                m_RowCache.pixels != nullptr ? &m_RowCache : nullptr, scanline,
+                                m_MsgState.overlaid() ? &ovMsg : nullptr);
     // 写した行と省いた行の数 (ログ用。コア 0 が読む)
     __atomic_store_n(&m_RowsCopied, m_RowCache.copied, __ATOMIC_RELAXED);
     __atomic_store_n(&m_RowsSkipped, m_RowCache.skipped, __ATOMIC_RELAXED);
     // 枠の外の部分 (重ねるときに枠からはみ出した部分を含む) は、変わったときに描く
-    if (osd.draw) platform::drawOsdImage(base, pitch, osdRect, s_OsdImage);
-    if (msg.draw) platform::drawOsdImage(base, pitch, msgRect, mm->image);
+    // 枠を写しているときは、背景を枠の絵の半分の明るさにする (黒の半透明に見える。m_ScaleLine は写し終えたので使ってよい)
+    auto drawImage = [&](const platform::OsdRect& r, const uint32_t* image) {
+        if (shownBezel != nullptr)
+            platform::drawOsdOnBezel(base, pitch, *shownBezel, r.x, r.y, r.w, r.h, image, platform::OSD_BG, m_ScaleLine);
+        else
+            platform::drawOsdImage(base, pitch, r, image);
+    };
+    if (osd.draw) drawImage(osdRect, s_OsdImage);
+    if (msg.draw) drawImage(msgRect, mm->image);
     const u64 us = (CTimer::GetClockTicks64() - t0) * 1000000 / CLOCKHZ;
     // コア 0 が読む (ログ)。書くのは写す役を持っているコアだけ
     __atomic_store_n(&m_CopyTotalUs, m_CopyTotalUs + us, __ATOMIC_RELAXED);
@@ -2155,7 +2545,8 @@ void CKernel::UpdateOsd() {
         const uint64_t dEmuUs = (cycles - m_OsdCycles) * 1000000 / m_pEmulator->cpuHz();
         s.speedPct = dWallUs != 0 ? (unsigned)((dEmuUs * 100 + dWallUs / 2) / dWallUs) : 0;
         // 読めなければ (QEMU など) 0 が返るので出さない。メールボックスを 1 回読む (1 秒に 1 回)。
-        // 出す場所がないとき (X68000 の画面がフレームバッファの横いっぱいで、osd=on のときなど) は読まない
+        // 出す場所がないとき (フレームバッファの高さが 148 ラインより低く、横 1 行も X68000 の画面に重なり、osd=on の
+        // ときだけ) は読まない
         const bool placed = __atomic_load_n(&m_OsdPlaced, __ATOMIC_RELAXED);
         // 0.1 度まで出すので、CCPUThrottle::GetTemperature() (1 度単位) ではなく 1/1000 度で読む
         const unsigned milliC = placed ? ReadMilliC() : 0;
@@ -2187,6 +2578,9 @@ void CKernel::UpdateOsd() {
         // 1GB より下のヒープの使った量 (一度でも切り出した量。ReadHeap()。メールボックスは使わない)。縦に並べるときだけ出る
         const HeapStatus heap = ReadHeap();
         if (heap.lowBytes != 0) s.heapMB = (int)((heap.lowBytes - heap.lowUnused + 512 * 1024) / (1024 * 1024));
+        // ネットワークの IP アドレス (縦に並べるときのいちばん下。net=on でアドレスが決まっているときだけ)。
+        // UpdateOsd() はコア 0 で動くので、ネットワークのタスクと同じコアで読む
+        if (m_pHostNet != nullptr) s.ipv4 = m_pHostNet->IPv4();
         // 1 枚も合成していなければ (X68000 が止まっている) 出さない (ExpireOsd())
         PublishOsd(published != m_OsdFrames[0] ? platform::packOsd(s) : platform::OsdValue());
     }
@@ -2216,7 +2610,7 @@ void CKernel::ExpireOsd() {
     if (now - m_OsdPublishedTicks < 2 * CLOCKHZ) return;
     PublishOsd(platform::OsdValue());
     m_OsdTicks = 0; // フレームが来たら数え直す
-    if (m_OsdState.shown && m_pLastFrame != nullptr && m_pEmulator->paused()) ShowFrame(*m_pLastFrame);
+    if (m_OsdState.shown && m_pLastFrame != nullptr && m_pEmulator->paused()) ShowFrame(*m_pLastFrame, true);
 }
 
 // POST /message (CHttpTask、コア 0) から呼ぶ。字を並べて字形にし、写す役のコアに渡す。消す時刻は ShowFrame() が見る。
@@ -2251,7 +2645,7 @@ void CKernel::ServiceMessage() {
     }
     if (!need) return;
     m_MsgRedraw = false;
-    if (m_pLastFrame != nullptr && m_pEmulator->paused()) ShowFrame(*m_pLastFrame);
+    if (m_pLastFrame != nullptr && m_pEmulator->paused()) ShowFrame(*m_pLastFrame, true);
 }
 
 // コア 1 が読んだテキスト画面が前回と違えば、UART のログに出す。tools/qemu_human68k.sh が読む
@@ -3024,15 +3418,36 @@ void CKernel::ReportSpeed() {
         CString rows;
         if (m_RowCache.pixels != nullptr && dc + ds != 0)
             rows.Format("; %u%% of the rows unchanged and not copied", (unsigned)((u64)ds * 100 / (dc + ds)));
-        // スキャンラインを入れて写した (縦 2 倍以上で scanline=on。あり / なしの時間を比べるため)
+        // 効果を掛けて写した (スキャンラインだけなら「; scanlines」、表で写したら「; video_filter=curve,mask」など。
+        // 整数倍でない枠で効果がなければ「; video_filter=none」。あり / なしの時間を比べるため)
         // (m_ShownScale は写す役の合成するコアが書き換えるので読まず、ShowFrame() が置いた値を読む)
-        if (__atomic_load_n(&m_ScanlineShown, __ATOMIC_RELAXED)) rows.Append("; scanlines");
+        const int crtShown = __atomic_load_n(&m_CrtShown, __ATOMIC_RELAXED);
+        if (crtShown & kCrtShownMap) {
+            rows.Append("; video_filter=");
+            rows.Append(platform::videoFilterName(crtShown & (platform::CRT_PRESET_COUNT - 1)));
+        } else if (crtShown == platform::CRT_SCANLINE) {
+            rows.Append("; scanlines");
+        }
         m_Logger.Write(FromMachine, LogNotice, "screen: copy to the framebuffer %u us on average, %u us at most%s",
                        (unsigned)((copyUs - m_CopyUsLogged) / (copies - m_CopyCountLogged)), copyMax,
                        (const char*)rows);
     }
     m_CopyCountLogged = copies;
     m_CopyUsLogged = copyUs;
+    // 効果の表を作っていたら、かかった時間 (画面モードか組み合わせが変わったときに、写す役のコアがフレームを写すたびに
+    // 少しずつ作る。ShowFrame())。作り終えた表の数、作り進めたフレームの数、合わせた時間、1 フレームでの最大
+    const uint32_t slices = __atomic_load_n(&m_CrtBuildSlices, __ATOMIC_RELAXED);
+    if (slices != m_CrtBuildSlicesLogged) {
+        const uint32_t done = __atomic_load_n(&m_CrtBuildsDone, __ATOMIC_RELAXED);
+        const uint32_t total = __atomic_load_n(&m_CrtBuildTotalUs, __ATOMIC_RELAXED);
+        m_Logger.Write(FromMachine, LogNotice,
+                       "screen: video table: %u built over %u frames, %u us in total, %u us at most in one frame",
+                       done - m_CrtBuildsDoneLogged, slices - m_CrtBuildSlicesLogged, total - m_CrtBuildTotalUsLogged,
+                       __atomic_exchange_n(&m_CrtBuildUs, 0u, __ATOMIC_RELAXED));
+        m_CrtBuildSlicesLogged = slices;
+        m_CrtBuildsDoneLogged = done;
+        m_CrtBuildTotalUsLogged = total;
+    }
     // コア 2 が 1 フレームを合成するのに使った時間と、コア 3 が 1 フレーム分の音を合成するのに使った時間は、
     // 区間を区切るよう頼む。そのコアが次のフレームの終わりで区切り、主ループの ReportCoreWork() が受け取って出す
     m_CoreWorkPending[0] = m_pEmulator->renderCoreActive();
@@ -3042,7 +3457,11 @@ void CKernel::ReportSpeed() {
     m_RowsLogged[1] = rowsSkipped;
     ReportCpu(FromMachine);
     if (m_pSound != nullptr || m_NullAudio)
-        m_Logger.Write(FromMachine, LogNotice, "sound: %u underrun(s)", m_pEmulator->audioUnderruns());
+        // たまっている量と、たまり具合の最小値の目標 (20ms から。足りなくなったときと、間に合わない間に多く作った
+        // ときに増える。x68k/sound.h)
+        m_Logger.Write(FromMachine, LogNotice, "sound: %u underrun(s), %u ms buffered, aiming for at least %u ms",
+                       m_pEmulator->audioUnderruns(), m_pEmulator->audioFill() * 1000 / pix68k_sound::RATE,
+                       m_pEmulator->audioGoal() * 1000 / pix68k_sound::RATE);
     ReportDisks();
     if (m_pEmulator->soundCoreActive()) {
         uint32_t wakes, empty;
@@ -3135,6 +3554,7 @@ void CKernel::DispatchKeys() {
     m_KeyMerge.merged(mods, down);
     if (m_RebootKeys.filter(mods, down)) m_RebootRequest.press();
     if (m_pEmulator != nullptr) SendKeyReport(mods, down);
+    else if (m_BootMenuActive) BootMenuKeys(mods, down); // 起動の組み合わせのメニュー (boot_menu.cpp)
 }
 
 // 押しているキー (修飾キーのビットと usage ごとの 1 ビット) を前回と比べ、押した / 離したキーを X68000 に送る。
@@ -3200,6 +3620,17 @@ bool CKernel::RebootWritingBack(const char* who, platform::RebootRequest& reques
             return false;
         }
         m_Logger.Write(FromMachine, LogWarning, "%s: restarting without writing back %s", who, what);
+    }
+    // POST /reboot?profile= を断ったあと取り消せずに残っていれば、ほかの再起動 (Ctrl + Alt + Delete) の前に戻す
+    // (ディスクを閉じ、アンマウントする FinishDeploy() の前に)。戻せなければ、断った組み合わせで起動しないよう
+    // 再起動しない
+    if (&request != &m_NetReboot && !CancelProfileChoiceForRestart(who)) {
+        if (!m_MenuActive && !m_DeployHeld) {
+            emu->requestPause(false);
+            const u64 t1 = CTimer::GetClockTicks64();
+            while (emu->paused() && CTimer::GetClockTicks64() - t1 < CLOCKHZ) asm volatile("sev");
+        }
+        return false;
     }
     CloseDiskFiles();
     if (m_DeploySeconds != 0) FinishDeploy(false);

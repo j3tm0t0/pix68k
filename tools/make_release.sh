@@ -9,10 +9,12 @@
 # ベアメタル版を Raspberry Pi 3 / 4 (400) / 5 の分ビルドし (tools/build_baremetal.sh)、Raspberry Pi のファームウェア
 # (Circle の boot/Makefile と同じ版。device tree は pix68k が対応する機種のものだけ)、config.txt、cmdline.txt、空の pix68k/ (ROM の置き方の README.txt)、
 # LICENSE、NOTICE、同梱のライブラリのライセンス、ソースの場所を書いた SOURCE.txt を入れる。
+# モニタの枠の絵 (video_filter= の cz-600de / cz-600db) は、tools/bezel_cz600d.py で描いて tools/bezel_pack.py で .bin にし、
+# pix68k/ に入れる (絵と .bin はリポジトリに入れない)。
 # IPL ROM、CGROM、ディスクのイメージ、SoundFont、MIDI の音源の ROM は入れない。最後に zip の中の一覧を調べ、
 # 決めた名前 (完全一致) 以外のファイルか、ROM やディスクのイメージに見える名前があれば zip を消して失敗する。
 # 要るもの: tools/build_baremetal.sh が要るもの (aarch64-elf-gcc か PREFIX64 のコンパイラ、rsync)、curl、zip、unzip、
-# shasum か sha256sum。ソースの URL は PIX68K_SOURCE_URL で変えられる (既定 https://github.com/j3tm0t0/pix68k)
+# shasum か sha256sum、python3 と numpy と Pillow (枠の絵)。ソースの URL は PIX68K_SOURCE_URL で変えられる (既定 https://github.com/j3tm0t0/pix68k)
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -62,6 +64,15 @@ mkdir -p "$STAGE/pix68k" "$STAGE/overlays" "$STAGE/licenses"
 cp build/baremetal-raspi3/app/kernel8.img "$STAGE/"
 cp build/baremetal-raspi4/app/kernel8-rpi4.img "$STAGE/"
 cp build/baremetal-raspi5/app/kernel_2712.img "$STAGE/"
+# モニタの枠の絵 (グレーの cz-600de と黒の cz-600db)
+BEZEL_PNG=$OUT/bezel-png
+rm -rf "$BEZEL_PNG"
+mkdir -p "$BEZEL_PNG"
+python3 tools/bezel_cz600d.py "$BEZEL_PNG"
+for b in cz-600de cz-600db; do
+  python3 tools/bezel_pack.py "$BEZEL_PNG/bezel-$b.png" "$STAGE/pix68k/bezel-$b.bin"
+done
+rm -rf "$BEZEL_PNG"
 
 # 2. ファームウェア。版とファイルの一覧は Circle の boot/Makefile から読む (Circle を上げれば一緒に変わる)。
 #    32 ビットの armstub やブートローダは使わないので入れない。取ってきたものは build/release/firmware-<版> に残して使い回す
@@ -176,6 +187,11 @@ IPL ROM、CGROM、ディスクのイメージは入っていない。自分で�
   hd0.hdf         SASI ID 0 のハードディスクのイメージ
   pix68k.cfg      設定 (なくてよい)
 
+このフォルダにはじめから入っているもの:
+
+  bezel-cz-600de.bin  モニタの枠の絵 (グレー)。pix68k.cfg に video_filter = scanline,curve,cz-600de のように書くと使う
+  bezel-cz-600db.bin  同じく黒の枠 (cz-600db)。どちらも画面が 1920x1080 のときだけ出る
+
 pix68k.cfg の例 (1 行に 1 つ「キー=値」。# から行末までは注釈):
 
   fd0 = HUMAN302.XDF
@@ -218,6 +234,10 @@ if [ -n "$TAG" ]; then WHERE="タグ ${TAG} (コミット ${COMMIT})"; else WHER
   echo "  ビルドのとき、tools/build_baremetal.sh は Circle を写した先の addon/fatfs/ffconf.h と include/circle/timer.h を書き換える"
   echo "  (Circle のリポジトリの中身は変えない。書き換えの中身は tools/build_baremetal.sh にある)。"
   echo
+  echo "pix68k/bezel-cz-600de.bin と bezel-cz-600db.bin (モニタの枠の絵) は、ソースの tools/bezel_cz600d.py で描き、"
+  echo "tools/bezel_pack.py で作ったもの (カーネルと同じく GPLv3)。numpy と Pillow の版が違うと、作り直したときに"
+  echo "数画素の色が 1 だけ違うことがある。"
+  echo
   echo "Munt (libmt32emu) を差し替えてリンクし直すには、ソースの external/munt/mt32emu を別の版に替え、"
   echo "tools/build_baremetal.sh でビルドし直す。"
   echo
@@ -237,10 +257,11 @@ rm -f "$SUMS_OUT"
 
 # 8. 中身を調べる: 決めた名前 (完全一致) 以外のファイルと、ROM やディスクのイメージに見える名前があれば失敗する
 ALLOWED="kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt
-pix68k/ pix68k/README.txt overlays/ licenses/ licenses/mt32emu-COPYING.LESSER.txt licenses/nuked-sc55-LICENSE.txt
+pix68k/ pix68k/README.txt pix68k/bezel-cz-600de.bin pix68k/bezel-cz-600db.bin overlays/ licenses/ licenses/mt32emu-COPYING.LESSER.txt licenses/nuked-sc55-LICENSE.txt
 licenses/tinysoundfont-LICENSE.txt $FW_FILES"
 for f in $FW_OVERLAYS; do ALLOWED="$ALLOWED overlays/$f"; done
 REQUIRED="kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt pix68k/README.txt
+pix68k/bezel-cz-600de.bin pix68k/bezel-cz-600db.bin
 LICENCE.broadcom COPYING.linux bootcode.bin start.elf start4.elf fixup.dat fixup4.dat
 $KEEP_DTB"
 LIST=$(unzip -Z1 "$ZIP")

@@ -291,6 +291,19 @@ inline bool queryValue(const char* query, const char* key, char* out, size_t siz
     return false;
 }
 
+// クエリに key があるか (値が長すぎて queryValue() が読めないときも true)
+inline bool queryHas(const char* query, const char* key) {
+    const size_t kn = strlen(key);
+    for (const char* p = query; *p;) {
+        const char* amp = strchr(p, '&');
+        const size_t n = amp ? (size_t)(amp - p) : strlen(p);
+        if (n >= kn && memcmp(p, key, kn) == 0 && (n == kn || p[kn] == '=')) return true;
+        p += n;
+        if (*p == '&') p++;
+    }
+    return false;
+}
+
 // URL の /files/ より後ろ (%xx は戻したもの) を、ドライブの中のパス ("/pix68k/pix68k.cfg"。ルートは "/") にする。
 // 「.」と「..」の段、\、:、FAT に使えない文字 (* ? " < > |) があれば false。続いた / と末尾の / は 1 つにまとめる
 inline bool normalizeFilePath(const char* in, char* out, size_t size) {

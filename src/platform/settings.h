@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "platform/crt_preset.h"
 #include "x68k/machine.h"
 
 namespace platform {
@@ -30,6 +31,7 @@ struct Settings {
     int maxSpeed = 0;           // max_speed=
     int speed060 = 100;         // speed060= (060turbo の命令の速さ。選んだクロックの実機の 68060 を 100 とした %)
     int maxSpeedLimit = 0;      // max_speed_limit= (060turbo の最高速モードの上限。同じ単位。0 は上限なし)
+    int busSyncSprite = 0;      // bus_sync_sprite= (X68030 と 060turbo で、スプライトの読み書きも 1.6 マイクロ秒ごとにそろえる)
     int renderCore = 1;         // render_core= (ベアメタル版だけ)
     int soundCore = 1;          // sound_core= (ベアメタル版だけ)
     int hat = -1;               // hat= (ベアメタル版だけ。-1 auto、0、1)
@@ -66,11 +68,29 @@ struct Settings {
     char netAllow[PATH_SIZE] = {}; // net_allow= (受け付ける送り元。「192.168.1.0/24,10.0.0.5」)
     char netToken[PATH_SIZE] = {}; // net_token= (書く操作に要るトークン)
     char syslog[PATH_SIZE] = {}; // syslog= (ログを送る先。「192.168.1.2」か「192.168.1.2:514」)
-    int scale = 1;              // scale= (ベアメタル版だけ。1 auto: 整数倍で拡大する、0 off。platform/frame_scale.h)
-    int scanline = 0;           // scanline= (ベアメタル版だけ。on なら縦 2 倍以上に拡大したとき、各行の最後の 1 行を暗くする。platform/frame_scale.h)
+    // 画面の出し方 (platform/crt_preset.h、platform/crt_effect.h)。公開版 v0.1.0 の scale= と scanline= は、
+    // 読み終えてから resolveLegacySettings() がこの 2 つに読み替える
+    // video_filter= (ブラウン管のように見せる効果。CRT_SCANLINE、CRT_CURVE、CRT_MASK を重ねた数。既定は効果なし)
+    int videoFilter = 0;
+    // video_scale= (VideoScale。off: 1 倍、integer: 整数倍 (既定)、aspect: 4:3 で高さいっぱい、full: 画面全体)。
+    // ホスト版の既定は aspect (host/main.cpp の hostDefaultSettings())
+    int videoScale = VIDEO_SCALE_INTEGER;
+    // v0.1.0 の scale= と scanline= を読み替えるか。v0.1.0 ではどちらもベアメタル版だけの項目で、ホスト版は読まなかった
+    // ので、ホスト版は 0 (hostDefaultSettings()。読んでも何もせず、保存でも行を書き直さない)
+    int legacyVideo = 1;
+    // scale= と scanline= の生の値 (-1 は書いていない)。保存はしない (kSettingKeys にない)
+    int legacyScale = -1;    // 1 auto、0 off
+    int legacyScanline = -1; // 1 on、0 off
+    // 行を読んだ順番 (あとの行が勝つ)。scanline= の行と video_filter= の行、scale= の行と video_scale= の行の
+    // どちらがあとかを resolveLegacySettings() が比べる。video_filter= / video_scale= は、受け付けた値の行だけ数える
+    int lineSeq = 0, legacyFilterSeq = 0, legacyScaleSeq = 0, videoFilterSeq = 0, videoScaleSeq = 0;
     // osd= (画面の隅にフレームの数、速さ、温度などを出す。platform/osd.h)。0 off、2 on: X68000 の画面の外の余白に
     // 入るときだけ出す (既定)、1 fps: 余白に入らなければ X68000 の画面に重ねる
     int osd = 2;
+    // 起動の組み合わせ (platform/boot_profile.h)
+    char autotype[PATH_SIZE] = {}; // autotype= (X68000 を動かし始めて autotype_wait= 秒たったら打つ文字列。/type と同じエスケープ)
+    int autotypeWait = 10;      // autotype_wait= (秒)
+    int profileWait = 5;        // profile_wait= (ベアメタル版だけ。起動の組み合わせのメニューで待つ秒数。0 ならメニューを出さない)
 
     // cpu と clock の組み合わせから、実際に使うクロック (MHz) を決める。組み合わせが合わなければ (68060 で clock=16 など)
     // その CPU の既定 (68000 は 16、68060 は 50) にする。68030 はいつも 25
@@ -85,6 +105,7 @@ struct Settings {
     void toConfig(x68k::Config& c) const {
         c.setCpu(cpu);
         c.setClockMHz(effectiveClockMHz());
+        c.setBusSyncSprite(busSyncSprite != 0);
         c.ramSize = (uint32_t)ramMB << 20;
         c.highMemSize = (uint32_t)highMemMB << 20;
         c.localMemSize = (uint32_t)(localMemMB >= 0 ? localMemMB : (cpu == 68060 ? 128 : 0)) << 20;
@@ -95,7 +116,8 @@ struct Settings {
 };
 
 struct SettingKey {
-    enum Kind : uint8_t { PATH, INT, ONOFF, CHOICE };
+    // FLAGS は choices の名前を , で並べて書き、choiceValues のビットを重ねた数にする (「none」か空なら 0)
+    enum Kind : uint8_t { PATH, INT, ONOFF, CHOICE, FLAGS };
     const char* key;
     Kind kind;
     size_t offset; // Settings の中の位置 (PATH は char[PATH_SIZE]、ほかは int)
@@ -105,6 +127,7 @@ struct SettingKey {
     const int* choiceValues;    // CHOICE の文字列に対応する値
     bool restart;  // 変えたら電源を入れ直す (エミュレータを作り直す) まで反映されない
     bool host;     // ホスト版でも使う (false ならホスト版は黙って無視する)
+    int exclusive = 0; // FLAGS で、どれか 1 つだけを使うビット (2 つ以上書いたら、あとに書いたものを使う)
 };
 
 namespace settings_detail {
@@ -116,8 +139,8 @@ static const char* const kKeyboardChoices[] = {"auto", "usb", "pi400us", "pi400j
 static const int kKeyboardValues[] = {0, 1, 2, 3, 2};
 static const char* const kSramChoices[] = {"fix", "keep", nullptr};
 static const int kSramValues[] = {1, 0};
-static const char* const kScaleChoices[] = {"auto", "off", nullptr};
-static const int kScaleValues[] = {1, 0};
+static const char* const kVideoScaleChoices[] = {"off", "integer", "aspect", "full", nullptr};
+static const int kVideoScaleValues[] = {VIDEO_SCALE_OFF, VIDEO_SCALE_INTEGER, VIDEO_SCALE_ASPECT, VIDEO_SCALE_FULL};
 static const char* const kOsdChoices[] = {"off", "on", "fps", nullptr};
 static const int kOsdValues[] = {0, 2, 1};
 // fpu_board= は on / off のほか、2 で 2 枚目のボード ($E9E080) もつなぐ。1 と 0 も受け付ける (書くときは on / off)
@@ -146,6 +169,7 @@ static const SettingKey kSettingKeys[] = {
     {"max_speed",    SettingKey::ONOFF,  PIX68K_OFF(maxSpeed),        0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"speed060",     SettingKey::INT,    PIX68K_OFF(speed060),        5, 3200, nullptr, nullptr, nullptr,                                                         true,  true},
     {"max_speed_limit", SettingKey::INT, PIX68K_OFF(maxSpeedLimit),   0, 3200, nullptr, nullptr, nullptr,                                                         true,  true},
+    {"bus_sync_sprite", SettingKey::ONOFF, PIX68K_OFF(busSyncSprite), 0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"render_core",  SettingKey::ONOFF,  PIX68K_OFF(renderCore),      0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"sound_core",   SettingKey::ONOFF,  PIX68K_OFF(soundCore),       0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"sram_memsize", SettingKey::CHOICE, PIX68K_OFF(fixSramMemsize),  0, 0,   nullptr, settings_detail::kSramChoices, settings_detail::kSramValues,               true,  true},
@@ -187,9 +211,12 @@ static const SettingKey kSettingKeys[] = {
     {"net_allow",    SettingKey::PATH,   PIX68K_OFF(netAllow),        0, 0,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"net_token",    SettingKey::PATH,   PIX68K_OFF(netToken),        0, 0,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"syslog",       SettingKey::PATH,   PIX68K_OFF(syslog),          0, 0,   nullptr, nullptr, nullptr,                                                          true,  false},
-    {"scale",        SettingKey::CHOICE, PIX68K_OFF(scale),           0, 0,   nullptr, settings_detail::kScaleChoices, settings_detail::kScaleValues,             false, false},
-    {"scanline",     SettingKey::ONOFF,  PIX68K_OFF(scanline),        0, 1,   nullptr, nullptr, nullptr,                                                          false, false},
+    {"video_filter", SettingKey::FLAGS,  PIX68K_OFF(videoFilter),     0, 0,   nullptr, kVideoFilterNames, kVideoFilterBits, false, true, kVideoFilterExclusive},
+    {"video_scale",  SettingKey::CHOICE, PIX68K_OFF(videoScale),      0, 0,   nullptr, settings_detail::kVideoScaleChoices, settings_detail::kVideoScaleValues,   false, true},
     {"osd",          SettingKey::CHOICE, PIX68K_OFF(osd),             0, 0,   nullptr, settings_detail::kOsdChoices,   settings_detail::kOsdValues,               false, true},
+    {"autotype",     SettingKey::PATH,   PIX68K_OFF(autotype),        0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
+    {"autotype_wait", SettingKey::INT,   PIX68K_OFF(autotypeWait),    0, 600, nullptr, nullptr, nullptr,                                                          true,  true},
+    {"profile_wait", SettingKey::INT,    PIX68K_OFF(profileWait),     0, 60,  nullptr, nullptr, nullptr,                                                          true,  false},
 };
 // clang-format on
 #undef PIX68K_OFF
@@ -354,9 +381,45 @@ inline Rs232cLink parseRs232c(const char* s, unsigned& port, char* addr, size_t 
     return Rs232cLink::TCP;
 }
 
-// 値を読んで Settings に入れる
-enum class SettingResult { OK, UNKNOWN_KEY, BAD_VALUE };
+// 前の書き方のキー (公開版 v0.1.0 の scale= と scanline=。#241 で video_scale= と video_filter= にした)。読むときは
+// applySetting() が生の値を持ち、読み終えたら resolveLegacySettings() が読み替える。保存するときは
+// platform/settings_file.h の migrateLegacySettings() が行を書き直す。
+// 公開版に出ていない crt= (#229) は読み替えず、REMOVED を返して無視する (行はそのまま残す)
+inline bool isLegacySettingKey(const char* key) { return strcmp(key, "scale") == 0 || strcmp(key, "scanline") == 0; }
+
+// 値を読んで Settings に入れる。LEGACY は前の書き方 (isLegacySettingKey()) で、読み替える。REMOVED は使えなくなった
+// キー (crt=) で、無視した。IGNORED_NAME は名前を並べる値 (video_filter=) に知らない名前があり、それを飛ばして入れた
+// (どれも知らせる。platform/setting_warning.h)。EXCLUSIVE_NAME は、どれか 1 つだけを使う名前 (video_filter= の枠) を
+// 2 つ以上書いたので、あとのものを使った
+enum class SettingResult { OK, UNKNOWN_KEY, BAD_VALUE, LEGACY, IGNORED_NAME, REMOVED, EXCLUSIVE_NAME };
+inline SettingResult applyKnownSetting(Settings& s, const char* key, const char* value);
 inline SettingResult applySetting(Settings& s, const char* key, const char* value) {
+    // 前の書き方は、生の値を持っておき、読み終えたら resolveLegacySettings() が v0.1.0 の決まりで読み替える
+    s.lineSeq++;
+    if (strcmp(key, "scale") == 0 || strcmp(key, "scanline") == 0) {
+        // ホスト版は v0.1.0 と同じく読まない (値を見る前に飛ばすので、scale=typo も知らせない)
+        if (!s.legacyVideo) return SettingResult::OK;
+        const bool isScale = strcmp(key, "scale") == 0;
+        int v;
+        if (strcmp(value, isScale ? "auto" : "on") == 0) v = 1;
+        else if (strcmp(value, "off") == 0) v = 0;
+        else return SettingResult::BAD_VALUE;
+        (isScale ? s.legacyScale : s.legacyScanline) = v;
+        (isScale ? s.legacyScaleSeq : s.legacyFilterSeq) = s.lineSeq;
+        return SettingResult::LEGACY;
+    }
+    if (strcmp(key, "crt") == 0) return SettingResult::REMOVED;
+    const SettingResult r = applyKnownSetting(s, key, value);
+    // video_filter= / video_scale= は、受け付けた値の行だけ順番を数える (video_scale=typo で、前の scale=off を消さない)
+    if (r == SettingResult::OK || r == SettingResult::IGNORED_NAME || r == SettingResult::EXCLUSIVE_NAME) {
+        if (strcmp(key, "video_filter") == 0) s.videoFilterSeq = s.lineSeq;
+        if (strcmp(key, "video_scale") == 0) s.videoScaleSeq = s.lineSeq;
+    }
+    return r;
+}
+
+// applySetting() の、kSettingKeys にあるキーを読むところ
+inline SettingResult applyKnownSetting(Settings& s, const char* key, const char* value) {
     const SettingKey* k = findSettingKey(key);
     if (k == nullptr) return SettingResult::UNKNOWN_KEY;
     switch (k->kind) {
@@ -390,11 +453,58 @@ inline SettingResult applySetting(Settings& s, const char* key, const char* valu
                 return SettingResult::OK;
             }
         return SettingResult::BAD_VALUE;
+    case SettingKey::FLAGS: {
+        // 「scanline,curve」のように , で並べる (前後の空白と、空の項目は無視する)。「none」は何も足さない (空なら 0)。
+        // 知らない名前は飛ばして、知っている名前だけを使い、IGNORED_NAME を返す (ログで知らせる。後の版で増える名前を
+        // 書いたファイルを、前の版で読んでも止めないため)。名前を増やすときは choices と choiceValues に足す
+        int bits = 0;
+        bool unknown = false, twice = false;
+        const char* p = value;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            const char* e = p;
+            while (*e && *e != ',') e++;
+            const char* t = e;
+            while (t > p && (t[-1] == ' ' || t[-1] == '\t')) t--;
+            const size_t n = (size_t)(t - p);
+            if (n > 0 && !(n == 4 && memcmp(p, "none", 4) == 0)) {
+                int i = 0;
+                while (k->choices[i] && !(strlen(k->choices[i]) == n && memcmp(k->choices[i], p, n) == 0)) i++;
+                if (k->choices[i]) {
+                    const int b = k->choiceValues[i];
+                    if (b & k->exclusive) {
+                        // どれか 1 つだけ: 前に書いたものを外す (同じ名前を 2 回書いたのは知らせない)
+                        if ((bits & k->exclusive & ~b) != 0) twice = true;
+                        bits &= ~k->exclusive;
+                    }
+                    bits |= b;
+                } else {
+                    unknown = true;
+                }
+            }
+            p = *e ? e + 1 : e;
+        }
+        *settingInt(s, *k) = bits;
+        return unknown ? SettingResult::IGNORED_NAME : twice ? SettingResult::EXCLUSIVE_NAME : SettingResult::OK;
+    }
     }
     return SettingResult::BAD_VALUE;
 }
 
 // Settings の値を pix68k.cfg に書く形にする。書く値がなければ (local_mem が -1 など) false
+// 公開版 v0.1.0 の scale= と scanline= を、v0.1.0 と同じ見た目になるように video_scale と video_filter に読み替える
+// (読み終えたあとに呼ぶ。起動の組み合わせなら、pix68k.cfg と重ねて読んだあと)。v0.1.0 のベアメタル版の決まり:
+//   scale=off は 1 倍 (off)、auto は整数倍 (integer)。scanline=on はスキャンライン (縦 2 倍以上のとき各行の最後を暗くする)
+// scale= の行より video_scale= の行があと (重ねて読んだときは組み合わせのファイルの行があと) なら video_scale= が勝つ。
+// scanline= と video_filter= も同じ。ホスト版 (legacyVideo が 0) は v0.1.0 と同じく何もしない
+inline void resolveLegacySettings(Settings& s) {
+    if (!s.legacyVideo) return;
+    if (s.legacyScanline >= 0 && s.legacyFilterSeq > s.videoFilterSeq)
+        s.videoFilter = s.legacyScanline ? (int)CRT_SCANLINE : (int)CRT_OFF;
+    if (s.legacyScale >= 0 && s.legacyScaleSeq > s.videoScaleSeq)
+        s.videoScale = s.legacyScale ? (int)VIDEO_SCALE_INTEGER : (int)VIDEO_SCALE_OFF;
+}
+
 inline bool formatSetting(const Settings& s, const SettingKey& k, char* out, size_t size) {
     switch (k.kind) {
     case SettingKey::PATH:
@@ -417,6 +527,23 @@ inline bool formatSetting(const Settings& s, const SettingKey& k, char* out, siz
                 return true;
             }
         return false;
+    }
+    case SettingKey::FLAGS: {
+        // choices の順に , でつなぐ。どれもなければ「none」
+        const int v = *settingInt(s, k);
+        size_t n = 0;
+        if (size == 0) return false;
+        out[0] = 0;
+        for (int i = 0; k.choices[i]; i++) {
+            if ((v & k.choiceValues[i]) == 0) continue;
+            const size_t len = strlen(k.choices[i]);
+            if (n + (n ? 1 : 0) + len + 1 > size) return false;
+            if (n) out[n++] = ',';
+            memcpy(out + n, k.choices[i], len + 1);
+            n += len;
+        }
+        if (n == 0) copyString(out, size, "none");
+        return true;
     }
     }
     return false;

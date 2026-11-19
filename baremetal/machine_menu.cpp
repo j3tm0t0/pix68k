@@ -128,7 +128,8 @@ void CKernel::OpenMenu() {
 void CKernel::CloseMenu() {
     m_Logger.Write(FromMenu, LogNotice, "closed%s%s%s", m_Menu.status()[0] ? " (" : "", m_Menu.status(),
                    m_Menu.status()[0] ? ")" : "");
-    if (m_Menu.restartRequested()) {
+    // 断った POST /reboot?profile= が残っていて前回の選択に戻せなければ、再起動せずに閉じる (X68000 を動かし直す)
+    if (m_Menu.restartRequested() && CancelProfileChoiceForRestart("menu Restart")) {
         // pix68k.cfg は書いてあり、ディスクも書き戻してある (restart())。SRAM を書いてから再起動する
         // (主ループが ShutdownReboot を返す)
         if (m_pEmulator->machine().sramDirty() || m_pEmulator->pendingSram() != nullptr)
@@ -139,7 +140,8 @@ void CKernel::CloseMenu() {
     }
     // メニューを消す (X68000 の画面の外にも描いたので、全体を描き直す)
     m_ShownWidth = -1;
-    if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame);
+    // X68000 が止まっていれば次のフレームは来ないので、効果の表は最後まで作る (ShowFrame())
+    if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame, m_pEmulator->paused());
     EnterCritical();
     m_MenuKeys.closed(m_LastMods);
     m_MenuKeyHead = m_MenuKeyTail = 0;
@@ -161,10 +163,14 @@ void CKernel::CloseMenu() {
 void CKernel::DrawMenu() {
     CBcmFrameBuffer* fb = m_Screen.GetFrameBuffer();
     if (fb == nullptr || fb->GetDepth() != 32) return;
-    if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame);
+    // X68000 が止まっていれば次のフレームは来ないので、効果の表は最後まで作る (ShowFrame())
+    if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame, m_pEmulator->paused());
     u32* base = (u32*)(uintptr)fb->GetBuffer();
     // メニューの枠は X68000 の画面の外にもはみ出すので、前に描いた枠が残らないよう外側も塗り直す
-    if (m_pLastFrame != nullptr)
+    // 枠を写しているときは、枠の外を枠の絵にする (platform/bezel.h)
+    if (m_pLastFrame != nullptr && m_BezelShown != 0)
+        platform::drawBezelOutside((u8*)base, fb->GetPitch(), m_Bezel[m_BezelShown - 1]);
+    else if (m_pLastFrame != nullptr)
         platform::fillOutside((u8*)base, fb->GetPitch(), (int)m_Screen.GetWidth(), (int)m_Screen.GetHeight(),
                               m_ShownScale, 0xff000000u);
     m_OsdState.invalidate(); // 画面の隅の数字も消えた (閉じたあとに描き直す)

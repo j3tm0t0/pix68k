@@ -493,8 +493,32 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
     } else if (strcmp(p, "/screen.ppm") == 0 && (m == M::GET || m == M::HEAD)) {
         GetScreen(m == M::HEAD);
     } else if (strcmp(p, "/reboot") == 0 && m == M::POST) {
-        SendText(202, "rebooting\n");
-        m_Env.netRequestReboot();
+        // ?profile=名前 なら、次の起動をその組み合わせ (pix68k-<名前>.cfg) にする (platform/boot_profile.h)
+        char profile[64];
+        const bool hasProfile = platform::queryHas(m_Req.query, "profile");
+        platform::ProfileRequest pr = platform::ProfileRequest::OK;
+        // 頼まれた組み合わせは、ここで profile.sel に書く。書けなければ再起動しない
+        m_Env.netBeginHeavy();
+        if (hasProfile)
+            pr = platform::queryValue(m_Req.query, "profile", profile, sizeof profile) ? m_Env.netBootProfile(profile)
+                                                                                     : platform::ProfileRequest::BAD_NAME;
+        else
+            pr = m_Env.netBootProfile(nullptr); // 前に頼まれて、書き戻せずに断った組み合わせを忘れる
+        m_Env.netEndHeavy();
+        switch (pr) {
+        case platform::ProfileRequest::OK:
+            SendText(202, "rebooting\n");
+            m_Env.netRequestReboot();
+            break;
+        case platform::ProfileRequest::BAD_NAME:
+            SendText(400, "profile= is a name of letters, digits, - and _ (pix68k-<name>.cfg), or empty for pix68k.cfg\n");
+            break;
+        case platform::ProfileRequest::NOT_FOUND: SendText(404, "no such profile (pix68k-<name>.cfg in /pix68k)\n"); break;
+        case platform::ProfileRequest::NO_DRIVE: SendText(503, "no boot drive\n"); break;
+        case platform::ProfileRequest::WRITE_FAILED:
+            SendText(500, "cannot write /pix68k/profile.sel; not rebooting\n");
+            break;
+        }
     } else if (strcmp(p, "/type") == 0 && m == M::POST) {
         Type();
     } else if (strcmp(p, "/key") == 0 && m == M::POST) {
@@ -511,6 +535,7 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
                       "GET  /thermal         temperature, ARM clock, throttling and the fan (Pi 5)\n"
                       "GET  /screen.ppm      the X68000 screen\n"
                       "POST /reboot          write back disks and SRAM, then reboot\n"
+                      "POST /reboot?profile=NAME   reboot with /pix68k/pix68k-NAME.cfg (empty: pix68k.cfg only)\n"
                       "POST /type            type the body as X68000 keys (\\n is Enter)\n"
                       "POST /key?down=XX&mod=YY, /key?up=XX, /key?up   hold / release USB keys\n"
                       "POST /message?sec=N   show the body (UTF-8) at the top left for N s (10; 0 = until cleared);\n"
@@ -1175,6 +1200,17 @@ void CHostNet::CheckRunning() {
     }
     m_pHttp = new CHttpTask(m_pNet, m_Logger, m_Env, m_Allow, m_Token, m_Name, m_pSysLog);
     if (m_pSerialLink != nullptr) m_pSerial = new CSerialTask(m_pNet, m_Logger, m_pSerialLink, m_SerialPort, m_Allow);
+}
+
+u32 CHostNet::IPv4() const {
+    // m_bRunning は一度つながったら戻らないので、リンクが切れたときやアドレスが変わったときのために毎回見る
+    // (IsRunning() はリンクと DHCP の状態を見るだけ。Pi 5 の MACB は PHY を読む)
+    if (m_pNet == nullptr || !m_pNet->IsRunning()) return 0;
+    const CIPAddress* ip = m_pNet->GetConfig()->GetIPAddress();
+    if (ip == nullptr || ip->IsNull()) return 0;
+    u8 a[4];
+    ip->CopyTo(a);
+    return (u32)a[0] << 24 | (u32)a[1] << 16 | (u32)a[2] << 8 | a[3];
 }
 
 void CHostNet::Service(unsigned waitUs) {

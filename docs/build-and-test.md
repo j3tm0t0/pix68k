@@ -18,6 +18,9 @@ cmake --build build -j
 
 ホスト版には SDL2 が要る (`brew install sdl2`)。見つからなければホスト版だけビルドしない。
 
+Release のビルドは `-fomit-frame-pointer` を付ける (#224。aarch64 の GCC で命令数が 1% ほど減る)。`perf record -g` などでフレームポインタを
+たどって呼び出し元を見たいときは、`cmake -S . -B build -DPIX68K_FRAME_POINTER=ON` でビルドする。
+
 Linux (Ubuntu 26.04 の GCC 15 で確かめている) では、次のパッケージを入れると同じ手順でビルドできる。
 
 ```sh
@@ -35,6 +38,8 @@ IPL ROM、CGROM、ディスクのイメージは置いていないので、そ�
 
 音 (OPM の FM 音源と ADPCM) はホスト版では SDL2 で 48kHz で出す。`--no-audio` で出さない。`--wav out.wav` で、出す代わりに WAV に書く
 (`--no-wait` と組み合わせられる)。`x68k_boot` も `--wav` で WAV を書ける。
+SDL2 で出すときは、ホストの処理が実時間に間に合わない間、ベアメタル版と同じく音を途切れさせずに遅く鳴らす (OPM と ADPCM は
+低く鳴り、MIDI の音源は音の高さが変わらない。[baremetal.md](baremetal.md) の音の説明を参照)。WAV に書くときは、この調整をしない。
 RTC の時刻は、既定ではホストの今の時刻から始まる。ゲームによっては RTC の値で動きが変わる (悪魔城ドラキュラは、起動した
 時刻の秒によって約 10 秒からの音が変わる) ので、WAV や画面を前の版と比べるときは、`pix68k` も `x68k_boot` も
 `--time 秒数` で時刻を決めておく。秒数は地方時の 1970-01-01 00:00:00 からの秒数として、時間帯を見ずにそのまま RTC に
