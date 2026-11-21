@@ -437,9 +437,8 @@ bool Renderer::buildSpriteLine(int y, int w) {
     uint8_t* const dst = spriteLine_ + MARGIN;
     memset(dst - MARGIN, 0, (size_t)sw + 2 * MARGIN);
 
-    // このラインに掛かるスプライトを、番号の小さい順に 32 個まで。BG との重なりの順 (1..3) ごとに分ける
-    uint8_t list[3][32];
-    int count[3] = {0, 0, 0};
+    // このラインに掛かるスプライトを、番号の小さい順に 32 個まで
+    uint8_t list[128]; // 制限があるときは 32 個まで
     int total = 0;
     for (int n = 0; n < 128; ++n) {
         const uint8_t* s = mem + n * 8;
@@ -448,25 +447,49 @@ bool Renderer::buildSpriteLine(int y, int w) {
         int row = line + 16 - (int)(be16(s + 2) & 1023);
         if (row < 0 || row > 15) continue; // このラインに掛からない
         if (total == 32) break;
-        total++;
-        list[prw - 1][count[prw - 1]++] = (uint8_t)n;
+        list[total++] = (uint8_t)n;
     }
 
+    // スプライトどうしは、優先度 (第 4 ワード) によらず、番号の小さいスプライトの不透明なドットが勝つ。優先度は、勝ったドットが
+    // BG の前か後ろかを決めるだけ (スプライトのドットを選んでから BG と重ねる)。番号の小さい順に、すでに不透明なドットがある所を
+    // 除いて見えるドットを決め (occ)、そのあと BG との重なりの順 (1..3) ごとに描く
     const uint8_t* pcg = mem + 0x8000;
-    auto drawSprites = [&](int group) {
-        // 番号の大きいものから書いて、小さいものを上にする
-        for (int k = count[group] - 1; k >= 0; k--) {
-            const uint8_t* s = mem + list[group][k] * 8;
-            int x = (int)(be16(s) & 1023) - 16 + right;
-            if (x <= -16 || x >= sw) continue;
-            unsigned attr = be16(s + 4);
-            int row = line + 16 - (int)(be16(s + 2) & 1023);
-            if (attr & 0x8000) row = 15 - row;
-            uint64_t left, rightDots;
-            pattern16(pcg, attr & 0xff, row, (attr & 0x4000) != 0, left, rightDots);
-            unsigned block = (attr >> 8) & 15;
-            putPattern(dst + x, left, block);
-            putPattern(dst + x + 8, rightDots, block);
+    uint8_t occ[MAX_WIDTH + 2 * MARGIN];
+    if (total) memset(occ, 0, (size_t)sw + 2 * MARGIN);
+    struct Visible {
+        int x;
+        uint64_t left, right;
+        unsigned block;
+        unsigned group; // 0..2 (優先度 1..3)
+    } vis[128];
+    int visCount = 0;
+    for (int k = 0; k < total; k++) {
+        const uint8_t* s = mem + list[k] * 8;
+        int x = (int)(be16(s) & 1023) - 16 + right;
+        if (x <= -16 || x >= sw) continue;
+        unsigned attr = be16(s + 4);
+        int row = line + 16 - (int)(be16(s + 2) & 1023);
+        if (attr & 0x8000) row = 15 - row;
+        uint64_t left, rightDots;
+        pattern16(pcg, attr & 0xff, row, (attr & 0x4000) != 0, left, rightDots);
+        uint8_t* o = occ + MARGIN + x;
+        const uint64_t occLeft = load64(o), occRight = load64(o + 8);
+        Visible& v = vis[visCount++];
+        v.x = x;
+        v.left = left & ~occLeft;
+        v.right = rightDots & ~occRight;
+        v.block = (attr >> 8) & 15;
+        v.group = (s[7] & 3) - 1;
+        // 0 でないドットのバイトを 0xff にして、占めたことにする
+        store64(o, occLeft | (((left + 0x0f0f0f0f0f0f0f0full) >> 4) & kOnes) * 0xff);
+        store64(o + 8, occRight | (((rightDots + 0x0f0f0f0f0f0f0f0full) >> 4) & kOnes) * 0xff);
+    }
+    auto drawSprites = [&](unsigned group) {
+        for (int k = 0; k < visCount; k++) {
+            const Visible& v = vis[k];
+            if (v.group != group) continue;
+            putPattern(dst + v.x, v.left, v.block);
+            putPattern(dst + v.x + 8, v.right, v.block);
         }
     };
     auto drawBg = [&](int n) {
