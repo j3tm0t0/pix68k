@@ -209,14 +209,15 @@ void testSelect() {
     r.init();
     CHECK_EQ(r.s.read(Spc::PSNS), 0);
 
-    // 相手がいない: Time Out。SEL を出したままになる。待つ間に転送カウンタは 0 まで減る
+    // 相手がいない: Time Out。SEL を出したままになる。待つ間に転送カウンタは 0 まで減る。
+    // SEL を出している間は、SSTS の INIT が 1 (ディスクの SCSI のドライバは、これで打ち切るかやり直すかを決める)
     r.s.write(Spc::PCTL, 0);
     r.s.write(Spc::TEMP, 0x80 | 1 << 5);
     r.tc(0x0f0003);
     r.s.write(Spc::SCMD, Spc::CMD_SELECT);
     CHECK_EQ(r.s.read(Spc::INTS), Spc::INTS_TIMEOUT);
     CHECK_EQ(r.s.read(Spc::PSNS), Spc::PSNS_SEL);
-    CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, 0);
+    CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, Spc::SSTS_INIT);
     CHECK_EQ(r.tc(), 0);
     // TEMP に $00 を書いて ID を下げ、転送カウンタに短い時間を入れて Time Out を消すと、その時間だけ待って
     // もう一度 Time Out になる (IPL ROM のドライバの手順)。転送カウンタが 0 のときに消すと、SEL を戻して終わる
@@ -230,12 +231,13 @@ void testSelect() {
     r.s.write(Spc::INTS, Spc::INTS_TIMEOUT);
     CHECK_EQ(r.s.read(Spc::INTS), 0);
     CHECK_EQ(r.s.read(Spc::PSNS), 0);
+    CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, 0);
     // 待つ時間 (TCH / TCM) が 0 なら無限大: 割り込みは出ず、Select を持ったまま。Bus Release で取り消す
     r.s.write(Spc::TEMP, 0x80 | 1 << 5);
     r.tc(0x000003);
     r.s.write(Spc::SCMD, Spc::CMD_SELECT);
     CHECK_EQ(r.s.read(Spc::INTS), 0);
-    CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, Spc::SSTS_BUSY);
+    CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, Spc::SSTS_INIT | Spc::SSTS_BUSY);
     r.s.write(Spc::SCMD, Spc::CMD_BUS_RELEASE);
     CHECK_EQ(r.s.read(Spc::SSTS) & 0xf0, 0);
     CHECK_EQ(r.s.read(Spc::PSNS), 0);
