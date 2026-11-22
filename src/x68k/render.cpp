@@ -101,6 +101,10 @@
 //     行わない。bit14 の半透明は bit10 によらず行う。
 //   - 65536 色では、ワードの最下位ビットを 0 にして色を引く。
 //   - テキストの横のスクロールで実画面からはみ出した分は、反対側をつなげて出す (本では「表示がおかしくなる」)。
+//   - コントラスト (システムポート $E8E001、0..15) は、合成したドットの R、G、B にそれぞれ コントラスト / 15 を掛ける
+//     (15 で今の色、0 で黒。直線にしたのは決めたことで、実機のモニタの明るさを測った資料はない)。ラインを描くときの値を
+//     使うので、フレームの途中で変えるとそのラインから変わる。IOCS の _CONTRAST でフェードインするソフト
+//     (電脳倶楽部パーフェクトコレクションのメニューなど) は、コントラスト 0 の間に VRAM を書き換えて見せない。
 //
 // 速さのための作り: 1 ラインごとに、各画面を色コードの並び (1 ドット 1 バイト) にしてから重ね、最後にパレットを引く。
 // 色コードの並びは 8 ドットずつ 64 ビットの値として扱う (リトルエンディアンの CPU を前提にしている)。
@@ -829,8 +833,36 @@ void Renderer::renderLine(int y) {
     if (!surface_.pixels || y < 0 || y >= smaller(height_, surface_.rows)) return;
     const int w = smaller(width_, surface_.columns);
     if (w <= 0) return;
-    if (indexedSink_) indexedSink_->beginLine(y, w);
+    IndexedLineSink* const sink = indexedSink_;
+    if (sink) sink->beginLine(y, w);
     uint32_t* out = surface_.pixels + (size_t)y * (size_t)surface_.pitch;
+    // コントラストを掛けるラインは色コードのまま渡さずにここで描く (渡すとコントラストが掛からない)
+    if (video_.contrast() < 15) indexedSink_ = nullptr;
+    composeLine(y, w, out);
+    indexedSink_ = sink;
+    applyContrast(w, out);
+}
+
+// コントラストが 15 より小さければ、ラインの各ドットの R、G、B に コントラスト / 15 を掛ける (先頭の決めたこと)
+void Renderer::applyContrast(int w, uint32_t* out) {
+    const unsigned c = video_.contrast();
+    if (c >= 15) return;
+    if (c != contrastSeen_) {
+        for (unsigned i = 0; i < 256; i++) contrastLevel_[i] = (uint8_t)((i * c + 7) / 15);
+        contrastSeen_ = c;
+    }
+    if (c == 0) {
+        for (int x = 0; x < w; x++) out[x] = 0;
+        return;
+    }
+    const uint8_t* lv = contrastLevel_;
+    for (int x = 0; x < w; x++) {
+        const uint32_t p = out[x];
+        out[x] = (uint32_t)lv[(p >> 16) & 0xff] << 16 | (uint32_t)lv[(p >> 8) & 0xff] << 8 | lv[p & 0xff];
+    }
+}
+
+void Renderer::composeLine(int y, int w, uint32_t* out) {
     const uint16_t r0 = video_.videoControl(0), r1 = video_.videoControl(1), r2 = video_.videoControl(2);
     const uint32_t* xrgb = video_.paletteXrgb();
     const uint32_t* const tlut = xrgb + 256;

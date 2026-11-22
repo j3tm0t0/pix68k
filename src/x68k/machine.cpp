@@ -595,6 +595,7 @@ bool Machine::setScsiExRom(const uint8_t* data, size_t size) {
 void Machine::resetDevices() {
     mfp_.reset();
     sysPort_.reset();
+    video_->setContrast(sysPort_.contrast());
     ioc_.reset();
     fdc_.reset();
     sound_.reset();
@@ -1598,7 +1599,10 @@ bool Machine::ioWrite(uint32_t addr, uint8_t v) {
         if (odd) rtc_.write((int)((off & 0x1f) >> 1), v);
         return true;
     case 6: return true; // プリンタ
-    case 7: sysPort_.write(off, v); return true;
+    case 7:
+        sysPort_.write(off, v);
+        if ((off & 0x0f) == 0x1) video_->setContrast(sysPort_.contrast()); // 画面の明るさ (render.cpp)
+        return true;
     case 8:
         syncDevices(); // 書く前の時間の分だけ、前の設定で音を作る
         sound_.opmWrite(off, v);

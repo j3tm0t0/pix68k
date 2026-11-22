@@ -20,6 +20,8 @@ public:
     bool sramWritable() const { return sramWrite_ == 0x31; }
     // $E8E007 の bit1 (HRL): 高解像度の 256/512 ドットのドットクロックを変える
     bool hrl() const { return (keyctrl_ & 0x02) != 0; }
+    // $E8E001 のコントラスト (0..15)
+    uint8_t contrast() const { return contrast_; }
     // $E8E00B が返す値: 0xFF = 68000 10MHz、0xFE = 68000 16MHz (XVI)、0xDC = 68030 25MHz
     uint8_t cpuInfo = 0xfe;
 

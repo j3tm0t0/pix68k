@@ -62,6 +62,8 @@ private:
     static constexpr int LINE_SIZE = MAX_WIDTH + 2 * MARGIN;
 
     void syncGeometry();
+    void composeLine(int y, int w, uint32_t* out); // ライン y を合成して out (w ドット) に書く
+    void applyContrast(int w, uint32_t* out);      // コントラストを掛ける (render.cpp の先頭)
     void buildColorSplitTables();
     bool buildSpriteLine(int y, int w);
     int buildGraphicLine(int y, int w, uint16_t r0, uint16_t r1, uint16_t r2, bool split);
@@ -115,6 +117,9 @@ private:
     uint32_t textPairsSeen_[16];
     bool textPairsValid_ = false;
     IndexedLineSink* indexedSink_ = nullptr;
+    // コントラストを掛けた 8 ビットの値 (contrastSeen_ のコントラストで作ったもの)
+    uint8_t contrastLevel_[256] = {};
+    unsigned contrastSeen_ = 16;
 };
 
 } // namespace x68k

@@ -1314,6 +1314,8 @@ void Machine::state(StateIO& s) {
     }
     // CPU が直接読み書きするページを、読んだ状態 (エリアセットなど) で決め直す。68030 / 68060 の TLB も空になる
     if (s.applying()) updateFastPages();
+    // コントラストは SysPort だけに書く。Video には読んだ値を入れる
+    if (s.applying()) video_->setContrast(sysPort_.contrast());
 #ifndef PIX68K_NO_CPU020
     // 68060 の MMU が有効な間の TLB と ATC (版 9 から。版 8 までは空から始める)。fast page を決め直したあとに読む
     if (cpu020_ && s.version() >= 9) cpu020_->stateTlb(s);

@@ -90,6 +90,7 @@ struct Screen {
     // 512x512 (31kHz)、画面はすべて OFF、パレット 0 は両方とも $0000
     void init() {
         v.reset();
+        v.setContrast(15); // Video のリセットはコントラストを変えない
         r.setTarget(px, Renderer::MAX_WIDTH, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
         crtc(0, 0x5b);
         crtc(2, 0x11);
@@ -1535,6 +1536,96 @@ void testIndexedCapture() {
     for (auto line : frame.supported) CHECK_EQ(line, 0);
 }
 
+// ---- コントラスト ----
+//
+// 合成したドットの R、G、B に コントラスト / 15 を掛ける (15 でそのまま、0 で黒)。ラインを描くときの値を使う。
+// 記録を通して描いても同じになる
+
+void testContrast() {
+    printf("contrast scales each channel by contrast / 15\n");
+    S.init();
+    S.crtc(20, 0x0315); // 65536 色
+    S.vc(0, 3);
+    S.vc(2, 0x002f); // テキストとグラフィック
+    for (int i = 0; i < 256; i++) S.palette(i, (uint16_t)(i * 0x0101 | 1));
+    for (int x = 0; x < 512; x++) S.gword(x, 3, (uint16_t)(x * 131 + 7));
+    S.tdot(5, 3, 2);
+    S.r.renderLine(3);
+    static uint32_t full[512];
+    memcpy(full, S.px + 3 * Renderer::MAX_WIDTH, sizeof full);
+    for (unsigned c : {15u, 14u, 7u, 1u, 0u}) {
+        S.v.setContrast((uint8_t)c);
+        CHECK_EQ(S.v.contrast(), c);
+        S.r.renderLine(3);
+        int wrong = 0;
+        for (int x = 0; x < 512; x++) {
+            const uint32_t p = full[x];
+            uint32_t want = 0;
+            for (int sh = 0; sh <= 16; sh += 8) want |= (((p >> sh) & 0xff) * c + 7) / 15 << sh;
+            wrong += S.px[3 * Renderer::MAX_WIDTH + x] != want;
+        }
+        CHECK_EQ(wrong, 0);
+    }
+    // 4 ビットより上は捨てる
+    S.v.setContrast(0x1f);
+    CHECK_EQ(S.v.contrast(), 15);
+    // テキストだけのライン (別の描き方) にも掛ける
+    S.vc(2, 0x0020);
+    S.tdot(9, 4, 3);
+    S.r.renderLine(4);
+    const uint32_t textFull = S.px[4 * Renderer::MAX_WIDTH + 9];
+    S.v.setContrast(0);
+    S.r.renderLine(4);
+    CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH + 9], 0u);
+    CHECK_EQ(textFull != 0u, true);
+    S.v.setContrast(15);
+
+    // 記録を通して、フレームの途中でコントラストを変える
+    static Screen source, shadow;
+    static uint32_t ring[1 << 10];
+    x68k::VideoJournal journal;
+    journal.init(ring, 10);
+    x68k::VideoReplayer replayer(journal, shadow.v, shadow.r);
+    source.init();
+    shadow.init();
+    shadow.r.setTarget(shadow.px, Renderer::MAX_WIDTH, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
+    source.v.setJournal(&journal);
+    source.vc(2, 0x0020);
+    for (int y = 0; y < 8; y++) source.tdot(9, y, 3);
+    for (int y = 0; y < 8; y++) {
+        source.v.setContrast(y < 4 ? 15 : 5);
+        journal.push(x68k::VideoJournal::make(x68k::VideoJournal::OP_RASTER, (uint32_t)y, 0));
+        journal.publish();
+        while (replayer.step()) {
+        }
+    }
+    source.v.setJournal(nullptr);
+    CHECK_EQ(shadow.v.contrast(), 5u);
+    const uint32_t bright = shadow.px[0 * Renderer::MAX_WIDTH + 9], dim = shadow.px[4 * Renderer::MAX_WIDTH + 9];
+    CHECK_EQ(bright, shadow.T(3));
+    uint32_t want = 0;
+    for (int sh = 0; sh <= 16; sh += 8) want |= (((bright >> sh) & 0xff) * 5 + 7) / 15 << sh;
+    CHECK_EQ(dim, want);
+
+    // 色コードを受け取る先 (libretro の GPU) があっても、コントラストを掛けるラインはここで描く
+    pix68k_retro::PalettedFrame frame;
+    frame.skipSoftware = true;
+    S.init();
+    S.vc(2, 0x0020);
+    S.tdot(9, 4, 3);
+    S.r.renderLine(4);
+    const uint32_t plain = S.px[4 * Renderer::MAX_WIDTH + 9];
+    S.r.setIndexedLineSink(&frame);
+    S.v.setContrast(5);
+    S.r.renderLine(4);
+    CHECK_EQ(frame.supported[4], 0);
+    uint32_t dimmed = 0;
+    for (int sh = 0; sh <= 16; sh += 8) dimmed |= (((plain >> sh) & 0xff) * 5 + 7) / 15 << sh;
+    CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH + 9], dimmed);
+    S.r.setIndexedLineSink(nullptr);
+    S.v.setContrast(15);
+}
+
 } // namespace
 
 int main() {
@@ -1563,5 +1654,6 @@ int main() {
     testRasterInterrupt(true);
     testJournalReplay();
     testJournalPaletteOutside();
+    testContrast();
     return finish();
 }

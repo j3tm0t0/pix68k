@@ -2,7 +2,7 @@
 //
 // しくみ:
 //   X68000 を動かすコア (書き手) は、Video の状態を変える操作 (VRAM、パレット、スプライト、CRTC への書き込み、
-//   ラスタコピー、垂直表示期間の始まりの処理 (高速クリア)、リセット) をすべて 32 ビットの記録にしてリングに入れる。画面の合成のラスタ (onRaster) と
+//   ラスタコピー、垂直表示期間の始まりの処理 (高速クリア)、リセット、コントラスト) をすべて 32 ビットの記録にしてリングに入れる。画面の合成のラスタ (onRaster) と
 //   フレームの終わり (onFrameEnd) も同じリングに入れる。
 //   合成するコア (読み手) は自分の Video の写し (shadow) を持ち、記録を順に同じ Video の関数で写しに当て、
 //   ラスタの記録が来たらそのラスタを写しから描く (VideoReplayer)。
@@ -33,7 +33,8 @@ public:
         OP_RASTER = 6,  // LineListener::onRaster(offset)
         OP_CONTROL = 7, // offset が CTL_*
     };
-    enum Control : uint32_t { CTL_RESET = 0, CTL_FRAME_END = 1, CTL_VDISP = 2 }; // CTL_VDISP: beginVerticalDisplay()
+    // CTL_VDISP: beginVerticalDisplay()。CTL_CONTRAST: setContrast(値)
+    enum Control : uint32_t { CTL_RESET = 0, CTL_FRAME_END = 1, CTL_VDISP = 2, CTL_CONTRAST = 3 };
     static constexpr unsigned BATCH = 256; // これだけたまったら、ラスタの区切りを待たずに読み手に見せる
 
     static uint32_t make(uint32_t op, uint32_t offset, uint32_t v) { return op << 29 | (offset & 0x1fffff) << 8 | (v & 0xff); }

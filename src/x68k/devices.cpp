@@ -5,7 +5,10 @@ namespace x68k {
 // ---------------------------------------------------------------- システムポート
 
 void SysPort::reset() {
-    contrast_ = tvctrl_ = imageUnit_ = sramWrite_ = power_ = 0;
+    tvctrl_ = imageUnit_ = sramWrite_ = power_ = 0;
+    // コントラストの電源投入時の値は資料がない。IPL ROM は起動の初めに SRAM の値を書く ($FF00A4 など) ので、
+    // その前に見えるものはない。IPL ROM を通らずに動かすとき (試験) に画面が黒くならないよう、最大 (15) にしておく
+    contrast_ = 15;
     keyctrl_ = 0x08; // bit3 = 1: キーボードがつながっている
 }
 

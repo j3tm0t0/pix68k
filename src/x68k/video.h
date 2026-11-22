@@ -110,6 +110,17 @@ public:
     const uint8_t* sprite() const { return sprite_; }
     uint32_t spriteRowsGeneration() const { return spriteRowsWrites_; }
 
+    // コントラスト (システムポート $E8E001 の bit3-0。0..15)。Renderer が、合成したラインの明るさに掛ける
+    // (render.cpp の先頭)。Video のリセットでは変えない (Machine が SysPort の値を入れる)。ステートにも書かない
+    // (Machine がステートを読んだあとに SysPort の値を入れる)。15 は今の色のまま
+    uint8_t contrast() const { return contrast_; }
+    void setContrast(uint8_t v) {
+        v &= 0x0f;
+        if (v == contrast_) return;
+        if (journal_) journal_->push(VideoJournal::make(VideoJournal::OP_CONTROL, VideoJournal::CTL_CONTRAST, v));
+        contrast_ = v;
+    }
+
     // ---- 表示タイミング ----
     // 1 ラスタの長さは「水平のドット数 (R00 + 1) x 8」/ ドットクロック。1 フレームは R04 + 1 ラスタ
     //
@@ -157,6 +168,7 @@ private:
     uint32_t crtcWrites_ = 0;
     uint32_t spriteRowsWrites_ = 0; // Derived renderer cache generation; not serialized.
     uint8_t operation_ = 0;
+    uint8_t contrast_ = 15;
     bool fastClearRequested_ = false; // 高速クリアを要求された (次の垂直表示期間の始まりで消す)
     int fastClearFields_ = 0;         // 消し始めてから終わるまでの、残りの垂直表示期間の数
     uint8_t tvram_[TVRAM_SIZE];
