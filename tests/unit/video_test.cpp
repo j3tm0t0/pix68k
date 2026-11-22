@@ -1607,21 +1607,43 @@ void testContrast() {
     for (int sh = 0; sh <= 16; sh += 8) want |= (((bright >> sh) & 0xff) * 5 + 7) / 15 << sh;
     CHECK_EQ(dim, want);
 
-    // 色コードを受け取る先 (libretro の GPU) があっても、コントラストを掛けるラインはここで描く
+    // 色コードを受け取る先 (libretro の GPU) には、コントラストを掛けたパレットを渡す。
+    // 受け取る先が描いたラインは、ここで描いたものと同じになる
     pix68k_retro::PalettedFrame frame;
     frame.skipSoftware = true;
     S.init();
-    S.vc(2, 0x0020);
-    S.tdot(9, 4, 3);
-    S.r.renderLine(4);
-    const uint32_t plain = S.px[4 * Renderer::MAX_WIDTH + 9];
-    S.r.setIndexedLineSink(&frame);
-    S.v.setContrast(5);
-    S.r.renderLine(4);
-    CHECK_EQ(frame.supported[4], 0);
-    uint32_t dimmed = 0;
-    for (int sh = 0; sh <= 16; sh += 8) dimmed |= (((plain >> sh) & 0xff) * 5 + 7) / 15 << sh;
-    CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH + 9], dimmed);
+    S.crtc(20, 0x0015); // 16 色
+    S.vc(0, 0);
+    S.palette(256, 0); // テキストの色コード 0 は透明
+    S.palette(256 + 3, 0x0001); // どのチャンネルも 4。コントラスト 1 で 0 になるが、透明にはしない
+    for (int i = 1; i < 16; i++) S.palette(i, 0xfffe); // 明るいグラフィック
+    S.pcg8(4, 0, 0x33550000); // テキストだけの描き方にならないよう、スプライトも出す (x = 4..)
+    S.sprite(0, 4, 4, 0x0401, 3);
+    for (int x = 0; x < 32; x++) {
+        S.tdot(x, 4, x % 4); // 色コード 3 は上の暗い色
+        S.gword(x, 4, (uint16_t)(x % 7));
+    }
+    unsigned captured = 0;
+    for (unsigned c : {15u, 14u, 7u, 1u, 0u}) for (int enable : {0x60, 0x6f}) {
+        S.v.setContrast((uint8_t)c);
+        S.vc(2, (uint16_t)enable);
+        S.r.setIndexedLineSink(nullptr);
+        S.r.renderLine(4);
+        uint32_t expected[512];
+        memcpy(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected);
+        if (c == 1 && enable == 0x6f) CHECK_EQ(expected[3], 0u); // 暗いテキストが手前にあり、グラフィックは見えない
+        std::fill(S.px + 4 * Renderer::MAX_WIDTH, S.px + 4 * Renderer::MAX_WIDTH + 512, kUntouched);
+        S.r.setIndexedLineSink(&frame);
+        S.r.renderLine(4);
+        // コントラスト 1 で暗い色がグラフィックの手前にあるラインだけは、透明にならないよう、ここで描く
+        const bool viaSink = !(c == 1 && enable == 0x6f);
+        CHECK_EQ(frame.supported[4], viaSink);
+        captured += frame.supported[4];
+        if (viaSink) CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH], kUntouched); // 受け取る先が描いたラインには書かない
+        frame.resolve(S.px, 512, 5);
+        CHECK_EQ(memcmp(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected), 0);
+    }
+    CHECK_EQ(captured, 9u);
     S.r.setIndexedLineSink(nullptr);
     S.v.setContrast(15);
 }

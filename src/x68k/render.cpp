@@ -105,6 +105,9 @@
 //     (15 で今の色、0 で黒。直線にしたのは決めたことで、実機のモニタの明るさを測った資料はない)。ラインを描くときの値を
 //     使うので、フレームの途中で変えるとそのラインから変わる。IOCS の _CONTRAST でフェードインするソフト
 //     (電脳倶楽部パーフェクトコレクションのメニューなど) は、コントラスト 0 の間に VRAM を書き換えて見せない。
+//     色コードのまま渡すライン (IndexedLineSink) では、渡すパレットの色に先に掛ける。ただし、グラフィックの手前の
+//     テキスト / スプライトの色に、もとが 0 でなく掛けると 0 (透明) になるものがあるライン (コントラスト 1 のごく暗い色)
+//     は、渡さずにここで描く (sinkPalette())。
 //
 // 速さのための作り: 1 ラインごとに、各画面を色コードの並び (1 ドット 1 バイト) にしてから重ね、最後にパレットを引く。
 // 色コードの並びは 8 ドットずつ 64 ビットの値として扱う (リトルエンディアンの CPU を前提にしている)。
@@ -833,24 +836,23 @@ void Renderer::renderLine(int y) {
     if (!surface_.pixels || y < 0 || y >= smaller(height_, surface_.rows)) return;
     const int w = smaller(width_, surface_.columns);
     if (w <= 0) return;
-    IndexedLineSink* const sink = indexedSink_;
-    if (sink) sink->beginLine(y, w);
+    if (indexedSink_) indexedSink_->beginLine(y, w);
     uint32_t* out = surface_.pixels + (size_t)y * (size_t)surface_.pitch;
-    // コントラストを掛けるラインは色コードのまま渡さずにここで描く (渡すとコントラストが掛からない)
-    if (video_.contrast() < 15) indexedSink_ = nullptr;
-    composeLine(y, w, out);
-    indexedSink_ = sink;
-    applyContrast(w, out);
+    // 色コードを渡した先が描くラインは、渡すパレットにコントラストを掛けてある (sinkPalette())
+    if (composeLine(y, w, out)) applyContrast(w, out);
+}
+
+void Renderer::syncContrastLevels(unsigned c) {
+    if (c == contrastSeen_) return;
+    for (unsigned i = 0; i < 256; i++) contrastLevel_[i] = (uint8_t)((i * c + 7) / 15);
+    contrastSeen_ = c;
 }
 
 // コントラストが 15 より小さければ、ラインの各ドットの R、G、B に コントラスト / 15 を掛ける (先頭の決めたこと)
 void Renderer::applyContrast(int w, uint32_t* out) {
     const unsigned c = video_.contrast();
     if (c >= 15) return;
-    if (c != contrastSeen_) {
-        for (unsigned i = 0; i < 256; i++) contrastLevel_[i] = (uint8_t)((i * c + 7) / 15);
-        contrastSeen_ = c;
-    }
+    syncContrastLevels(c);
     if (c == 0) {
         for (int x = 0; x < w; x++) out[x] = 0;
         return;
@@ -862,7 +864,26 @@ void Renderer::applyContrast(int w, uint32_t* out) {
     }
 }
 
-void Renderer::composeLine(int y, int w, uint32_t* out) {
+// 色はドットごとに決まるので、パレットの色に先にコントラストを掛けても、引いた色に掛けても同じになる。
+// ただしテキストとスプライトは色が 0 のドットを透明とするので (composeLayers())、front (テキスト側) で
+// もとが 0 でなく掛けると 0 になる色があれば (コントラスト 1 のごく暗い色)、透明かどうかが変わってしまうので
+// nullptr を返す。そのラインは色コードを渡さずにここで描く。コントラスト 0 ではグラフィックも黒になるので渡してよい
+const uint32_t* Renderer::sinkPalette(const uint32_t* src, uint32_t* dst, bool front) {
+    const unsigned c = video_.contrast();
+    if (c >= 15) return src;
+    syncContrastLevels(c);
+    const uint8_t* lv = contrastLevel_;
+    uint32_t vanished = 0;
+    for (int i = 0; i < 256; i++) {
+        const uint32_t p = src[i];
+        const uint32_t q = (uint32_t)lv[(p >> 16) & 0xff] << 16 | (uint32_t)lv[(p >> 8) & 0xff] << 8 | lv[p & 0xff];
+        vanished |= p && !q;
+        dst[i] = q;
+    }
+    return front && c && vanished ? nullptr : dst;
+}
+
+bool Renderer::composeLine(int y, int w, uint32_t* out) {
     const uint16_t r0 = video_.videoControl(0), r1 = video_.videoControl(1), r2 = video_.videoControl(2);
     const uint32_t* xrgb = video_.paletteXrgb();
     const uint32_t* const tlut = xrgb + 256;
@@ -881,7 +902,7 @@ void Renderer::composeLine(int y, int w, uint32_t* out) {
                 textPairsValid_ = true;
             }
             drawTextOnly(video_, y, w, out, textPairs_);
-            return;
+            return true;
         }
         buildTextLine(video_, y, w, textLine_ + MARGIN);
         text = textLine_ + MARGIN;
@@ -921,17 +942,21 @@ void Renderer::composeLine(int y, int w, uint32_t* out) {
                     codes = mergeLine_ + MARGIN;
                 }
             }
-            if (indexedSink_->above(y, w, codes, nullptr, tlut, nullptr)) return;
+            // 奥は黒なので、色が 0 になって透明になっても同じ (sinkPalette() の front は false でよい)
+            if (indexedSink_->above(y, w, codes, nullptr, sinkPalette(tlut, sinkText_, false), nullptr)) return false;
         }
         composeLayers(out, w, stacking, front, back, tlut, [](int) { return (uint32_t)0; });
-        return;
+        return true;
     }
-    if (indexedSink_ && !special && graphic == GRAPHIC_CODE && stacking == STACK_ABOVE &&
-        indexedSink_->above(y, w, front, graphicLine_ + MARGIN, tlut, xrgb)) return;
+    if (indexedSink_ && !special && graphic == GRAPHIC_CODE && stacking == STACK_ABOVE) {
+        const uint32_t* tp = sinkPalette(tlut, sinkText_, true);
+        if (tp && indexedSink_->above(y, w, front, graphicLine_ + MARGIN, tp, sinkPalette(xrgb, sinkGraphic_, false)))
+            return false;
+    }
     if (special) {
         const uint8_t* zero = zeroLine_ + MARGIN;
         composeSpecial(w, out, r2, graphic, front ? front : zero, back ? back : zero, stacking);
-        return;
+        return true;
     }
     if (graphic == GRAPHIC_WORD) {
         // 65536 色。ワードの上位バイトと下位バイトでそれぞれパレットを引いた色を、XRGB にしたものの表を使う
@@ -952,10 +977,11 @@ void Renderer::composeLine(int y, int w, uint32_t* out) {
         const uint32_t* th = wordHiXrgb_;
         const uint32_t* tl = wordLoXrgb_;
         composeLayers(out, w, stacking, front, back, tlut, [=](int x) { return th[word[x] >> 8] | tl[word[x] & 0xff]; });
-        return;
+        return true;
     }
     const uint8_t* gcode = graphicLine_ + MARGIN;
     composeLayers(out, w, stacking, front, back, tlut, [=](int x) { return xrgb[gcode[x]]; });
+    return true;
 }
 
 } // namespace x68k

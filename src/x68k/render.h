@@ -62,8 +62,13 @@ private:
     static constexpr int LINE_SIZE = MAX_WIDTH + 2 * MARGIN;
 
     void syncGeometry();
-    void composeLine(int y, int w, uint32_t* out); // ライン y を合成して out (w ドット) に書く
+    // ライン y を合成して out (w ドット) に書く。色コードを渡した先が描くと引き受けたときは書かずに false を返す
+    bool composeLine(int y, int w, uint32_t* out);
     void applyContrast(int w, uint32_t* out);      // コントラストを掛ける (render.cpp の先頭)
+    void syncContrastLevels(unsigned c);           // contrastLevel_ をコントラスト c の表にする
+    // 色コードを渡す先に渡すパレット。コントラストが 15 なら src、そうでなければ掛けたものを dst に作って返す。
+    // front (奥にグラフィックがあるテキスト側) で、掛けると透明になってしまう色があれば nullptr (渡さない)
+    const uint32_t* sinkPalette(const uint32_t* src, uint32_t* dst, bool front);
     void buildColorSplitTables();
     bool buildSpriteLine(int y, int w);
     int buildGraphicLine(int y, int w, uint16_t r0, uint16_t r1, uint16_t r2, bool split);
@@ -120,6 +125,9 @@ private:
     // コントラストを掛けた 8 ビットの値 (contrastSeen_ のコントラストで作ったもの)
     uint8_t contrastLevel_[256] = {};
     unsigned contrastSeen_ = 16;
+    // 色コードを渡す先に渡す、コントラストを掛けたテキストとグラフィックのパレット (sinkPalette())
+    uint32_t sinkText_[256] = {};
+    uint32_t sinkGraphic_[256] = {};
 };
 
 } // namespace x68k
