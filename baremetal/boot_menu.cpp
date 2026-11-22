@@ -243,7 +243,7 @@ int CKernel::RunBootMenu(const platform::ProfileList& list, int initial) {
 void CKernel::DrawBootMenu(const platform::BootMenu& menu) {
     CBcmFrameBuffer* fb = m_Screen.GetFrameBuffer();
     if (fb == nullptr || fb->GetDepth() != 32) return;
-    menu.draw((u32*)(uintptr)fb->GetBuffer(), (int)(fb->GetPitch() / 4), (int)m_Screen.GetWidth(),
+    menu.draw((uint32_t*)(uintptr)fb->GetBuffer(), (int)(fb->GetPitch() / 4), (int)m_Screen.GetWidth(),
               (int)m_Screen.GetHeight(), NowMs(), m_pBootCgrom, m_pBootCgrom ? x68k::Machine::CG_SIZE : 0, 0xff000000u);
 }
 

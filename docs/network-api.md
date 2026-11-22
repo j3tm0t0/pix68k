@@ -24,7 +24,7 @@ HTTP (80 番) のサーバと syslog の送信を行う。既定では動かさ�
 
 `net_token=` を書くと、ファイルを読む (`GET /files/...`) のにもトークンが要る。トークンは `pix68k.cfg` か `cmdline.txt` に書いてあり、
 読めればそのまま書き込みと再起動に使えるため。その写し (`.new`、`.part`、`.old` や手で作った控え) もあるので、名前で選ばずに
-ファイルはすべてトークンを求める。`/log`、`/thermal`、`/screen.ppm`、`/ts6bga.ppm`、`/screen2.ppm` はトークンなしで読める (`net_allow=` の制限は受ける)。
+ファイルと `/fd0.xdf`、`/fd1.xdf` はすべてトークンを求める。`/log`、`/thermal`、`/screen.ppm`、`/ts6bga.ppm`、`/screen2.ppm` はトークンなしで読める (`net_allow=` の制限は受ける)。
 
 HTTP の口:
 
@@ -34,6 +34,7 @@ HTTP の口:
 | `GET /files/<パス>` | SD カード (起動したドライブ) のファイルを読む (`net_token=` があればトークンが要る)。`/` で終われば一覧 (1 行に `名前`、タブ、バイト数。ディレクトリは `名前/`) |
 | `DELETE /files/<パス>` | ファイルを消す (トークンが要る。ディレクトリと、X68000 が使っているディスクのイメージは断る) |
 | `PUT /files/<パス>`、`POST /files/<パス>` | ファイルを書く (トークンが要る)。`<パス>.part` に書き、受け取り終えたら `<パス>` と入れ替える (元のファイルは `<パス>.old` にしてから消す)。途中で切れたら元のファイルは変えない。大きさの上限はない (SD カードに 32KB ずつ書く)。`Content-Length` が要る (`Transfer-Encoding` は chunked でもほかでも断る、400) |
+| `GET /fd0.xdf`、`GET /fd1.xdf` | そのドライブに入っている、USB-FDD から読んだ実物のディスク (`fd0 = usb-fdd:`) の XDF のイメージ (1,261,568 バイト。`net_token=` があればトークンが要る。`/files` と同じ扱い)。ファイルから入れたディスクや空のドライブなら 404 (ファイルのイメージは `/files` で読む)。送る前にイメージの写しを取るので、そのメモリ (約 1.2MB) が足りなければ 503。`HEAD` は写しを取らずに長さだけ返す。実物のディスクには書かない ([disks-and-scsi.md](disks-and-scsi.md) の「実物のフロッピーディスクを USB-FDD から読む」) |
 | `GET /log` | 起動してからのログ (UART と同じもの。最新の 64KB) |
 | `GET /thermal` | 温度、ARM のクロック、ファームウェアがクロックを下げているか、ファン (Pi 5)。`名前=値` を 1 行ずつ返す (下に詳しく書いた) |
 | `GET /screen.ppm` | X68000 の画面 (PPM)。X68000 が動いていれば、次に合成し終えたフレームを待って返す (下に詳しく書いた) |
@@ -59,6 +60,8 @@ curl -H 'X-Pix68k-Token: 好きな文字列' --data-binary @pix68k.cfg http://pi
 curl http://pix68k/log
 curl http://pix68k/thermal
 curl -o screen.ppm http://pix68k/screen.ppm
+# USB-FDD から読んだ FD0 のディスクを、XDF のイメージとして取る (net_token= があればトークンを付ける)
+curl -H 'X-Pix68k-Token: 好きな文字列' -o gradius.xdf http://pix68k/fd0.xdf
 curl -o ts6bga.ppm http://pix68k/ts6bga.ppm
 curl -o screen2.ppm http://pix68k/screen2.ppm
 # キー入力 (X68000 のリセット、CTRL + OPT.1 + DEL は Ctrl + GUI + Delete)
@@ -137,6 +140,7 @@ curl の代わりに、この口を操作するコマンド `pix68kcli` (Go、ma
   `curl http://192.168.1.50/` と、`net_name=` を書いていなければ `curl http://pix68k/` が通る。ルータが付けるドメイン付きの名前 (`pix68k.lan` など) は断るので、アドレスか `net_name=` の名前で送る。
   `Host:` のない HTTP/1.0 の要求は受ける
 - `Origin:` ヘッダの付いた書き込み (ブラウザのページから送られたもの) は断る (403)。`net_allow=` だけでトークンなしの設定でも、ほかのサイトのページから書き込みや再起動をさせないため
+- PUT / POST の置き先が `/pix68k` の直下で、`/pix68k` がまだなければ、作ってから書く (LAN から起動する機械の SD カードに ROM や `pix68k.cfg` を最初に置くとき。#302)。ほかのディレクトリは作らず、ないディレクトリへの PUT は 404
 - PUT / POST の送り先が既存のディレクトリなら断る (400)。`/files/pix68k` のようにファイル名を書き忘れて、ディレクトリを置き換えないように
 - X68000 が使っているディスクのイメージも GET で読めるが、書き戻しと重なると中身が揃わないことがある
 - `pix68k.cfg` の読めない値をログに出すとき、`net_token=` の値は出さない (`/log` はトークンなしで読めるため)。

@@ -270,6 +270,53 @@ void testWriteSplit() {
     CHECK_EQ(same(prof3, "video_scale = aspect\n"), 1);
 }
 
+// osd_bars= (画面の右下の使用率のバー) は共通の項目: 組み合わせを選んでも pix68k.cfg の値を受け継ぎ、組み合わせに
+// 書けばそちらが勝つ。メニューで変えて保存すると、行のあるほうに書き、読み直すと同じ値になる
+void testOsdBarsProfile() {
+    auto warn = [](bool, const char*, const char*, SettingResult) {};
+    auto bad = [](bool, const char*) {};
+    ConfigText base, prof;
+    load(base, "osd = on\nosd_bars = on\n");
+    load(prof, "cpu = 68060\nsc0 = CBXNEW.HDS\n");
+    Settings s;
+    readProfileSettings(base, &prof, s, false, warn, bad);
+    CHECK_EQ(s.osdBars, 1); // 受け継ぐ
+    ConfigText prof2;
+    load(prof2, "osd_bars = off\n");
+    Settings s2;
+    readProfileSettings(base, &prof2, s2, false, warn, bad);
+    CHECK_EQ(s2.osdBars, 0); // 組み合わせが勝つ
+    // 書いていなければ既定の off
+    ConfigText empty;
+    load(empty, "fd0 = A.XDF\n");
+    Settings s3;
+    readProfileSettings(empty, nullptr, s3, false, warn, bad);
+    CHECK_EQ(s3.osdBars, 0);
+    // 保存: pix68k.cfg に行がなければ pix68k.cfg に足し (共通の項目)、読み直すと on
+    ConfigText base4, prof4;
+    load(base4, "net = on\n");
+    load(prof4, "fd0 = GR2A.XDF\n");
+    Settings saved4;
+    readProfileSettings(base4, &prof4, saved4, false, warn, bad);
+    Settings s4 = saved4;
+    s4.osdBars = 1;
+    bool cb = false, cp = false;
+    CHECK_EQ(writeProfileSettings(base4, prof4, s4, saved4, cb, cp), 1);
+    CHECK_EQ(cb, 1);
+    CHECK_EQ(cp, 0);
+    CHECK_EQ(same(base4, "net = on\nosd_bars=on\n"), 1);
+    Settings again;
+    readProfileSettings(base4, &prof4, again, false, warn, bad);
+    CHECK_EQ(again.osdBars, 1);
+    // 組み合わせに行があれば組み合わせに書く
+    Settings s5 = s2;
+    s5.osdBars = 1;
+    CHECK_EQ(writeProfileSettings(base, prof2, s5, s2, cb, cp), 1);
+    CHECK_EQ(cb, 0);
+    CHECK_EQ(cp, 1);
+    CHECK_EQ(same(prof2, "osd_bars = on\n"), 1);
+}
+
 // video_filter= と video_scale= は共通の項目: 組み合わせに書かなければ pix68k.cfg の値を受け継ぎ、書けば (none でも)
 // そちらを使う。v0.1.0 の書き方 (scale=、scanline=) も受け継ぎ (pix68k.cfg に残っていても見た目が変わらないように)、
 // 保存するときはどちらのファイルでも新しい 2 つの行にする。pix68k.cfg は pix68k.cfg だけを読んだ値で、組み合わせのファイルは
@@ -977,6 +1024,7 @@ int main() {
     testTitleSjis();
     testMerge();
     testWriteSplit();
+    testOsdBarsProfile();
     testVideoProfile();
     testList();
     testChoice();

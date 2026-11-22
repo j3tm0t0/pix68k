@@ -412,6 +412,9 @@ void testSettings() {
     CHECK_EQ(strcmp(s.midiMt32Pcm, "/roms/MT32_PCM.ROM"), 0);
     CHECK_EQ((int)applySetting(s, "midi_out", "sc55"), (int)SettingResult::OK);
     CHECK_EQ(s.midiOut, 4);
+    CHECK_EQ(s.mercuryRhythm[0], 0);
+    CHECK_EQ((int)applySetting(s, "mercury_rhythm", "OPNA"), (int)SettingResult::OK);
+    CHECK_EQ(strcmp(s.mercuryRhythm, "OPNA"), 0);
     CHECK_EQ(s.midiSc55[0], 0);
     CHECK_EQ((int)applySetting(s, "midi_sc55", "SC55MK2"), (int)SettingResult::OK);
     CHECK_EQ(strcmp(s.midiSc55, "SC55MK2"), 0);

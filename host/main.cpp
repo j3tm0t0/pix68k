@@ -42,7 +42,9 @@
 //                    指定すると --scsi-ex も付けたことになる
 //   --fpu-board [N]  数値演算プロセッサボード (CZ-6BP1 相当、MC68881) をつなぐ ($E9E000。--no-fpu-board で外す)。
 //                    続けて 2 を書くと 2 枚目も $E9E080 につなぐ (1 なら 1 枚。--fpu-board だけと同じ)
-//   --mercury        まーきゅりーゆにっと (16 ビットの PCM、$ECC080) をつなぐ (--no-mercury で外す)
+//   --mercury        まーきゅりーゆにっと (16 ビットの PCM と YMF288 2 個、$ECC080) をつなぐ (--no-mercury で外す)
+//   --mercury-rhythm DIR  YMF288 のリズム音源の音 (2608_BD.WAV など 6 つの WAV。platform/opn_rhythm.h) を置いたディレクトリ。
+//                    指定しなければ ROM のディレクトリから探す。なければリズムは鳴らない
 //   --neptune        ネットワークボード Neptune-X (NE2000 互換、$ECE000) をつなぐ (--no-neptune で外す)
 //   --neptune-link L フレームの送受信の先 (echo (既定)、loopback、pcap:IF、tap:NAME。host_ether.h)。--neptune も付けたことになる
 //   --neptune-mac M  ボードの MAC アドレス (既定 02:68:6b:00:00:01)
@@ -122,6 +124,7 @@
 
 #include "host_ether.h"
 #include "host_serial.h"
+#include "real_floppy_dev.h"
 
 #include "platform/crt_effect.h"
 #include "platform/input_map.h"
@@ -134,6 +137,7 @@
 #include "platform/setting_warning.h"
 #include "platform/settings_file.h"
 #include "platform/mt32_synth.h"
+#include "platform/opn_rhythm.h"
 #include "platform/sc55_synth.h"
 #include "platform/sf2_synth.h"
 #include "platform/uart_midi.h"
@@ -864,6 +868,7 @@ struct Options {
     bool scsiEx = false;          // 外付け SCSI ボード
     int fpuBoard = 0;             // 数値演算プロセッサボードの枚数 (0..2)
     bool mercury = false;         // まーきゅりーゆにっと
+    char mercuryRhythm[1024] = {0}; // その YMF288 のリズムの WAV のディレクトリ (空なら romDir)
     bool neptune = false;         // Neptune-X
     char neptuneMac[platform::Settings::PATH_SIZE] = {0};  // その MAC アドレス (空なら既定)
     char neptuneLink[platform::Settings::PATH_SIZE] = {0}; // フレームの送受信の先 (空なら echo)
@@ -924,6 +929,7 @@ struct Disk {
     uint8_t* data = nullptr;
     size_t size = 0;
     char path[1024] = {0};
+    bool real = false; // 実物のドライブから読んだ (書き戻さない)
 };
 
 // メニューを開いている間の画面の大きさ (X68000 の画面をこの大きさに引き伸ばしてメニューを重ねる)
@@ -931,8 +937,56 @@ const int kMenuWidth = 768, kMenuHeight = 512;
 // runMachine() の戻り値: メニューの「Restart」で、新しい設定で作り直す
 const int kRestart = 3;
 
+// 実物のフロッピーディスクドライブ (Linux のブロックデバイス。USB-FDD の /dev/sdX) から、ディスクの全体を読む (#286)。
+// 読めなければ理由を出して nullptr。デバイスは読むだけで開く (host/real_floppy_dev.h)
+uint8_t* loadRealFloppy(const char* path, size_t& size) {
+    host::BlockDeviceFloppy dev;
+    if (!dev.open(path)) {
+        perror(path);
+        return nullptr;
+    }
+    typedef platform::RealFloppyReader Reader;
+    uint8_t* buf = (uint8_t*)malloc(Reader::IMAGE_BYTES);
+    Reader r;
+    if (buf && r.begin(&dev, buf, Reader::IMAGE_BYTES)) {
+        printf("%s: reading the floppy disk (%u tracks)\n", path, (unsigned)Reader::TRACKS);
+        while (r.step()) {
+            if (r.track() % 22 == 0) {
+                printf("%s: %u/%u tracks\n", path, (unsigned)r.track(), (unsigned)Reader::TRACKS);
+                fflush(stdout);
+            }
+        }
+    }
+    if (buf && r.status() == Reader::DONE) {
+        size = Reader::IMAGE_BYTES;
+        return buf;
+    }
+    switch (r.error()) {
+    case Reader::NO_DISK: fprintf(stderr, "%s: no disk in the drive\n", path); break;
+    case Reader::BAD_FORMAT:
+        fprintf(stderr, "%s: %u blocks of %u bytes; only X68000 2HD (1232 blocks of 1024 bytes) is supported\n", path,
+                (unsigned)r.blocks(), (unsigned)r.blockBytes());
+        break;
+    case Reader::READ_ERROR:
+        fprintf(stderr, "%s: cannot read block %u (cylinder %u, head %u, sector %u)\n", path, (unsigned)r.badBlock(),
+                (unsigned)r.badCylinder(), (unsigned)r.badHead(), (unsigned)r.badSector());
+        break;
+    default: fprintf(stderr, "%s: out of memory\n", path); break;
+    }
+    free(buf);
+    size = 0;
+    return nullptr;
+}
+
 bool loadDisk(Disk& d, const char* path, bool readOnly) {
-    d.data = loadWhole(path, d.size);
+    // ブロックデバイスは実物のドライブとして読み、いつも書き込み禁止にする (ディスクには書かない)
+    d.real = host::isBlockDevice(path);
+    if (d.real) {
+        d.data = loadRealFloppy(path, d.size);
+        readOnly = true;
+    } else {
+        d.data = loadWhole(path, d.size);
+    }
     if (!d.data || !d.image.load(d.data, d.size, readOnly, path)) {
         free(d.data);
         d.data = nullptr;
@@ -945,7 +999,8 @@ bool loadDisk(Disk& d, const char* path, bool readOnly) {
 // ドライブから取り出す。書き込まれていて --write-back なら、イメージのファイルに書き戻す
 void unloadDisk(x68k::Machine& m, int drive, Disk& d, bool writeBack) {
     if (!d.data) return;
-    if (d.image.dirty()) {
+    // 実物のドライブから読んだディスクは書き込み禁止で入れるので dirty にならないが、書き戻さないことをここでも確かめる
+    if (d.image.dirty() && !d.real) {
         if (!writeBack) printf("disk %s was written, but not saved (use --write-back)\n", d.path);
         else if (saveFile(d.path, d.data, d.size)) printf("disk saved: %s\n", d.path);
         else perror(d.path);
@@ -1001,6 +1056,7 @@ void applySettings(const platform::Settings& s, Options& opt) {
     opt.cdId = s.cdId;
     opt.fpuBoard = s.fpuBoard;
     opt.mercury = s.mercury != 0;
+    configPath(opt.config, s.mercuryRhythm, opt.mercuryRhythm, sizeof opt.mercuryRhythm);
     opt.neptune = s.neptune != 0;
     platform::copyString(opt.neptuneMac, sizeof opt.neptuneMac, s.neptuneMac);
     platform::copyString(opt.neptuneLink, sizeof opt.neptuneLink, s.neptuneLink);
@@ -1121,6 +1177,7 @@ platform::Settings runningSettings(const Options& opt) {
     s.cdId = opt.cdId;
     s.fpuBoard = opt.fpuBoard;
     s.mercury = opt.mercury;
+    platform::copyString(s.mercuryRhythm, sizeof s.mercuryRhythm, opt.mercuryRhythm);
     s.neptune = opt.neptune;
     platform::copyString(s.neptuneMac, sizeof s.neptuneMac, opt.neptuneMac);
     platform::copyString(s.neptuneLink, sizeof s.neptuneLink, opt.neptuneLink);
@@ -1654,6 +1711,41 @@ x68k::MidiOut* loadSc55(const char* dir, int rate) {
     return synth;
 }
 
+// まーきゅりーゆにっとの YMF288 のリズムの音を dir から読む (最初の 1 回だけ。読んだ音は終わるまで持ち続ける)。
+// ファイルの名前は大文字と小文字のどちらでもよい
+void loadOpnRhythm(const char* dir) {
+    static platform::OpnRhythm rhythm;
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    int found = 0;
+    for (int i = 0; i < x68k::Opn3::RHYTHMS; i++) {
+        char name[32], path[1100];
+        snprintf(name, sizeof name, "%s", platform::kOpnRhythmFiles[i]);
+        size_t size = 0;
+        uint8_t* file = nullptr;
+        for (int lower = 0; lower < 2 && !file; lower++) {
+            if (lower)
+                for (char* c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            file = loadWhole(path, size);
+        }
+        if (!file) continue;
+        if (rhythm.add(i, file, size)) {
+            found++;
+        } else {
+            fprintf(stderr, "%s: not a 16-bit PCM WAV file; not used\n", path);
+            free(file);
+        }
+    }
+    if (found) {
+        x68k::Opn3::setRhythm(&rhythm.set);
+        printf("Mercury Unit: %d rhythm sounds from %s\n", found, dir);
+    } else {
+        printf("Mercury Unit: no rhythm sounds (%s and others are not in %s)\n", platform::kOpnRhythmFiles[0], dir);
+    }
+}
+
 // MIDI ボードの音源を用意する (opt.midiOut で選ぶ)。読めなければ知らせて nullptr (MIDI は鳴らさずに続ける)
 x68k::MidiOut* loadMidiSynth(const Options& opt, int rate) {
     if (opt.midiOut == 2) return nullptr; // none
@@ -1783,7 +1875,10 @@ int runMachine(Options& opt) {
     }
     if (opt.fpuBoard) printf("FPU board (CZ-6BP1, MC68881) at $E9E000\n");
     if (opt.fpuBoard >= 2) printf("FPU board (CZ-6BP1, MC68881) at $E9E080\n");
-    if (opt.mercury) printf("Mercury Unit at $ECC080\n");
+    if (opt.mercury) {
+        printf("Mercury Unit at $ECC080\n");
+        loadOpnRhythm(opt.mercuryRhythm[0] ? opt.mercuryRhythm : opt.romDir);
+    }
     if (opt.neptune) {
         uint8_t mac[6];
         memcpy(mac, x68k::Neptune::DEFAULT_MAC, 6);
@@ -2107,6 +2202,13 @@ int runMachine(Options& opt) {
         if (lv.midi != 0 || lv.clipped != 0)
             printf("sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix\n",
                    (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);
+        // 音源ごとの最大と、足したあと (MIDI の音源を足す前) に止めた数、MIDI の音源の出力が上限に届いた数、捨てた数。
+        // 音が出たときだけ出す
+        if (lv.mix != 0 || lv.midi != 0 || lv.dropped != 0)
+            printf("sound sources: OPM peak %u, ADPCM %u, Mercury PCM %u, YMF288 %u, sum %u (of 32767); %u sample(s) clipped before MIDI, "
+                   "%u MIDI frame(s) at full scale, %u frame(s) dropped\n",
+                   (unsigned)lv.opm, (unsigned)lv.adpcm, (unsigned)lv.mercury, (unsigned)lv.opn, (unsigned)lv.mix, (unsigned)lv.mixClipped,
+                   (unsigned)lv.midiFull, (unsigned)lv.dropped);
     }
 
     if (opt.dumpText && haveCg) {
@@ -2177,7 +2279,7 @@ void usage(const char* argv0) {
             "          [--sram-memsize fix|keep] [--cpu 68000|68030|68060] [--ipl file] [--high-mem MB]\n"
             "          [--local-mem MB] [--ram MB] [--max-speed] [--scsi-ex | --no-scsi-ex] [--scsi-ex-rom file]\n"
             "          [--speed060 percent] [--max-speed-limit percent] [--bus-sync-sprite]\n"
-            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--config file] [--profile name] [--image-dir dir]\n"
+            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--mercury-rhythm dir] [--config file] [--profile name] [--image-dir dir]\n"
             "          [--neptune] [--neptune-link echo|loopback|pcap:IF|tap:NAME] [--neptune-mac MAC]\n"
             "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT]\n"
             "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none]\n"
@@ -2215,7 +2317,7 @@ int main(int argc, char** argv) {
         "--frames", "-r", "-0", "-1", "-h", "--sram", "--screenshot", "--type", "--type-after", "--wav", "--time",
         "--sram-memsize", "--cpu", "--ipl", "--high-mem", "--local-mem", "--ram", "--clock", "--scsi-ex-rom",
         "--cd", "--cd-id", "--image-dir", "--state-dir", "--press", "--press-after", "--midi-sf2", "--midi-voices", "--midi-out",
-        "--midi-mt32-ctrl", "--midi-mt32-pcm", "--midi-sc55", "--midi-dump", "--midi-uart-family", "--speed060",
+        "--midi-mt32-ctrl", "--midi-mt32-pcm", "--midi-sc55", "--mercury-rhythm", "--midi-dump", "--midi-uart-family", "--speed060",
         "--max-speed-limit", "--message", "--message-sec", "--message-dump", "--profile"};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sc")) {
@@ -2271,6 +2373,9 @@ int main(int argc, char** argv) {
             opt.fpuBoard = 0;
         } else if (!strcmp(a, "--mercury") || !strcmp(a, "--no-mercury")) {
             opt.mercury = a[2] == 'm';
+        } else if (!strcmp(a, "--mercury-rhythm") && hasArg) {
+            snprintf(opt.mercuryRhythm, sizeof opt.mercuryRhythm, "%s", argv[++i]);
+            opt.mercury = true;
         } else if (!strcmp(a, "--neptune") || !strcmp(a, "--no-neptune")) {
             opt.neptune = a[2] == 'n' && a[3] == 'e';
         } else if (!strcmp(a, "--neptune-link") && hasArg) {

@@ -42,6 +42,7 @@
 #include "platform/key_type.h"
 #include "platform/menu.h"
 #include "platform/osd.h"
+#include "platform/osd_bars.h"
 #include "platform/osd_message.h"
 #include "platform/reboot_keys.h"
 #include "platform/settings_file.h"
@@ -70,8 +71,21 @@ public:
         if (__atomic_load_n(&m_bEnabled, __ATOMIC_RELAXED)) m_b->Write(buffer, count);
         m_ring->Write(buffer, count);
         if (!__atomic_load_n(&m_bFirst, __ATOMIC_ACQUIRE)) return (int)count;
-        return m_a->Write(buffer, count);
+        // UART には少しずつ書く。CSerialDevice::Write() は、渡した分を送り終えるまで割り込みを止める (115200bps の
+        // 送信待ち。185 文字で 16ms)。1 行をまとめて渡すと、その間に HDMI の音の DMA の割り込み (16ms ごと) を
+        // 取りこぼし、音が飛んだ (#296)。SERIAL_PIECE バイトずつなら、1 回に止めるのは 1.4ms ほどで、その間に
+        // 割り込みが入る。呼んだ側がもともと割り込みを止めているとき (割り込みの処理の中からのログなど) は、分けても
+        // 止まったままになる。分けた間に、ほかのコアや割り込みの処理が書いたログが、UART では行の途中に入ることがある
+        // (色を付けるエスケープシーケンスの途中に入れば、端末の表示が乱れる)。画面と /log のリングは 1 行ずつのまま
+        const char* p = static_cast<const char*>(buffer);
+        for (size_t done = 0; done < count;) {
+            const size_t n = count - done < SERIAL_PIECE ? count - done : SERIAL_PIECE;
+            if (m_a->Write(p + done, n) < 0) return -1;
+            done += n;
+        }
+        return (int)count;
     }
+    static constexpr size_t SERIAL_PIECE = 16;
     void EnableSecond(bool on) { __atomic_store_n(&m_bEnabled, on, __ATOMIC_RELAXED); }
     // 1 番目 (UART) に出すのをやめる (UART を MIDI の出力に使うとき)
     void DisableFirst() { __atomic_store_n(&m_bFirst, false, __ATOMIC_RELEASE); }
@@ -251,11 +265,17 @@ private:
     }
     unsigned ServiceDisks(u64 now, bool io = true);
     u8* ReadWholeFile(const char* path, unsigned& size);
+    void LoadOpnRhythm();
     static FRESULT ReadFileChecked(const char* path, u8*& data, unsigned& size);
     static FRESULT WriteFileReplacing(const char* path, const char* tmp, const void* data, unsigned size);
     static FRESULT ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size, bool& usedTmp);
     u8* ReadRom(const char* name, unsigned size);
     bool LoadDisk(int drive, const char* name);
+    bool LoadRealFloppy(int drive, int unit); // fd<N>=usb-fdd:<unit> (unit は 0 から。USB-FDD の実物のディスクを読む。#286)
+    bool m_RealFloppy[2] = {false, false};    // m_pDisks[drive] は USB-FDD から読んだディスク (書き出せる。#287)
+    u8* m_pRealFloppyBuf[2] = {nullptr, nullptr}; // USB-FDD から読んだイメージの置き場 (ドライブごと。一度確保したら使い回す)
+    static void RealFloppyWaitHook();             // USB-FDD への転送を待つ間に呼ばれる (ウォッチドッグを延ばす。ScanUsb() が登録)
+    u64 m_RealFloppyWaitFrom = 0;             // USB-FDD が出てくるのを待ち始めた時刻 (0 = まだ待っていない)
     bool LoadHardDisk(const char* name);
     void LoadScsi();
     void LoadSram();
@@ -314,6 +334,8 @@ private:
     const char* diskName(int drive) override { return m_Settings.fd[drive]; }
     int changeCd(const char* name, platform::MenuText& msg) override;
     void resetMachine() override;
+    bool hasRealFloppy(int drive) const override { return m_RealFloppy[drive]; }
+    bool saveFloppyImage(int drive, platform::MenuText& msg) override;
     bool saveState(int slot, platform::MenuText& msg) override;
     bool loadState(int slot, platform::MenuText& msg) override;
     bool saveSettings(const platform::Settings& s, platform::MenuText& msg) override;
@@ -332,8 +354,11 @@ private:
     void netBeginHeavy() override;
     void netEndHeavy() override;
     void netIdleUntil(u64 deadline) override { IdleUntil(deadline); }
+    void netSpinUs(unsigned us) override { SpinUs(us); }
     bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) override;
     bool netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) override;
+    unsigned netFloppyImage(int drive, u8* buf, unsigned capacity) override;
+    bool netCanAllocate(unsigned bytes) override;
     void ShowTsFrame();
     void netRequestReboot() override;
     platform::ProfileRequest netBootProfile(const char* name) override;
@@ -375,6 +400,9 @@ private:
         PublishOsd(platform::OsdValue());
         m_OsdTicks = 0;
     }
+    // 画面の右下の使用率のバー (osd_bars=)。ShowFrame() が次のフレームから読む
+    bool hasOsdBars() const override { return true; }
+    void osdBarsChanged(int on) override { __atomic_store_n(&m_Settings.osdBars, on, __ATOMIC_RELAXED); }
     void UpdateOsd();
     static int OsdPiModel();
     void ExpireOsd();
@@ -439,6 +467,7 @@ private:
     unsigned m_GpuDisplayW = 0, m_GpuDisplayH = 0; // 表示の大きさ
     enum GpuScaleNote { GpuScaleOff, GpuScaleOn, GpuScaleBadOption, GpuScaleNoDisplay, GpuScaleDoesNotFit, GpuScaleFailed };
     GpuScaleNote m_GpuScaleNote = GpuScaleOff;
+    bool m_GpuScaleByDefault = false; // オプションがなく、機種の既定で使った (Raspberry Pi 2。InitScreen())
     unsigned m_DeploySeconds = 0;      // tools/deploy_pi.sh から起動されたときの動作秒数 (0 なら普通の起動)
     CCoreRunner m_Cores;
 
@@ -556,6 +585,10 @@ private:
     bool m_InScanDelay = false;        // UsbScanDelay() の中 (入れ子にしない)
     unsigned m_EventStreamUs = 0;      // コア 0 のイベントストリームの周期 (us)。0 なら届かないので、待つ間は空回りする
     void IdleUntil(u64 deadline);      // 時刻 deadline まで待つ (event_wait.h。届かなければ空回り)
+    void SpinUs(unsigned us);          // us マイクロ秒、空回りで待つ (待った時間を m_Core0IdleTicks に足す)
+    void AddCore0Idle(u64 t0, u64 irq0); // t0 (時刻) から今までを、その間の割り込みの時間を除いて m_Core0IdleTicks に足す
+    u64 m_Core0IdleTicks = 0;          // コア 0 が IdleUntil() で待った時間の合計 (CTimer::GetClockTicks64() の単位。割り込みの
+                                       // 処理時間は除く。画面の右下の使用率のバー。コア 0 だけが触る)
     void StartEventStream();
     u64 m_ScanLastAlive = 0;           // ServiceDuringUsbScan() がウォッチドッグを延ばした時刻
     bool m_FrameLogged = false;        // 最初の画面を出した時刻をログに出した
@@ -583,8 +616,8 @@ private:
     // ほかは 0。ShowFrame() が書き、コア 0 がログに使う)
     int m_CrtShown = 0;
     static constexpr int kCrtShownMap = 0x10;
-    alignas(16) u32 m_ScaleLine[4096];      // 拡大した 1 行 (platform/frame_scale.h の presentScaled())
-    alignas(16) u32 m_ScaleLine2[4096];     // もう 1 行 (platform/crt_effect.h の presentCrt() がにじませるときに使う)
+    alignas(16) uint32_t m_ScaleLine[4096];      // 拡大した 1 行 (platform/frame_scale.h の presentScaled())
+    alignas(16) uint32_t m_ScaleLine2[4096];     // もう 1 行 (platform/crt_effect.h の presentCrt() がにじませるときに使う)
     // 画面の出し方 (video_scale=、video_filter=。platform/crt_effect.h)
     int m_Video = platform::VIDEO_SCALE_INTEGER << 16; // video_scale << 16 | video_filter (コア 0 が書き、写す役のコアが読む)
     bool m_VideoAll = false;                // pix68k_crt_all=1 (Pi 3 でもどの組み合わせも選べる。VideoAllowed())
@@ -613,6 +646,7 @@ private:
     int m_BezelSkip = 0;               // 枠を出さない理由 (platform::bezelSkipCode())。ShowFrame() が毎フレーム書き、コア 0 が読む
     platform::BezelSkipLog m_BezelSkipLog; // コア 0 だけが触る
     platform::OsdState m_OsdState;          // 画面の隅の数字の、いま出ているもの (platform/osd.h)
+    platform::OsdState m_BarsState;         // 画面の右下の使用率のバーの、いま出ているもの (platform/osd_bars.h。a に詰めた値)
     // 画面の左上のメッセージ (POST /message。platform/osd_message.h)。字形はコア 0 が作って s_MsgBox (machine_run.cpp)
     // に置き、写す役のコアが ShowFrame() で s_MsgShown に写す。ここの 3 つは写す役のコアだけが触る
     platform::MessageState m_MsgState;      // いま出ているもの
@@ -669,6 +703,11 @@ private:
     }
     platform::OsdValue m_OsdValue;
     unsigned m_OsdSeq = 0;
+    // 画面の右下の使用率のバー (platform::packOsdBars() の値。64 ビット 1 つなので版の番号なしで受け渡す)。
+    // コア 0 が UpdateOsd() で書き、写す役のコアが ShowFrame() で読む。右上の数字を出すときだけ出す
+    uint64_t m_OsdBars = 0;
+    uint64_t m_OsdBusyUs[platform::OSD_BAR_CORES] = {}; // 前に数えたときの、コア 1 から 3 が仕事をした時間の合計 (0 番目はコア 0 が待った時間の合計。us)
+    int m_OsdBarShown[platform::OSD_BAR_ROWS] = {-1, -1, -1, -1, -1}; // 出している使用率 (platform::osdBarShown())
     int m_OsdRpmShown = -1;            // OSD に出しているファンの回転数 (platform::osdRpmShown())
     unsigned m_OsdEffMHzShown = 0;     // OSD に出している最高速モードの実効のクロック (platform::osdEffMHzShown())
     u64 m_OsdTicks = 0;                // 前に数えた時刻 (0 なら次に数え始める)

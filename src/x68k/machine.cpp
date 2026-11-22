@@ -814,6 +814,15 @@ uint64_t Machine::nextTimerIrq() const {
         const uint32_t opm = sound_.clocksToOpmIrq();
         if (opm && opm < clocks) clocks = opm;
     }
+    // まーきゅりーゆにっとの YMF288 のタイマー。Sound は 64 クロックごとにしか進めないので、その境目に合わせる
+    if (mercury_) {
+        const uint32_t opn = mercury_->opnClocksToIrq();
+        if (opn) {
+            const uint32_t per = (uint32_t)Opm::CLOCKS_PER_SAMPLE;
+            const uint32_t n = (opn + per - 1) / per * per - sound_.pendingClocks();
+            if (n < clocks) clocks = n;
+        }
+    }
     if (clocks == Mfp::NO_TIMER_IRQ) return UINT64_MAX;
     // advanceDevices() の換算の逆: synced_ から n サイクル進めると (mfpAcc_ + n * mfpMul_) / mfpDiv_ クロック進む。
     // これが clocks に届く最小の n (切り上げ)
@@ -1258,6 +1267,7 @@ void Machine::updateIrq() {
     if (scsiExRom_ && spcEx_.irq()) level = SCSI_EX_IRQ_LEVEL;
     if (neptune_ && neptune_->irq()) level = Neptune::INTERRUPT_LEVEL;
     if (dmac_.irq()) level = 3;
+    if (mercury_ && mercury_->irq()) level = Mercury::INTERRUPT_LEVEL; // YMF288 のタイマー
     if (midi_ && midi_->irq()) level = Ym3802::INTERRUPT_LEVEL;
     if (scc_.irq()) level = 5;
     if (mfp_.irq()) level = 6;
@@ -1277,7 +1287,14 @@ int Machine::interruptAck(int level) {
         v = scc_.ack();
         break;
     case Ym3802::INTERRUPT_LEVEL:
-        if (midi_ && midi_->irq()) v = midi_->vector(); // 要因は ICR で消すまで続く
+        // MIDI ボードと、まーきゅりーゆにっとの YMF288 (どちらもレベル 4)。両方が要求していたら MIDI ボードを先に答えさせる
+        // (どちらが先かは分からない)。まーきゅりーゆにっとは、応答すると要求を消す (mercury.h)
+        if (midi_ && midi_->irq()) {
+            v = midi_->vector(); // 要因は ICR で消すまで続く
+        } else if (mercury_ && mercury_->irq()) {
+            v = mercury_->vector();
+            mercury_->ack();
+        }
         break;
     case 3:
         v = dmac_.ack();
@@ -1507,6 +1524,7 @@ __attribute__((noinline, cold)) bool Machine::boardWrite(uint32_t addr, uint8_t 
         if (!mercury_ || off < 0x80 || off >= 0x100) return false;
         syncDevices(); // 書く前の時間の分だけ、前の設定で音を作る
         sound_.mercuryWrite(*mercury_, off, v);
+        if (off >= 0xc0) updateIrq(); // YMF288 のフラグを消すと /IRQ が下がり、タイマーを許可すると上がることがある
         return true;
     case 39:
         if (!neptune_ || !neptune_->write(off, v)) return false;

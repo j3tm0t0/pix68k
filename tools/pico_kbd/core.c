@@ -227,3 +227,139 @@ int picobin_tbyb(const uint8_t* p, unsigned n) {
     }
     return -1;
 }
+
+static const char* skip_sp(const char* p) {
+    while (*p == ' ') p++;
+    return p;
+}
+
+// 10 進か 16 進の数を読む。桁がなければ false。max を超えたら false (そこで止めるので、桁はあふれない)
+static bool read_num(const char** p, unsigned base, uint32_t max, uint32_t* out) {
+    const char* q = skip_sp(*p);
+    uint32_t v = 0;
+    unsigned n = 0;
+    for (;; q++, n++) {
+        char c = *q;
+        int d = (c >= '0' && c <= '9') ? c - '0'
+                : base == 16 && c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : base == 16 && c >= 'A' && c <= 'F' ? c - 'A' + 10
+                : -1;
+        if (d < 0) break;
+        if (n >= 8 && base == 16) return false; // 32 ビットを超える
+        if (base == 10 && v > (max - (uint32_t)d) / 10) return false;
+        v = v * base + (uint32_t)d;
+        if (v > max) return false;
+    }
+    if (n == 0) return false;
+    // 数のすぐ後ろは空白か終わり ("12x" のような書き方を受けない)
+    if (*q != 0 && *q != ' ') return false;
+    *p = q;
+    *out = v;
+    return true;
+}
+
+bool pad_parse(const char* args, uint32_t* buttons, uint8_t* hat, unsigned* ms) {
+    const char* p = skip_sp(args);
+    uint32_t b = 0, h = 0, m = 0;
+    if (*p != 0) {
+        if (!read_num(&p, 16, 0xffffffffu, &b)) return false;
+        p = skip_sp(p);
+        if (*p != 0) {
+            if (!read_num(&p, 10, PAD_HAT_MAX, &h)) return false;
+            p = skip_sp(p);
+            if (*p != 0) {
+                if (!read_num(&p, 10, PAD_MAX_MS, &m) || m == 0) return false;
+                p = skip_sp(p);
+                if (*p != 0) return false;
+            }
+        }
+    }
+    *buttons = b;
+    *hat = (uint8_t)h;
+    *ms = (unsigned)m;
+    return true;
+}
+
+static bool usbc_mode(const char* p, UsbcMode* mode) {
+    p = skip_sp(p);
+    if (*p == 0) { *mode = USBC_SAME; return true; }
+    UsbcMode m;
+    if (p[0] == 'k' && p[1] == 'g') { m = USBC_KBD_PAD; p += 2; }
+    else if (p[0] == 'k') { m = USBC_KBD; p += 1; }
+    else return false;
+    if (*skip_sp(p) != 0) return false;
+    *mode = m;
+    return true;
+}
+
+bool usbc_parse(const char* args, UsbcAction* action, unsigned* ms, UsbcMode* mode) {
+    const char* p = skip_sp(args);
+    if (strncmp(p, "off", 3) == 0 && (p[3] == 0 || p[3] == ' ')) {
+        if (*skip_sp(p + 3) != 0) return false;
+        *action = USBC_OFF;
+        *ms = 0;
+        *mode = USBC_SAME;
+        return true;
+    }
+    if (strncmp(p, "on", 2) == 0 && (p[2] == 0 || p[2] == ' ')) {
+        if (!usbc_mode(p + 2, mode)) return false;
+        *action = USBC_ON;
+        *ms = 0;
+        return true;
+    }
+    uint32_t v;
+    if (!read_num(&p, 10, USBC_MAX_MS, &v) || v < USBC_MIN_MS) return false;
+    if (!usbc_mode(p, mode)) return false;
+    *action = USBC_CYCLE;
+    *ms = (unsigned)v;
+    return true;
+}
+
+void pad_init(PadState* s) {
+    memset(s, 0, sizeof *s);
+    s->dirty = true;
+}
+
+void pad_set(PadState* s, uint32_t buttons, uint8_t hat, unsigned ms) {
+    s->buttons = buttons;
+    s->hat = hat;
+    s->dirty = true;
+    s->holdMs = ms;
+    s->holdArmed = false; // 読まれていない前のレポートが読まれても、数え始めない
+    s->releasePending = false;
+}
+
+bool pad_next(PadState* s, uint64_t now_us, uint32_t* buttons, uint8_t* hat) {
+    if (s->releasePending && now_us >= s->releaseAt) {
+        s->releasePending = false;
+        s->buttons = 0;
+        s->hat = 0;
+        s->dirty = true;
+    }
+    if (!s->dirty || s->inFlight) return false;
+    *buttons = s->buttons;
+    *hat = s->hat;
+    return true;
+}
+
+void pad_sent(PadState* s) {
+    s->dirty = false;
+    s->inFlight = true;
+    s->holdArmed = s->holdMs > 0;
+}
+
+void pad_complete(PadState* s, uint64_t now_us) {
+    s->inFlight = false;
+    if (s->holdArmed) {
+        s->holdArmed = false;
+        s->releaseAt = now_us + (uint64_t)s->holdMs * 1000u;
+        s->releasePending = true;
+        s->holdMs = 0;
+    }
+}
+
+void pad_failed(PadState* s) {
+    s->inFlight = false;
+    s->holdArmed = false;
+    s->dirty = true;
+}

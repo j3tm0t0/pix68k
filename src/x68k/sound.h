@@ -2,7 +2,8 @@
 //
 // Machine は CPU が進んだ分のクロック (4MHz) を advance() に渡す。OPM の 1 サンプル (64 クロック、62.5kHz)
 // ごとに ADPCM を進め、OPM の出力と ADPCM の出力を足し、直流を切る高域通過フィルタ (出力のコンデンサの代わり、
-// 約 10Hz) と低域通過フィルタ (X68000 の出力のフィルタの代わり、1 次を 2 段) を通して、線形補間で出力の周波数に直す。
+// 約 10Hz) と低域通過フィルタ (X68000 の出力のフィルタの代わり、1 次を 2 段) を通して、窓をかけた sinc の多相フィルタで
+// 出力の周波数に直す (出力の周波数の半分より上の成分を落としてから間引く。sound.cpp の Sound::output())。
 // ADPCM (MSM6258) の復号値は誤差がたまって 0 からずれたまま止まる (無音のデータを流し続けるドライバでは、
 // そのずれが直流として残る)。実機の出力はコンデンサでつながっているので直流は出ない。
 // 出力のフレームは AudioRing (1 つの書き手と 1 つの読み手のロックのないリングバッファ) にためる。
@@ -37,7 +38,7 @@
 // 記録 (setJournal) に入れる。合成するコアの Sound は記録を順に当てて音を作る (SoundReplayer)。
 // どちらも同じ順で同じ入力を受けるので、作る音は 1 つのコアのときと同じになる。
 // まーきゅりーゆにっと (mercury.h) をつないでいれば、OPM の 1 サンプルごとに進めて、その PCM も混ぜる。
-// まーきゅりーゆにっとの書き込み (コマンド、モード、データ) も記録し、合成するコアでは SoundReplayer が持つものに当てる。
+// まーきゅりーゆにっとの書き込み (コマンド、モード、データ、YMF288 のレジスタ) も記録し、合成するコアでは SoundReplayer が持つものに当てる。
 // MIDI ボード (ym3802.h) が送り終えたバイトも記録する (J_MIDI)。記録の中の位置が送り終えた時刻になる。
 // 合成するコアでは、SoundReplayer に渡した音源 (midi_out.h) に届ける。音源の音は出力のフレームごとに足す
 // (X68000 の出力のフィルタは通さない。外につないだ音源の音なので)。
@@ -46,7 +47,8 @@
 // 進め (62.5kHz に直す)、出力のフレームごとに、その値を 1/2 にして足す (音量の比はまーきゅりーゆにっとと同じ)。
 // MIDI の音源と同じく、X68000 の出力のフィルタ (直流を切るフィルタと低域通過フィルタ) は通さない: 実機の CD-ROM 装置の
 // オーディオは装置のオーディオの出力から出て、X68000 の音声の回路を通らない。
-// 足して 16 ビットを超えた分は、上限と下限で止める (MIDI の音源を足したときと同じ)。
+// 16 ビットに止めるのは、全部 (OPM、ADPCM、まーきゅりーゆにっと、CD-ROM 装置のオーディオ、MIDI の音源) を足したあとの
+// 1 か所だけ。超えた分は、上限と下限で止める。
 // ベアメタルでも使えるよう、例外、RTTI、STL は使わない。
 #pragma once
 
@@ -123,6 +125,20 @@ public:
     void state(StateIO& s); // 状態の保存と復元 (x68k/state.h、state.cpp)
     void copyStateFrom(const Sound& from); // x68k::copySoundState()
     static constexpr uint32_t OPM_RATE = 4000000 / Opm::CLOCKS_PER_SAMPLE; // 62500
+    static constexpr int RESAMPLE_TAPS = 32; // 出力の周波数に直すフィルタのタップの数 (sound.cpp の kResample)
+    static constexpr int RESAMPLE_PHASES = 512; // その表の、1 サンプルの間の位置の刻み
+    // 表の 1 行 (RESAMPLE_TAPS 個、2^15 倍)。phase は 0 から RESAMPLE_PHASES (試験用)。コミットしてある表
+    // (出力が 47.4kHz 以上のときに使う。通す範囲の真ん中が 22kHz)
+    static const int16_t* resampleRow(int phase);
+    // この Sound が今使っている表の 1 行 (試験用)
+    const int16_t* activeResampleRow(int phase) const { return rows_[phase]; }
+    // 出力の周波数 hz のときの、フィルタの通す範囲と止める範囲の真ん中の周波数 (Hz)。22000 ならコミットしてある表を使い、
+    // それより低ければ、setOutputRate() のときにその周波数の表を作る (sound.cpp の説明)。作った表は 4 つまで覚える。
+    // 5 つ目の周波数を使うと、いちばん前に作った表を作り直すので、その表を使っている Sound があれば先に止めておくこと
+    // (出力の周波数は、ふつう 1 つのプログラムで 1 つ)。setOutputRate() は、ほかのコアやスレッドが音を作る前に呼ぶ
+    static int resampleCenterHz(int hz);
+    // 真ん中の周波数が centerHz の表を作る (table は RESAMPLE_PHASES + 1 行)。三角関数などは自前で計算する
+    static void buildResampleTable(int16_t (*table)[RESAMPLE_TAPS], int centerHz);
 
     Sound() { setOutputRate(0); }
     void reset();
@@ -146,18 +162,41 @@ public:
     unsigned latencyGoal() const { return target() + extra(); }
     // 出力の大きさ (ログ用)。前に takeLevels() で取ってからの、
     //   base:    MIDI の音源を足す前の音 (OPM、ADPCM、まーきゅりーゆにっと、CD-ROM 装置のオーディオ) の絶対値の最大
+    //            (16 ビットに止める前の値なので、32767 を超えることがある)
     //   midi:    MIDI の音源が 1 フレームに足した量の絶対値の最大
-    //   clipped: 足して 16 ビットを超え、上限か下限で止めたフレームの数
+    //   clipped: 全部を足して 16 ビットを超え、上限か下限で止めたフレームの数
+    //   opm、adpcm、mercury、opn: 足す前の音源ごとの絶対値の最大 (足すときの比を掛けたあと。62.5kHz のサンプルで見る)。
+    //            mercury はまーきゅりーゆにっとの PCM、opn はその YMF288 (2 個の和)
+    //   mix:     OPM、ADPCM、まーきゅりーゆにっと (PCM と YMF288) を足してフィルタを通した値の絶対値の最大
+    //            (62.5kHz のサンプル。32767 を超えていれば、ほかに足すものがなくても止めている)
+    //   mixClipped: その音だけ (CD-ROM 装置のオーディオと MIDI の音源を足す前) で 16 ビットを超えた出力のフレームの数。
+    //            どの音源で超えたのかを見分けるためのもの (これが 0 で clipped があれば、足したもので超えている)
+    //   midiFull: MIDI の音源が足した量が 16 ビットの上限か下限に届いた (か超えた) フレームの数。音源の中で止めた
+    //            (platform/mt32_synth.cpp、sc55_synth.cpp の clamp16()) ときに増える
+    //   dropped: リングバッファが満杯で捨てたフレームの数
     // 音が割れるという報告のときに、振り切れているのか、どの音源が大きいのかを実機で見分けるためのもの。
-    // ほかのコアやスレッドから呼んでよい (音を作る側はアトミックに書く)。clipped は 1 つずつアトミックに足すので、
-    // 取るのと重なっても、消えることも 2 つの区間に入ることもない。最大は、取るのと重なった 1 フレームが次の区間に
-    // 入ることがある。3 つを同時には取らないので、区間の境目は 1 フレームほどずれる
+    // ほかのコアやスレッドから呼んでよい (音を作る側はアトミックに書く)。数 (clipped、mixClipped、midiFull、dropped) は
+    // 1 つずつアトミックに足すので、取るのと重なっても、消えることも 2 つの区間に入ることもない。最大は、取るのと
+    // 重なった 1 フレームが次の区間に入ることがある。同時には取らないので、区間の境目は 1 フレームほどずれる
     struct Levels {
         uint32_t base, midi, clipped;
+        uint32_t opm, adpcm, mercury, opn, mix, mixClipped, midiFull, dropped;
     };
     Levels takeLevels() {
-        return {__atomic_exchange_n(&levelBase_, 0u, __ATOMIC_RELAXED), __atomic_exchange_n(&levelMidi_, 0u, __ATOMIC_RELAXED),
-                __atomic_exchange_n(&levelClipped_, 0u, __ATOMIC_RELAXED)};
+        const auto take = [](uint32_t& v) { return __atomic_exchange_n(&v, 0u, __ATOMIC_RELAXED); };
+        Levels lv;
+        lv.base = take(levelBase_);
+        lv.midi = take(levelMidi_);
+        lv.clipped = take(levelClipped_);
+        lv.opm = take(levelOpm_);
+        lv.adpcm = take(levelAdpcm_);
+        lv.mercury = take(levelMercury_);
+        lv.opn = take(levelOpn_);
+        lv.mix = take(levelMix_);
+        lv.mixClipped = take(levelMixClipped_);
+        lv.midiFull = take(levelMidiFull_);
+        lv.dropped = take(levelDropped_);
+        return lv;
     }
     // 補間の刻みを、出力の周波数から決まる値よりどれだけ小さくしているか (千分率。大きくしているときは 0)。
     // 5 までは速さのずれの調整、それより大きければ間に合わない間の調整 (stretchIfLow())。音を作る側が読む (試験用)
@@ -242,7 +281,8 @@ public:
         J_MIDI = 5,    // bit8: 1 なら音源の音をすべて止める、0 なら bit7-0 の MIDI のバイトを送る
         J_CD = 6,      // CD-ROM 装置のオーディオ。bit16: 0 なら左のサンプル (bit15-0)、1 なら右のサンプル (これで 1 フレーム)
         J_CD_DELTA = 7, // CD-ROM 装置のオーディオの 1 フレーム。前のフレームとの差 (bit27-14 が左、bit13-0 が右。14 ビットの符号つき)
-        J_MERCURY = 8, // bit27-24: 0 つなぐ、1 外す、2 コマンド (bit7-0)、3 DMAC のモード (bit7-0)、4 データ (bit15-0)
+        J_MERCURY = 8, // bit27-24: 0 つなぐ、1 外す、2 コマンド (bit7-0)、3 DMAC のモード (bit7-0)、4 データ (bit15-0)、
+                       // 5 YMF288 のレジスタへの書き込み (bit17: チップ、bit16: A1、bit15-8: レジスタの番号、bit7-0: 値)
     };
     // 進めたクロック数をまとめて記録する上限 (4MHz で 1ms)。これを超えたら記録して読み手に見せる
     static constexpr uint32_t JOURNAL_ADVANCE_CHUNK = 4000;
@@ -311,6 +351,14 @@ private:
         if (midi > __atomic_load_n(&levelMidi_, __ATOMIC_RELAXED)) __atomic_store_n(&levelMidi_, midi, __ATOMIC_RELAXED);
         if (l > 32767 || l < -32768 || r > 32767 || r < -32768)
             __atomic_fetch_add(&levelClipped_, 1u, __ATOMIC_RELAXED); // 読んで足して書くと、取るのと重なったときに前の区間の数が残る
+        const int32_t ml = l - bl, mr = r - br;
+        if (ml >= 32767 || ml <= -32768 || mr >= 32767 || mr <= -32768) __atomic_fetch_add(&levelMidiFull_, 1u, __ATOMIC_RELAXED);
+    }
+    // 左右の絶対値の大きい方が、覚えている最大より大きければ書く
+    static void notePeak(uint32_t& peak, int32_t a, int32_t b) {
+        const uint32_t x = (uint32_t)(a < 0 ? -(int64_t)a : a), y = (uint32_t)(b < 0 ? -(int64_t)b : b);
+        const uint32_t v = x > y ? x : y;
+        if (v > __atomic_load_n(&peak, __ATOMIC_RELAXED)) __atomic_store_n(&peak, v, __ATOMIC_RELAXED);
     }
     // extra_ を書く (latencyGoal() をほかのコアが読むので、アトミックに書く)
     void setExtra(unsigned frames) { __atomic_store_n(&extra_, frames, __ATOMIC_RELAXED); }
@@ -328,7 +376,13 @@ private:
     int32_t lp1_[2] = {}, lp2_[2] = {}; // フィルタ
     int64_t hpOut_[2] = {};             // 直流を切るフィルタの出力 (2^20 倍)
     int32_t hpIn_[2] = {};              // 直流を切るフィルタの前の入力
-    int32_t prev_[2] = {};       // 補間の前のサンプル
+    int32_t prev_[2] = {};       // 線形補間で直していたときの、前のサンプル (今は使わない。ステートの並びのために残す)
+    // 出力の周波数に直すフィルタの履歴 (低域通過フィルタの出力。16 ビットに止める前)。同じ値を j と j + RESAMPLE_TAPS に
+    // 書くので、hist_[c] + histPos_ からの RESAMPLE_TAPS 個が、古いものから順に並ぶ
+    int32_t hist_[2][2 * RESAMPLE_TAPS] = {};
+    uint32_t histPos_ = 0;       // 次に書く位置 (0 から RESAMPLE_TAPS - 1)
+    // 使う表 (コミットしてある表か、setOutputRate() が作って sound.cpp に置いた表)。Sound は持ち主ではない
+    const int16_t (*rows_)[RESAMPLE_TAPS] = nullptr;
     uint32_t pos_ = 0;           // 補間の位置 (16.16、前のサンプルからの距離)
     uint32_t step_ = 0, baseStep_ = 0; // 出力 1 フレームあたりに進む OPM のサンプル数 (16.16)
     unsigned target_ = 0;        // setLatency() の量 (読むときは target())
@@ -336,6 +390,8 @@ private:
     // 次の 2 つは合わせて 4 バイト (前は minFill_ が 4 バイト。Sound の大きさと並びを変えない)。どちらも
     // たまり具合 (AudioRing::SIZE 以下) なので 16 ビットで足りる
     uint32_t levelBase_ = 0, levelMidi_ = 0, levelClipped_ = 0; // takeLevels() の説明を参照 (ステートには入れない)
+    uint32_t levelOpm_ = 0, levelAdpcm_ = 0, levelMercury_ = 0, levelMix_ = 0; // 同上
+    uint32_t levelMixClipped_ = 0, levelMidiFull_ = 0, levelDropped_ = 0, levelOpn_ = 0;       // 同上
     uint16_t minFill_ = UINT16_MAX;  // 今の区間 (0.25 秒) のたまり具合の最小値
     uint16_t shortMin_ = UINT16_MAX; // この 1/32 秒のたまり具合の最小値 (stretchIfLow())
     unsigned extra_ = 0;         // 目標に足している量 (フレーム。読むときは extra()、書くときは setExtra())

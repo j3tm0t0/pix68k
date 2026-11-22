@@ -105,7 +105,7 @@ Munt の出力は 48kHz で、そのまま OPM と ADPCM の音に混ぜる (Mun
 超えた分は、上限と下限で止める (折り返さない。`midi_test`)。MIDI の音源が鳴ったか、止めたフレームがあった区間は、ログに
 `sound level: peak 18685 before MIDI, MIDI peak 20423 (of 32767), 0 frame(s) clipped after the mix` の形で、MIDI の音源を
 足す前の音の最大、MIDI の音源が足した量の最大、止めたフレームの数を出す (ベアメタル版は速さのログと同じ間隔で、その区間の値。
-ホスト版は終わるときに全体の値)。ベアメタル版は、Munt が捨てたメッセージと SysEx の数も、増えたときに
+ホスト版は終わるときに全体の値)。続けて `sound sources: OPM peak 17295, ADPCM 11192, Mercury PCM 0, YMF288 0, sum 19906 (of 32767); 0 sample(s) clipped before MIDI, 0 MIDI frame(s) at full scale, 0 frame(s) dropped` の形で、音源ごとの最大 (Mercury PCM と YMF288 は、まーきゅりーゆにっとの PCM と YMF288)、OPM と ADPCM とまーきゅりーゆにっとを足してフィルタを通した値の最大、その音だけ (出力の周波数に直したあと、CD-ROM 装置のオーディオと MIDI の音源を足す前) で 16 ビットを超えた出力のフレームの数、MIDI の音源の出力が 16 ビットの上限に届いたフレームの数 (音源の中で止めたときに増える)、リングバッファが満杯で捨てたフレームの数を出す (ベアメタル版は、足した値が上限の半分を超えたか、止めた、届いた、捨てたのどれかがあった区間だけ)。16 ビットに止めるのは全部を足したあとの 1 か所で、1 行目の `clipped after the mix` がその数。OPM、ADPCM、まーきゅりーゆにっとだけで超えたフレームは、2 行目の数にも 1 行目の数にも入る (2 行目が 0 で 1 行目が 0 でなければ、足した音源で超えている)。ベアメタル版は、Munt が捨てたメッセージと SysEx の数も、増えたときに
 `MT-32: dropped ...` で出す。
 
 グラディウス II (FD 版、SOUND MODE の MODULE を MIDI MT-32 にする) をホスト版で測ったときの値 (MT-32 Control v1.07):

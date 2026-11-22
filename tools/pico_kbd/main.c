@@ -4,7 +4,8 @@
 //       命令を 1 行ずつ受け、応答 ("#pico ..." の行) と、UART1 で受けたログを返す
 //   UART1 (GP5 = RX、115200bps): 試験する Pi の UART の TX (Pi 3 / 4 なら GPIO 14) につなぐ。受けたバイトをそのまま UART0 に送る
 //   UART1 (GP4 = TX): 試験する Pi の UART の RX につなぐと、S / W 命令で文字列を送れる (つながなくてもよい)
-//   USB: 試験する Pi につなぐ。boot プロトコルの USB キーボードに見える
+//   USB: 試験する Pi につなぐ。boot プロトコルの USB キーボードに見える。C 命令で kg を選ぶと、HID のゲームパッドも足した
+//       複合装置としてつなぎ直す (起動したときはキーボードだけ。PICO_KBD_PAD_DEFAULT=1 でビルドするとゲームパッドも見せる)
 //
 // 命令 (改行で終わる 1 行):
 //   P              "#pico ok" を返す (USB がつながっていれば "mounted" も付ける)
@@ -29,6 +30,17 @@
 //                  T と同じく \n、\r、\t、\e、\b、\\ が書ける。"sent N" を返す (N は送るバイト数)。
 //                  送る分が 1023 バイトの待ち行列に入りきらなければ、何も送らずに "send dropped"
 //   W 文字列       S と同じだが、最後に改行を付けない
+//   G [bb [h [ms]]] ゲームパッドのボタン bb (16 進、bit0 がボタン 1、32 個まで) とハット h (0 = 離す、1 = 上、2 = 右上、
+//                  時計回りに 8 = 左上) を押す。ms (1〜10000) を書くと、その時間だけ押して離す (押したレポートを
+//                  受け手が読み終えた時刻から数える)。書かなければ押したまま (0 は書けない)。
+//                  引数なしの G はすべて離す。応答は "pad"。ゲームパッドを見せていないときは "pad none"、
+//                  USB がつながっていないときは "pad dropped"、書き方が違えば "error bad-args"
+//   C off          USB を切り離す (tud_disconnect。試験機からは抜いたように見える)。応答は "usb off"
+//   C on [k|kg]    USB をつなぐ (tud_connect)。k はキーボードだけ、kg はキーボードとゲームパッド (省略すると今のまま)。
+//                  つないだまま違う組み合わせを選んだときは、切り離して 500 ミリ秒後につなぎ直す。応答は "usb on"
+//   C ms [k|kg]    USB を切り離し、ms ミリ秒 (100〜60000) 後につなぎ直す。応答は "usb off ms ms"、つなぎ直したら "usb on"。
+//                  キーボードとゲームパッドは 1 つの USB 装置なので、どちらも一緒に抜き差しされる。
+//                  切り離している間は T / K / D / G / U を入れずに dropped を返す ("up dropped" のときも、押したままのキーは忘れる)
 //   O ...          無線 LAN 越しの更新 (PICO_KBD_OTA を付けたビルドだけ。ota.c の先頭を参照)
 //   N              無線 LAN の様子を返す (無線 LAN のビルドだけ。"net up ip=... port=... host=... client=..." など。
 //                  無線 LAN なしのビルドは "net none")。行の終わりに " wd=W wd-boot=B" が付く
@@ -244,17 +256,67 @@ static void pulse_task(Pulse* p) {
 }
 
 // ---- USB ----
+#ifndef PICO_KBD_PAD_DEFAULT
+#define PICO_KBD_PAD_DEFAULT 0
+#endif
+static bool s_padEnabled = PICO_KBD_PAD_DEFAULT; // 今のつながり (切り離しているなら次のつながり) でゲームパッドを見せるか
+static bool s_usbOff;                            // C 命令で切り離している
+static bool s_usbReconnect;                      // s_reconnectAt につなぎ直す
+static absolute_time_t s_reconnectAt;
+
+bool app_pad_enabled(void) { return s_padEnabled; }
+
+static bool s_mountSeen; // 最後に切り離したあと (起動してから)、試験機が設定を終えた (tud_mount_cb())
+static bool s_inFlight;  // 送ったキーボードのレポートを受け手がまだ読んでいない
+
+// キーとゲームパッドを送ってよいか。切り離したあとも、試験機がバスをリセットするまで tud_mounted() は true のままなので、
+// 切り離したあとは、試験機が設定し直すまで (tud_mount_cb()) つながっていないとみなす
+static bool usb_up(void) { return tud_mounted() && !s_usbOff && s_mountSeen; }
+
+// ゲームパッドの状態。送るのは変わったときだけ。押している時間は、押したレポートが読まれてから数える (core.c の PadState)
+static PadState s_pad;
+
+static void pad_reset(void) { pad_init(&s_pad); } // 次につながったら、離した状態を 1 回送る
+
+static void pad_task(void) {
+    uint32_t b;
+    uint8_t h;
+    if (!s_padEnabled || !usb_up() || !tud_hid_n_ready(1)) return;
+    if (!pad_next(&s_pad, time_us_64(), &b, &h)) return;
+    if (tud_hid_n_gamepad_report(1, 0, 0, 0, 0, 0, 0, 0, h, b)) pad_sent(&s_pad);
+}
+
+// 切り離す。まだ送っていないキーとゲームパッドの状態は捨てる
+static void usb_off(void) {
+    tud_disconnect();
+    s_usbOff = true;
+    s_usbReconnect = false;
+    s_mountSeen = false;
+    s_inFlight = false;
+    keyq_init();
+    pad_reset();
+}
+
+static void usb_on(void) {
+    s_usbOff = false;
+    s_usbReconnect = false;
+    tud_connect();
+}
+
+static void usbc_task(void) {
+    if (s_usbReconnect && time_reached(s_reconnectAt) && reply("usb on")) usb_on();
+}
+
 static absolute_time_t s_next; // 次の項目を送ってよい時刻
 static uint32_t s_sentWaitUs;  // 送った項目の待ち時間。受け手が読み終えた時刻から数える
-static bool s_inFlight;        // 送った項目を受け手がまだ読んでいない
 
 static void usb_task(void) {
     const Step* s = keyq_peek();
     if (s == NULL) return;
     if (!time_reached(s_next)) return;
-    if (!tud_hid_ready()) return;                    // つながっていない、または前の送信がまだ読まれていない
+    if (s_usbOff || !tud_hid_n_ready(0)) return;     // つながっていない、または前の送信がまだ読まれていない
     if (s_inFlight) return;
-    if (!tud_hid_report(0, s->report, 8)) return;    // 受け付けられなければ、次の周回でもう一度送る
+    if (!tud_hid_n_report(0, 0, s->report, 8)) return; // 受け付けられなければ、次の周回でもう一度送る
     // 押している時間は、受け手が読み終えた時刻から数える (tud_hid_report_complete_cb)。
     // 受け手が読みに来るのが遅れても、押してから離すまでの時間が縮まないように
     s_sentWaitUs = s->wait_us;
@@ -303,11 +365,11 @@ static void run(const char* line) {
     case 0:
         return;
     case 'P':
-        reply(tud_mounted() ? "ok mounted" : "ok not-mounted");
+        reply(usb_up() ? "ok mounted" : "ok not-mounted");
         return;
     case 'T': {
         // つながる前に入れたキーは、つながったとき (tud_mount_cb()) に捨てられるので、入れずに dropped に数える
-        const bool mounted = tud_mounted();
+        const bool mounted = usb_up();
         unsigned skipped = 0, full = 0;
         for (; *p; p++) {
             char c = *p;
@@ -335,7 +397,7 @@ static void run(const char* line) {
             reply("error bad-args");
             return;
         }
-        reply(tud_mounted() && keyq_tap((uint8_t)u, (uint8_t)m, ms) ? "key" : "key dropped");
+        reply(usb_up() && keyq_tap((uint8_t)u, (uint8_t)m, ms) ? "key" : "key dropped");
         return;
     }
     case 'D': {
@@ -347,10 +409,16 @@ static void run(const char* line) {
             reply("error bad-args");
             return;
         }
-        reply(tud_mounted() && keyq_down((uint8_t)u, (uint8_t)m) ? "down" : "down dropped");
+        reply(usb_up() && keyq_down((uint8_t)u, (uint8_t)m) ? "down" : "down dropped");
         return;
     }
     case 'U':
+        // 切り離している間は列に入れない (つなぎ直したとき tud_mount_cb() が列を捨てる)。押したままのキーは忘れる
+        if (!usb_up()) {
+            keyq_init();
+            reply("up dropped");
+            return;
+        }
         keyq_up();
         reply("up");
         return;
@@ -405,6 +473,56 @@ static void run(const char* line) {
         }
         if (cmd == 'S') ring_put(&s_piTxRing, '\n');
         snprintf(buf, sizeof buf, "sent %u", n);
+        reply(buf);
+        return;
+    }
+    case 'G': {
+        uint32_t b;
+        uint8_t h;
+        unsigned ms;
+        if (!pad_parse(p, &b, &h, &ms)) {
+            reply("error bad-args");
+            return;
+        }
+        if (!s_padEnabled) {
+            reply("pad none");
+            return;
+        }
+        if (!usb_up()) {
+            reply("pad dropped");
+            return;
+        }
+        pad_set(&s_pad, b, h, ms);
+        reply("pad");
+        return;
+    }
+    case 'C': {
+        UsbcAction a;
+        unsigned ms;
+        UsbcMode m;
+        if (!usbc_parse(p, &a, &ms, &m)) {
+            reply("error bad-args");
+            return;
+        }
+        const bool pad = m == USBC_SAME ? s_padEnabled : m == USBC_KBD_PAD;
+        if (a == USBC_OFF) {
+            usb_off();
+            reply("usb off");
+            return;
+        }
+        if (a == USBC_ON && (s_usbOff || pad == s_padEnabled)) {
+            s_padEnabled = pad;
+            if (s_usbOff) usb_on();
+            reply("usb on");
+            return;
+        }
+        // 切り離して、決めた時間のあとにつなぎ直す (つないだまま組み合わせを変える C on は 500 ミリ秒)
+        if (a == USBC_ON) ms = 500;
+        usb_off();
+        s_padEnabled = pad; // 記述子は、つなぎ直したときに試験機が読み直す
+        s_usbReconnect = true;
+        s_reconnectAt = make_timeout_time_ms(ms);
+        snprintf(buf, sizeof buf, "usb off %u ms", ms);
         reply(buf);
         return;
     }
@@ -538,6 +656,8 @@ int main(void) {
         wd_task();
         tud_task();
         usb_task();
+        pad_task();
+        usbc_task();
         pulse_task(&s_rst);
         pulse_task(&s_pwr);
         uart_task();
@@ -561,9 +681,14 @@ int main(void) {
 
 // ---- TinyUSB の呼び出し ----
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, uint8_t* buffer, uint16_t reqlen) {
-    (void)instance;
     (void)report_id;
     (void)type;
+    if (instance == 1) { // ゲームパッド: 今の状態
+        hid_gamepad_report_t r = {.hat = s_pad.hat, .buttons = s_pad.buttons};
+        if (reqlen < sizeof r) return 0;
+        memcpy(buffer, &r, sizeof r);
+        return sizeof r;
+    }
     if (reqlen < 8) return 0;
     memset(buffer, 0, 8);
     return 8;
@@ -571,9 +696,8 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 
 // 受け手 (試験する Pi) が送ってきた LED の状態を知らせる (pix68k がこのキーボードを使っているかの目安)
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, uint8_t const* buffer, uint16_t size) {
-    (void)instance;
     (void)report_id;
-    if (type == HID_REPORT_TYPE_OUTPUT && size >= 1) {
+    if (instance == 0 && type == HID_REPORT_TYPE_OUTPUT && size >= 1) {
         char buf[24];
         snprintf(buf, sizeof buf, "led %02x", buffer[0]);
         reply(buf);
@@ -581,9 +705,13 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 }
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_t len) {
-    (void)instance;
     (void)report;
     (void)len;
+    if (instance == 1) { // ゲームパッド: 押している時間は、ここから数える
+        pad_complete(&s_pad, time_us_64());
+        return;
+    }
+    if (instance != 0) return;
     s_next = make_timeout_time_us(s_sentWaitUs);
     s_inFlight = false;
 }
@@ -591,10 +719,14 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_
 // 送れなかったときも、次の項目に進めるようにする
 void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type, uint8_t const* report,
                               uint16_t xferred_bytes) {
-    (void)instance;
     (void)report_type;
     (void)report;
     (void)xferred_bytes;
+    if (instance == 1) { // ゲームパッドは、送れなかった状態をもう一度送る
+        pad_failed(&s_pad);
+        return;
+    }
+    if (instance != 0) return;
     s_next = make_timeout_time_us(s_sentWaitUs);
     s_inFlight = false;
 }
@@ -610,17 +742,22 @@ void tud_suspend_cb(bool remote_wakeup_en) {
     keyq_up();
     s_inFlight = false;
     s_next = get_absolute_time();
+    pad_reset();
 }
 
 void tud_mount_cb(void) {
+    s_mountSeen = true;
     keyq_init();
+    pad_reset();
     s_inFlight = false;
     s_next = get_absolute_time(); // 前のつながりの待ち時間 (K の ms など) を持ち越さない
     reply("mounted");
 }
 // つながりが切れたら、残っているキーを捨てる
 void tud_umount_cb(void) {
+    s_mountSeen = false;
     keyq_init();
+    pad_reset();
     s_inFlight = false;
     reply("unmounted");
 }

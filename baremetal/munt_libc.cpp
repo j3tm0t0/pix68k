@@ -18,10 +18,28 @@ constexpr double kPiHalfHi = 1.57079632673412561417;
 constexpr double kPiHalfLo = 6.07710050650619224932e-11;
 constexpr double kTwoOverPi = 0.63661977236758134308;
 
+// AArch64 では丸めと絶対値と平方根の命令を直接使う。32 ビットの ARM (Pi 2 の Cortex-A7、ARMv7) には frintn / frintm /
+// frintp に当たる命令がないので、丸めは C で書く (絶対値と平方根は VFP の vabs / vsqrt)
+#if !defined(__aarch64__)
+constexpr double kTwo52 = 4503599627370496.0; // 2^52。絶対値がこれ以上の倍精度の値は、すべて整数
+
+// 絶対値が 2^52 以上か NaN (丸めずにそのまま返す値)
+inline bool isIntegral(double x) { return !(x > -kTwo52 && x < kTwo52); }
+#endif
+
+// 最も近い整数に丸める (真ん中は偶数へ)
 inline double roundNearest(double x) {
+#if defined(__aarch64__)
     double r;
     asm("frintn %d0, %d1" : "=w"(r) : "w"(x));
     return r;
+#else
+    if (isIntegral(x)) return x;
+    // 2^52 を足すと小数の部分が丸めで落ちる (FPSCR の丸めは既定の「最も近い偶数へ」のまま)。
+    // コンパイラが足し引きを消さないように volatile に置く
+    volatile double t = x < 0 ? x - kTwo52 : x + kTwo52;
+    return x < 0 ? t + kTwo52 : t - kTwo52;
+#endif
 }
 
 // 2^i (i は整数)。倍精度の指数の範囲を超えたら 0 か大きな値
@@ -104,26 +122,46 @@ void putNumber(Out& o, unsigned long long v, unsigned base, bool upper, bool neg
 extern "C" {
 
 double floor(double x) {
+#if defined(__aarch64__)
     double r;
     asm("frintm %d0, %d1" : "=w"(r) : "w"(x));
     return r;
+#else
+    if (isIntegral(x)) return x;
+    const double t = (double)(long long)x; // 0 に向けて切り捨てる
+    return t > x ? t - 1.0 : t;
+#endif
 }
 
 double ceil(double x) {
+#if defined(__aarch64__)
     double r;
     asm("frintp %d0, %d1" : "=w"(r) : "w"(x));
     return r;
+#else
+    if (isIntegral(x)) return x;
+    const double t = (double)(long long)x;
+    return t < x ? t + 1.0 : t;
+#endif
 }
 
 double fabs(double x) {
     double r;
+#if defined(__aarch64__)
     asm("fabs %d0, %d1" : "=w"(r) : "w"(x));
+#else
+    asm("vabs.f64 %P0, %P1" : "=w"(r) : "w"(x));
+#endif
     return r;
 }
 
 double sqrt(double x) {
     double r;
+#if defined(__aarch64__)
     asm("fsqrt %d0, %d1" : "=w"(r) : "w"(x));
+#else
+    asm("vsqrt.f64 %P0, %P1" : "=w"(r) : "w"(x));
+#endif
     return r;
 }
 

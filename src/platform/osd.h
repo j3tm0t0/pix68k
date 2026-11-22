@@ -15,6 +15,10 @@
 //      (16:9 のモニタの左右の黒いところ) が 128 ドットあるとき。右の余白が狭くても、上の余白が 4 + 行数 x 16 ライン
 //      以上あれば重ならないので縦に並べる (行数は 4 から 9 で変わるので、上の余白が 68 から 147 ラインのときは、
 //      THROTTLED や IP アドレスが出たり消えたりすると、縦と 2. の横 1 行が入れ替わる。前の場所は OsdState が消す)
+//   1b. 右の余白が 128 ドットに足りなくても 96 ドットあれば、1 行を OSD_V_ITEM (11) 文字に詰めて縦に並べる (狭い並び。
+//      #314)。IP アドレスのほかの行はもともと 11 文字に入る。IP アドレスが 11 文字を超えるときは、2 つ目の「.」のあとで
+//      2 行に分ける (「192.168.」「1.41」)。フレームバッファを表示の半分にして GPU に拡大させるとき (pix68k_gpu_scale=2。
+//      960x540 に 768x512 の画面で、余白が 96 ドット) に、X68000 の画面に重ねずに出すため
 //   2. 重なるなら横 1 行 (placeOsd())。X68000 の画面に重ならなければ (上の余白が 20 ライン以上) そこに出す
 //   3. どちらも重なるときは、縦に並べたものを右上に置き、X68000 の画面に重ねる (overlay。osd=on でも osd=fps でも)
 //      (IP アドレスをいつも出すため。2026-11 に持ち主が決めた)。フレームバッファに縦に並べたものが入らなければ、
@@ -45,7 +49,9 @@ static constexpr int OSD_V_COLS = 15;  // 縦に並べるときの 1 行の文�
 static constexpr int OSD_V_ITEM = 11;  // IP アドレスのほかの行の文字数の上限 (上の注釈を参照)
 static constexpr int OSD_V_ITEMS = 8;  // IP アドレスのほかの行の数 (Pi、MPU、フレーム、速さ、ヒープ、温度、ファン、クロックを下げたか)
 static constexpr int OSD_V_ROWS = OSD_V_ITEMS + 1; // 縦に並べるときの行数の上限 (IP アドレスの行を足す)
-static constexpr int OSD_TEXT_MAX = OSD_V_COLS * OSD_V_ROWS; // formatOsdRows() が作る文字数の上限 (横 1 行より多い)
+static constexpr int OSD_V_ROWS_NARROW = OSD_V_ROWS + 1; // 狭い並び (1 行 OSD_V_ITEM 文字) の行数の上限 (IP アドレスが 2 行)
+// formatOsdRows() が作る文字数の上限 (横 1 行より多い。狭い並びの OSD_V_ITEM * OSD_V_ROWS_NARROW = 110 より多い)
+static constexpr int OSD_TEXT_MAX = OSD_V_COLS * OSD_V_ROWS;
 // 絵の画素数の上限 (縦に並べて、いちばん多い行数のとき。横 1 行は OSD_CHARS_MAX * 8 * 16 で、これより小さい)
 static constexpr int OSD_IMAGE_PIXELS = OSD_V_COLS * 8 * OSD_V_ROWS * 16;
 static constexpr int OSD_MODE_OFF = 0, OSD_MODE_FPS = 1, OSD_MODE_ON = 2; // Settings::osd
@@ -69,13 +75,14 @@ enum OsdPi {
     OSD_PI_3B, OSD_PI_3BPLUS, OSD_PI_3APLUS, OSD_PI_CM3, OSD_PI_CM3PLUS, OSD_PI_ZERO2W,
     OSD_PI_4B, OSD_PI_400, OSD_PI_CM4, OSD_PI_CM4S,
     OSD_PI_5, OSD_PI_500, OSD_PI_CM5, OSD_PI_CM5LITE,
+    OSD_PI_2B, // Raspberry Pi 2 Model B (32 ビットのカーネル、#302)
     OSD_PI_OTHER, // 上のどれでもない (「Pi」と出す)
     OSD_PI_COUNT
 };
 // OSD に出すモデルの名前 (6 文字まで。クロックと合わせて 11 文字に入るように)
 inline const char* osdPiName(int pi) {
     static const char* const names[OSD_PI_COUNT] = {"",     "RPi3", "RPi3+", "RPi3A+", "CM3",  "CM3+",  "Zero2", "RPi4",
-                                                    "Pi400", "CM4", "CM4S",  "RPi5",   "Pi500", "CM5", "CM5L",  "Pi"};
+                                                    "Pi400", "CM4", "CM4S",  "RPi5",   "Pi500", "CM5", "CM5L",  "RPi2", "Pi"};
     return pi > 0 && pi < OSD_PI_COUNT ? names[pi] : "";
 }
 // 出す ARM のクロック (MHz) に丸める。1000MHz 以上は 100MHz 単位 (「2.4GHz」と出す)、それより下は 10MHz 単位
@@ -305,6 +312,22 @@ inline void ipRow(Text& t, uint32_t ip) {
         t.num(ip >> (24 - 8 * i) & 255);
     }
 }
+// 狭い並びで、IP アドレスが 1 行 (OSD_V_ITEM 文字) に入らないか
+inline bool ipNeedsTwoRows(uint32_t ip) {
+    Text t;
+    ipRow(t, ip);
+    return t.n > OSD_V_ITEM;
+}
+// IP アドレスを 2 行に分ける: a に「192.168.」(2 つ目の「.」まで)、b に「1.41」
+inline void ipTwoRows(Text& a, Text& b, uint32_t ip) {
+    a.num(ip >> 24 & 255);
+    a.ch('.');
+    a.num(ip >> 16 & 255);
+    a.ch('.');
+    b.num(ip >> 8 & 255);
+    b.ch('.');
+    b.num(ip & 255);
+}
 } // namespace osd_detail
 
 // packed を横 1 行で出すときの文字数。「THR」(4 文字) は出すときだけ足す
@@ -326,6 +349,13 @@ inline int osdRows(const OsdValue& packed) {
     const OsdStats s = unpackOsd(packed);
     int n = s.throttled ? 8 : s.fanLevel >= 0 ? 7 : s.tempDeciC >= 0 ? 6 : s.heapMB >= 0 ? 5 : 4; // 速さの行 (4 行目) はいつもある
     return n + (packed.hasIp() ? 1 : 0);
+}
+
+// 狭い並び (1 行 OSD_V_ITEM 文字) のときの行数。IP アドレスが 11 文字を超えるときは 2 行に分けるので 1 行多い
+inline int osdRowsNarrow(const OsdValue& packed) {
+    const int n = osdRows(packed);
+    if (!packed.valid() || !packed.hasIp()) return n;
+    return n + (osd_detail::ipNeedsTwoRows(unpackOsd(packed).ipv4) ? 1 : 0);
 }
 
 // packed の数字を width 文字 (OSD_CHARS_MAX まで) に右寄せして out に入れる (out は width + 1 バイト)。数字がなければ空白だけ
@@ -358,11 +388,16 @@ inline void formatOsd(char* out, const OsdValue& packed, int width = OSD_CHARS) 
 // 上から、Pi のモデルと ARM のクロック、MPU とクロック、フレームの速さ、X68000 の速さ、ヒープの使った量、温度、
 // ファンの回転数、クロックを下げたか (温度とファンを隣に置く)。出さない項目の行は空白。
 // IP アドレスは決まった行に置かず、最後の空でない行のすぐ下に出す (ファンや THROTTLED がないときに、空いた行を挟まない)。
-// 数字がなければ空白だけ
-inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_ITEMS) {
-    if (rows_ > OSD_V_ROWS) rows_ = OSD_V_ROWS;
+// 数字がなければ空白だけ。
+// cols が OSD_V_ITEM なら狭い並び: 1 行 cols 文字に右寄せし、IP アドレスが入らなければ 2 行に分ける (rows は
+// osdRowsNarrow() の値、OSD_V_ROWS_NARROW まで)。cols は OSD_V_COLS か OSD_V_ITEM (ほかの値は OSD_V_COLS として扱う)
+inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_ITEMS, int cols = OSD_V_COLS) {
+    const bool narrow = cols == OSD_V_ITEM;
+    if (!narrow) cols = OSD_V_COLS;
+    const int maxRows = narrow ? OSD_V_ROWS_NARROW : OSD_V_ROWS;
+    if (rows_ > maxRows) rows_ = maxRows;
     if (rows_ < 0) rows_ = 0;
-    osd_detail::Text rows[OSD_V_ROWS];
+    osd_detail::Text rows[OSD_V_ROWS_NARROW];
     if (packed.valid()) {
         const OsdStats s = unpackOsd(packed);
         if (s.pi != OSD_PI_NONE) osd_detail::piRow(rows[0], s);
@@ -412,18 +447,21 @@ inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_I
         if (packed.hasIp()) {
             int k = OSD_V_ITEMS;
             while (k > 0 && rows[k - 1].n == 0) k--;
-            osd_detail::ipRow(rows[k], s.ipv4);
+            if (narrow && osd_detail::ipNeedsTwoRows(s.ipv4))
+                osd_detail::ipTwoRows(rows[k], rows[k + 1], s.ipv4);
+            else
+                osd_detail::ipRow(rows[k], s.ipv4);
         }
     }
-    for (int i = 0; i < rows_; i++) rows[i].right(out + i * OSD_V_COLS, OSD_V_COLS);
-    out[rows_ * OSD_V_COLS] = 0;
+    for (int i = 0; i < rows_; i++) rows[i].right(out + i * cols, cols);
+    out[rows_ * cols] = 0;
 }
 
 struct OsdRect {
     int x = 0, y = 0, w = 0, h = 0; // フレームバッファの中の位置と大きさ。w が 0 なら出さない
     int scale = 1;                  // 文字の倍率
     bool overlay = false;           // X68000 の画面に重なる (写すたびに描く)
-    bool vertical = false;          // 1 項目ずつ縦に並べる (OSD_V_COLS 文字 x h / 16 行)。false なら横 1 行
+    bool vertical = false;          // 1 項目ずつ縦に並べる (OSD_V_COLS 文字か、狭い並びの OSD_V_ITEM 文字 x h / 16 行)。false なら横 1 行
 
     bool operator==(const OsdRect& o) const {
         return x == o.x && y == o.y && w == o.w && h == o.h && scale == o.scale && overlay == o.overlay &&
@@ -431,6 +469,9 @@ struct OsdRect {
     }
     bool operator!=(const OsdRect& o) const { return !(*this == o); }
 };
+
+// r が狭い並び (縦に並べて、1 行 OSD_V_ITEM 文字) か。並びは幅で見分ける
+inline bool osdIsNarrow(const OsdRect& r) { return r.vertical && r.w == OSD_V_ITEM * 8 * r.scale; }
 
 // fbW x fbH の画面の右上に、横 1 行 (chars 文字。OSD_CHARS_MAX まで) で置く。X68000 の画面 (picX, picY から picW x picH) に
 // 重なれば overlay。左端は 4 画素にそろえる (フレームバッファに 16 バイトずつ書けるように)。入らなければ w = 0
@@ -447,13 +488,16 @@ inline OsdRect placeOsd(int fbW, int fbH, int picX, int picY, int picW, int picH
     return r;
 }
 
-// 画面の右上に、縦に並べて置く (OSD_V_COLS 文字 x rows 行、1 倍)。X68000 の画面 (picX, picY から picW x picH) に重なれば
+// 画面の右上に、縦に並べて置く (cols 文字 x rows 行、1 倍。cols は OSD_V_COLS か、狭い並びの OSD_V_ITEM)。X68000 の画面 (picX, picY から picW x picH) に重なれば
 // overlay。左端は 4 画素にそろえる。X68000 の画面をまだ写していない (picW が 0 以下) か、入らなければ w = 0
-inline OsdRect placeOsdVertical(int fbW, int fbH, int picX, int picY, int picW, int picH, int rows = OSD_V_ITEMS) {
+inline OsdRect placeOsdVertical(int fbW, int fbH, int picX, int picY, int picW, int picH, int rows = OSD_V_ITEMS,
+                                int cols = OSD_V_COLS) {
     OsdRect r;
     if (picW <= 0 || rows < 1) return r;
-    if (rows > OSD_V_ROWS) rows = OSD_V_ROWS;
-    r.w = OSD_V_COLS * 8;
+    const bool narrow = cols == OSD_V_ITEM;
+    if (!narrow) cols = OSD_V_COLS;
+    if (rows > (narrow ? OSD_V_ROWS_NARROW : OSD_V_ROWS)) rows = narrow ? OSD_V_ROWS_NARROW : OSD_V_ROWS;
+    r.w = cols * 8;
     r.h = rows * 16;
     r.x = (fbW - r.w - OSD_PAD_X) & ~3;
     r.y = OSD_PAD_Y;
@@ -464,12 +508,17 @@ inline OsdRect placeOsdVertical(int fbW, int fbH, int picX, int picY, int picW, 
 }
 
 // 置く場所を決める (このファイルの先頭の 1. から 3.)。mode は Settings::osd。chars は横 1 行にするときの文字数
-// (osdChars())、rows は縦に並べるときの行数 (osdRows())
+// (osdChars())、rows は縦に並べるときの行数 (osdRows())、rowsNarrow は狭い並びの行数 (osdRowsNarrow()。0 以下なら
+// 狭い並びは使わない)
 inline OsdRect chooseOsd(int mode, int fbW, int fbH, int picX, int picY, int picW, int picH, int chars = OSD_CHARS,
-                         int rows = OSD_V_ITEMS) {
+                         int rows = OSD_V_ITEMS, int rowsNarrow = 0) {
     if (mode == OSD_MODE_OFF) return OsdRect();
     const OsdRect v = placeOsdVertical(fbW, fbH, picX, picY, picW, picH, rows);
     if (v.w > 0 && !v.overlay) return v;
+    if (rowsNarrow > 0) {
+        const OsdRect n = placeOsdVertical(fbW, fbH, picX, picY, picW, picH, rowsNarrow, OSD_V_ITEM);
+        if (n.w > 0 && !n.overlay) return n;
+    }
     const OsdRect h = placeOsd(fbW, fbH, picX, picY, picW, picH, 1, chars);
     if (h.w > 0 && !h.overlay) return h;
     if (v.w > 0) return v;
@@ -524,10 +573,12 @@ inline void renderOsd(uint32_t* image, const OsdRect& r, const OsdValue& packed)
         renderOsdImage(image, r, text);
         return;
     }
-    formatOsdRows(text, packed, r.h / (16 * r.scale));
+    // 幅で並びが分かる (OSD_V_COLS 文字か、狭い並びの OSD_V_ITEM 文字)
+    const int cols = osdIsNarrow(r) ? OSD_V_ITEM : OSD_V_COLS;
+    formatOsdRows(text, packed, r.h / (16 * r.scale), cols);
     const int rowH = 16 * r.scale;
     for (int y = 0; y < r.h; y++)
-        renderOsdRow(image + (size_t)y * r.w, text + (y / rowH) * OSD_V_COLS, y % rowH, r.scale, OSD_V_COLS);
+        renderOsdRow(image + (size_t)y * r.w, text + (y / rowH) * cols, y % rowH, r.scale, cols);
 }
 
 // 描く側が持つ「いま画面に出ているもの」。update() に出したい値と場所を渡すと、消す場所と描くかを決める。

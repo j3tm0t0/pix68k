@@ -243,7 +243,112 @@ static void test_base64_crc(void) {
     CHECK(crc32_update(0, NULL, 0) == 0);
 }
 
+static void test_pad_parse(void) {
+    uint32_t b = 99;
+    uint8_t h = 99;
+    unsigned ms = 99;
+    CHECK(pad_parse("", &b, &h, &ms) && b == 0 && h == 0 && ms == 0);   // すべて離す
+    CHECK(pad_parse("  ", &b, &h, &ms) && b == 0 && h == 0 && ms == 0);
+    CHECK(pad_parse("1", &b, &h, &ms) && b == 1 && h == 0 && ms == 0);  // 押したまま
+    CHECK(pad_parse("ffffffff 8 10000", &b, &h, &ms) && b == 0xffffffffu && h == 8 && ms == 10000);
+    CHECK(pad_parse(" 0 1 200 ", &b, &h, &ms) && b == 0 && h == 1 && ms == 200);
+    CHECK(pad_parse("Ab 3", &b, &h, &ms) && b == 0xab && h == 3 && ms == 0);
+    b = 7;
+    CHECK(!pad_parse("100000000", &b, &h, &ms));  // 32 ビットを超える
+    CHECK(b == 7);                                // 失敗したときは書き換えない
+    CHECK(!pad_parse("1 9", &b, &h, &ms));        // ハットは 8 まで
+    CHECK(!pad_parse("1 0 10001", &b, &h, &ms));  // 10 秒まで
+    CHECK(!pad_parse("1 0 99999999999", &b, &h, &ms));
+    CHECK(!pad_parse("1 0 100 5", &b, &h, &ms));  // 余計な引数
+    CHECK(!pad_parse("1 0 0", &b, &h, &ms));      // 明示した 0 ミリ秒は断る (押したままは、ミリ秒を書かない)
+    CHECK(!pad_parse("x", &b, &h, &ms));
+    CHECK(!pad_parse("1x", &b, &h, &ms));
+    CHECK(!pad_parse("1 2a", &b, &h, &ms));
+}
+
+static void test_pad_state(void) {
+    PadState s;
+    uint32_t b;
+    uint8_t h;
+    // 起動したとき: 離した状態を 1 回送る
+    pad_init(&s);
+    CHECK(pad_next(&s, 0, &b, &h) && b == 0 && h == 0);
+    pad_sent(&s);
+    CHECK(!pad_next(&s, 0, &b, &h)); // 読まれるまで次を送らない
+    // 前のレポートが読まれる前に G 1 0 1。読まれるのが 5ms 遅れても、押したレポートは送られ、そこから 1ms 押す
+    pad_set(&s, 1, 0, 1);
+    CHECK(!pad_next(&s, 5000, &b, &h));
+    pad_complete(&s, 5000); // 前の (離した) レポートが読まれた。ここでは数え始めない
+    CHECK(!s.releasePending);
+    CHECK(pad_next(&s, 5000, &b, &h) && b == 1);
+    pad_sent(&s);
+    CHECK(!pad_next(&s, 20000, &b, &h)); // 押したレポートがまだ読まれていない。時間が過ぎても離さない
+    pad_complete(&s, 20000);             // 読まれた。ここから 1ms
+    CHECK(!pad_next(&s, 20999, &b, &h));
+    CHECK(pad_next(&s, 21000, &b, &h) && b == 0 && h == 0);
+    pad_sent(&s);
+    pad_complete(&s, 22000);
+    CHECK(!s.releasePending && !pad_next(&s, 100000, &b, &h)); // 離したレポートでは数え始めない
+    // 押したまま (ミリ秒なし) は離さない
+    pad_set(&s, 2, 3, 0);
+    CHECK(pad_next(&s, 0, &b, &h) && b == 2 && h == 3);
+    pad_sent(&s);
+    pad_complete(&s, 0);
+    CHECK(!pad_next(&s, 100000000, &b, &h));
+    // 送れなかったときは、同じ状態を送り直し、押す時間はその送信が読まれてから数える
+    pad_set(&s, 4, 0, 10);
+    CHECK(pad_next(&s, 0, &b, &h) && b == 4);
+    pad_sent(&s);
+    pad_failed(&s);
+    CHECK(!s.releasePending);
+    CHECK(pad_next(&s, 50000, &b, &h) && b == 4);
+    pad_sent(&s);
+    pad_complete(&s, 60000);
+    CHECK(!pad_next(&s, 69999, &b, &h));
+    CHECK(pad_next(&s, 70000, &b, &h) && b == 0);
+    pad_sent(&s);
+    pad_complete(&s, 70000);
+    // 押している間に別の G が来たら、前の離す時刻は捨てる
+    pad_set(&s, 8, 0, 5);
+    CHECK(pad_next(&s, 0, &b, &h));
+    pad_sent(&s);
+    pad_complete(&s, 0);
+    pad_set(&s, 16, 0, 0);
+    CHECK(pad_next(&s, 1000, &b, &h) && b == 16);
+    pad_sent(&s);
+    pad_complete(&s, 1000);
+    CHECK(!pad_next(&s, 10000000, &b, &h)); // 5ms で離さない
+}
+
+static void test_usbc_parse(void) {
+    UsbcAction a;
+    unsigned ms;
+    UsbcMode m;
+    CHECK(usbc_parse("off", &a, &ms, &m) && a == USBC_OFF && m == USBC_SAME);
+    CHECK(usbc_parse(" off ", &a, &ms, &m) && a == USBC_OFF);
+    CHECK(usbc_parse("on", &a, &ms, &m) && a == USBC_ON && m == USBC_SAME);
+    CHECK(usbc_parse("on kg", &a, &ms, &m) && a == USBC_ON && m == USBC_KBD_PAD);
+    CHECK(usbc_parse("on k", &a, &ms, &m) && a == USBC_ON && m == USBC_KBD);
+    CHECK(usbc_parse("3000", &a, &ms, &m) && a == USBC_CYCLE && ms == 3000 && m == USBC_SAME);
+    CHECK(usbc_parse("100 kg", &a, &ms, &m) && a == USBC_CYCLE && ms == 100 && m == USBC_KBD_PAD);
+    CHECK(!usbc_parse("99", &a, &ms, &m));  // 100 ミリ秒より短い切り離しは受けない
+    CHECK(!usbc_parse("1 kg", &a, &ms, &m));
+    CHECK(usbc_parse("60000 k", &a, &ms, &m) && ms == 60000 && m == USBC_KBD);
+    CHECK(!usbc_parse("", &a, &ms, &m));
+    CHECK(!usbc_parse("0", &a, &ms, &m));
+    CHECK(!usbc_parse("60001", &a, &ms, &m));
+    CHECK(!usbc_parse("off k", &a, &ms, &m));
+    CHECK(!usbc_parse("on g", &a, &ms, &m));
+    CHECK(!usbc_parse("on kgx", &a, &ms, &m));
+    CHECK(!usbc_parse("onn", &a, &ms, &m));
+    CHECK(!usbc_parse("100 kg 1", &a, &ms, &m));
+    CHECK(!usbc_parse("100ms", &a, &ms, &m));
+}
+
 int main(void) {
+    test_pad_parse();
+    test_usbc_parse();
+    test_pad_state();
     test_base64_crc();
     test_token();
     test_logline();

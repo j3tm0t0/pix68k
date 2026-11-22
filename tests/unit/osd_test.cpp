@@ -7,6 +7,7 @@
 
 #include "platform/crt_effect.h"
 #include "platform/osd.h"
+#include "platform/osd_bars.h"
 #include "test_check.h"
 
 using namespace platform;
@@ -545,15 +546,7 @@ struct ShowSim {
         cache.rows = fh;
         fillOutside((uint8_t*)fb.data(), pitch, sw, sh, s, 0xff000000u);
     }
-    void force(int y0, int y1) {
-        if (cache.forceY0 >= cache.forceY1) {
-            cache.forceY0 = y0;
-            cache.forceY1 = y1;
-            return;
-        }
-        if (y0 < cache.forceY0) cache.forceY0 = y0;
-        if (y1 > cache.forceY1) cache.forceY1 = y1;
-    }
+    void force(int y0, int y1) { cache.force(y0, y1); }
     void show(const OsdValue& v) {
         uint8_t* base = (uint8_t*)fb.data();
         rect = chooseOsd(OSD_MODE_ON, sw, sh, s.dstX, s.dstY, s.dstW, s.dstH, osdChars(v), osdRows(v));
@@ -727,6 +720,7 @@ void testPiRow() {
     CHECK_EQ(strcmp(row0(OSD_PI_CM5LITE, 2400), "CM5L 2.4GHz"), 0);
     CHECK_EQ(strcmp(row0(OSD_PI_CM3PLUS, 1200), "CM3+ 1.2GHz"), 0);
     CHECK_EQ(strcmp(row0(OSD_PI_OTHER, 1500), "  Pi 1.5GHz"), 0);
+    CHECK_EQ(strcmp(row0(OSD_PI_2B, 900), "RPi2 900MHz"), 0);
     CHECK_EQ(strcmp(row0(OSD_PI_3B, 700), "RPi3 700MHz"), 0);         // 1GHz より下は MHz (QEMU など)
     CHECK_EQ(strcmp(row0(OSD_PI_5, 0), "       RPi5"), 0);          // クロックがなければ名前だけ
     CHECK_EQ(strcmp(row0(OSD_PI_NONE, 2400), "           "), 0);    // モデルがなければ出さない
@@ -1316,9 +1310,9 @@ void testOverlay(int fw, int fh, int sw, int sh, bool scaleOn) {
 // 既定の osd=on で、モニタの大きさと X68000 の画面モードごとに、どこに出るかを表にする (いちばん行の多い値: ファン、
 // THROTTLED、15 文字の IP アドレス)。どの組み合わせでも出て (IP アドレスも)、フレームバッファからはみ出さない。
 // X68000 の画面に重なるのは overlay のときだけ。16:9 のモニタ (720p 以上) では、重ねずに縦に並べる
-// (gpu_scale=2 の 960x540 で、余白が 120 + 8 ドットに足りないときを除く)
+// (gpu_scale=2 の 960x540 でも、右の余白が 96 ドットあれば 11 文字幅の狭い並びで重ねずに出す。#314)
 void testCoverage() {
-    printf("coverage (osd=on: V 縦に並べる、v 縦に並べて重ねる、H 横 1 行、h 横 1 行を重ねる)\n");
+    printf("coverage (osd=on: V 縦に並べる、n 11 文字幅で縦に並べる、v 縦に並べて重ねる、H 横 1 行、h 横 1 行を重ねる)\n");
     OsdStats st;
     st.pi = OSD_PI_5;
     st.armMHz = 2400;
@@ -1357,10 +1351,29 @@ void testCoverage() {
         for (const Mode& m : modes) {
             const FrameScale base = computeFrameScale(m.w, m.h, z.w, z.h, true, 4096 - 4, z.gx, z.gy);
             const FrameScale fs = videoFrameScale(vs, base, m.w, m.h, z.w, z.h, 4096 - 4, z.gx, z.gy);
-            const OsdRect r = chooseOsd(OSD_MODE_ON, z.w, z.h, fs.dstX, fs.dstY, fs.dstW, fs.dstH, osdChars(v), osdRows(v));
+            // ベアメタル版の ShowFrame() と同じく、狭い並び (n。1 行 11 文字) も選べるようにして呼ぶ
+            const OsdRect r = chooseOsd(OSD_MODE_ON, z.w, z.h, fs.dstX, fs.dstY, fs.dstW, fs.dstH, osdChars(v), osdRows(v),
+                                        osdRowsNarrow(v));
+            const bool narrow = osdIsNarrow(r);
             if (r.overlay && !(z.gx > 1 && z.gy > 1)) allClear = false;
             n += snprintf(line + n, sizeof line - n, " %4dx%-4d %c ", m.w, m.h,
-                          r.w == 0 ? '-' : r.vertical ? (r.overlay ? 'v' : 'V') : (r.overlay ? 'h' : 'H'));
+                          r.w == 0 ? '-' : narrow ? 'n' : r.vertical ? (r.overlay ? 'v' : 'V') : (r.overlay ? 'h' : 'H'));
+            // 狭い並びは重ねない。960x540 (pix68k_gpu_scale=2) の 768x512 の枠 (768x512、256x256、384x256 の画面) はこれ
+            if (narrow) CHECK_EQ(r.overlay, false);
+            // 右下のバー (osd_bars=on) も置く: 縦に並べた数字が X68000 の画面に重ならないなら、バーも重ならない。
+            // 右端は数字とそろう。数字にぶつかって出せない (w = 0) のは、フレームバッファが低いときだけ
+            if (r.vertical) {
+                const OsdRect bars = placeOsdBars(OSD_MODE_ON, z.w, z.h, fs.dstX, fs.dstY, fs.dstW, fs.dstH, r);
+                if (bars.w > 0) {
+                    CHECK_EQ(bars.x >= 0 && bars.x + bars.w <= z.w && bars.y >= 0 && bars.y + bars.h <= z.h, true);
+                    CHECK_EQ(bars.x + bars.w, r.x + r.w);
+                    if (!r.overlay) CHECK_EQ(bars.overlay, false);
+                    if (narrow) CHECK_EQ(bars.w, OSD_BAR_NARROW_W);
+                } else {
+                    CHECK_EQ(z.h < r.h + OSD_BAR_H + 2 * OSD_PAD_Y, true);
+                }
+            }
+            if (z.w == 960 && fs.dstW == 768 && fs.dstH == 512 && vs == VIDEO_SCALE_INTEGER) CHECK_EQ(narrow, true);
             // どれでも出て、倍率は 1、フレームバッファに入る
             CHECK_EQ(r.w > 0, true);
             if (r.w == 0) continue;
@@ -1372,7 +1385,12 @@ void testCoverage() {
                 r.x < fs.dstX + fs.dstW && fs.dstX < r.x + r.w && r.y < fs.dstY + fs.dstH && fs.dstY < r.y + r.h;
             CHECK_EQ(overlap, r.overlay);
             // IP アドレスが入る (縦なら 9 行目、横 1 行ならいちばん右)
-            if (r.vertical) {
+            if (narrow) {
+                // 狭い並び: IP アドレスは最後の 2 行に分かれる
+                CHECK_EQ(r.h, OSD_V_ROWS_NARROW * 16);
+                formatOsdRows(text, v, r.h / 16, OSD_V_ITEM);
+                CHECK_EQ(strcmp(text + 8 * OSD_V_ITEM, "   192.168.    100.200"), 0);
+            } else if (r.vertical) {
                 CHECK_EQ(r.h, OSD_V_ROWS * 16);
                 formatOsdRows(text, v, r.h / 16);
                 CHECK_EQ(strncmp(text + 8 * OSD_V_COLS, "192.168.100.200", OSD_V_COLS), 0);
@@ -1389,7 +1407,99 @@ void testCoverage() {
     }
 }
 
+// 狭い並び (#314): 右の余白が 96 ドット (960x540 のフレームバッファに 768x512 の画面。pix68k_gpu_scale=2) のとき、
+// 1 行 11 文字に詰めて X68000 の画面に重ねずに出す。IP アドレスが 11 文字を超えるときは 2 行に分ける
+void testNarrow() {
+    printf("narrow vertical\n");
+    OsdStats s;
+    s.composedDeci = 555;
+    s.shownDeci = 555;
+    s.speedPct = 100;
+    s.tempDeciC = 472;
+    s.heapMB = 48;
+    s.pi = OSD_PI_3B;
+    s.armMHz = 1200;
+    s.mpu = 68000;
+    s.mpuMHz = 16;
+    s.ipv4 = 0xc0a80129u; // 192.168.1.41 (12 文字)
+    const OsdValue v = packOsd(s);
+    CHECK_EQ(v.hasIp(), true);
+    const int rows = osdRows(v), rowsN = osdRowsNarrow(v);
+    CHECK_EQ(rowsN, rows + 1);
+    // 960x540 に 768x512 (左右に 96 ドット、上下に 14 ライン)
+    const OsdRect wide = placeOsdVertical(960, 540, 96, 14, 768, 512, rows);
+    CHECK_EQ(wide.overlay, true); // 15 文字の並びは重なる
+    const OsdRect r = chooseOsd(OSD_MODE_ON, 960, 540, 96, 14, 768, 512, osdChars(v), rows, rowsN);
+    CHECK_EQ(r.vertical, true);
+    CHECK_EQ(r.overlay, false);
+    CHECK_EQ(r.w, OSD_V_ITEM * 8);
+    CHECK_EQ(r.h, rowsN * 16);
+    CHECK_EQ(r.x, 864); // X68000 の画面の右端 (96 + 768) のすぐ右
+    CHECK_EQ(r.x + r.w + OSD_PAD_X, 960);
+    // rowsNarrow を渡さなければ今までどおり (縦に並べたものを重ねる)
+    const OsdRect old = chooseOsd(OSD_MODE_ON, 960, 540, 96, 14, 768, 512, osdChars(v), rows);
+    CHECK_EQ(old.w, OSD_V_COLS * 8);
+    CHECK_EQ(old.overlay, true);
+    // 右の余白が 128 ドットあれば、狭い並びは使わない
+    const OsdRect roomy = chooseOsd(OSD_MODE_ON, 1920, 1080, 192, 28, 1536, 1024, osdChars(v), rows, rowsN);
+    CHECK_EQ(roomy.w, OSD_V_COLS * 8);
+    CHECK_EQ(roomy.overlay, false);
+    // 余白が 96 ドットより狭ければ、狭い並びも重なるので使わない (横 1 行か、15 文字を重ねる)
+    const OsdRect tight = chooseOsd(OSD_MODE_ON, 900, 540, 66, 14, 768, 512, osdChars(v), rows, rowsN);
+    CHECK_EQ(osdIsNarrow(tight), false);
+    // 文字: 11 文字に右寄せ。IP アドレスは 2 つ目の「.」のあとで分ける
+    char text[OSD_TEXT_MAX + 1];
+    formatOsdRows(text, v, rowsN, OSD_V_ITEM);
+    CHECK_EQ((int)strlen(text), rowsN * OSD_V_ITEM);
+    auto row = [&](int i) {
+        static char b[OSD_V_ITEM + 1];
+        memcpy(b, text + i * OSD_V_ITEM, OSD_V_ITEM);
+        b[OSD_V_ITEM] = 0;
+        return (const char*)b;
+    };
+    CHECK_EQ(strcmp(row(0), "RPi3 1.2GHz"), 0);
+    CHECK_EQ(strcmp(row(1), "68000 16MHz"), 0);
+    CHECK_EQ(strcmp(row(3), "       100%"), 0);
+    CHECK_EQ(strcmp(row(rowsN - 2), "   192.168."), 0);
+    CHECK_EQ(strcmp(row(rowsN - 1), "       1.41"), 0);
+    // 15 文字の並びの各行の右の 11 文字と同じ (IP アドレスの行を除く)
+    char wideText[OSD_TEXT_MAX + 1];
+    formatOsdRows(wideText, v, rows);
+    for (int i = 0; i < rows - 1; i++)
+        CHECK_EQ(memcmp(wideText + i * OSD_V_COLS + (OSD_V_COLS - OSD_V_ITEM), text + i * OSD_V_ITEM, OSD_V_ITEM), 0);
+    // 11 文字に入る IP アドレスは 1 行のまま
+    s.ipv4 = 0x0a000205u; // 10.0.2.5
+    const OsdValue v2 = packOsd(s);
+    CHECK_EQ(osdRowsNarrow(v2), osdRows(v2));
+    formatOsdRows(text, v2, osdRowsNarrow(v2), OSD_V_ITEM);
+    CHECK_EQ(strcmp(text + (osdRowsNarrow(v2) - 1) * OSD_V_ITEM, "   10.0.2.5"), 0);
+    // いちばん長い IP アドレスと、いちばん多い行数でも、文字と絵が上限に収まる
+    s.ipv4 = 0xffffffffu;
+    s.throttled = true;
+    s.fanLevel = 1;
+    s.fanRpm = 2200;
+    const OsdValue v3 = packOsd(s);
+    CHECK_EQ(osdRowsNarrow(v3), OSD_V_ROWS_NARROW);
+    CHECK_EQ(OSD_V_ITEM * OSD_V_ROWS_NARROW <= OSD_TEXT_MAX, true);
+    CHECK_EQ(OSD_V_ITEM * 8 * OSD_V_ROWS_NARROW * 16 <= OSD_IMAGE_PIXELS, true);
+    formatOsdRows(text, v3, OSD_V_ROWS_NARROW, OSD_V_ITEM);
+    CHECK_EQ(strcmp(text + (OSD_V_ROWS_NARROW - 2) * OSD_V_ITEM, "   255.255.    255.255"), 0);
+    // 絵: 幅から並びを決めて描く。すべての画素を描き、文字と背景の色だけ
+    const OsdRect rn = placeOsdVertical(960, 540, 96, 14, 768, 512, OSD_V_ROWS_NARROW, OSD_V_ITEM);
+    CHECK_EQ(rn.h, OSD_V_ROWS_NARROW * 16);
+    std::vector<uint32_t> img((size_t)rn.w * rn.h, 0x12345678u);
+    renderOsd(img.data(), rn, v3);
+    int badPx = 0, fg = 0;
+    for (uint32_t px : img) {
+        if (px != OSD_FG && px != OSD_BG) badPx++;
+        if (px == OSD_FG) fg++;
+    }
+    CHECK_EQ(badPx, 0);
+    CHECK_EQ(fg > 0, true);
+}
+
 int main() {
+    testNarrow();
     testFormat();
     testFps();
     testCoverage();

@@ -178,7 +178,7 @@ void CKernel::DrawMenu() {
     if (fb == nullptr || fb->GetDepth() != 32) return;
     // X68000 が止まっていれば次のフレームは来ないので、効果の表は最後まで作る (ShowFrame())
     if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame, m_pEmulator->paused());
-    u32* base = (u32*)(uintptr)fb->GetBuffer();
+    uint32_t* base = (uint32_t*)(uintptr)fb->GetBuffer();
     // メニューの枠は X68000 の画面の外にもはみ出すので、前に描いた枠が残らないよう外側も塗り直す
     // 枠を写しているときは、枠の外を枠の絵にする (platform/bezel.h)
     if (m_pLastFrame != nullptr && m_BezelShown != 0)
@@ -187,6 +187,7 @@ void CKernel::DrawMenu() {
         platform::fillOutside((u8*)base, fb->GetPitch(), (int)m_Screen.GetWidth(), (int)m_Screen.GetHeight(),
                               m_ShownScale, 0xff000000u);
     m_OsdState.invalidate(); // 画面の隅の数字も消えた (閉じたあとに描き直す)
+    m_BarsState.invalidate(); // 右下の使用率のバーも同じ
     m_MsgState.invalidate(); // 左上のメッセージも同じ
     // 日本語のファイル名は CGROM の字で描く
     const uint8_t* cg = m_pEmulator != nullptr ? m_pEmulator->cgRom() : nullptr;
@@ -233,7 +234,9 @@ bool CKernel::insertDisk(int drive, const char* name, platform::MenuText& msg) {
         msg.add("cannot use a temporary file: ").add(name);
         return false;
     }
-    // 読めなければ、入っているディスクはそのまま (LoadDisk() は読めてから入れ替える)
+    // 読めなければ、入っているディスクはそのまま (LoadDisk() は読めてから入れ替える)。
+    // ただし、USB-FDD から読んだディスクが入っているドライブに USB-FDD を読み直すときは、先に取り出すので
+    // (LoadRealFloppy()。同じバッファに読むため)、読めなければドライブは空になる
     if (!LoadDisk(drive, name)) {
         // 読めないか、入っているディスクを書き戻せなかった (どちらかはログに出る)
         msg.add("cannot change to ").add(name);

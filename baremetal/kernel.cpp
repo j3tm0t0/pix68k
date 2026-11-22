@@ -1,8 +1,10 @@
 #include "kernel.h"
+#include "platform/dma_refill.h"
 #include "platform/net_files.h"
 
 #include <circle/bcmpropertytags.h>
 #include <circle/machineinfo.h>
+#include <circle/memio.h>
 #include <circle/memorymap.h>
 #include <circle/string.h>
 #include <circle/synchronize.h>
@@ -17,6 +19,46 @@ static const char FromKernel[] = "pix68k";
 // MsDelay() を、これが nullptr でなければこれを呼ぶように書き換える (submodule は変えない)。ScanUsb() の間だけ設定する
 extern "C" {
 void (*volatile pix68k_msdelay_hook)(unsigned nMilliSeconds) = nullptr;
+// 音の出力の DMA (2 つのバッファを交互に送る)。Circle の DMA の割り込みの処理 (tools/circle_dma_patch.sh が書き換えたもの) が、
+// 割り込みのたびに pix68k_dma_refill() を呼んで、どのバッファを埋めるかを聞く。決め方は platform/dma_refill.h。
+//   pix68k_dma_resyncs  送り終えたバッファの番号を、DMA のレジスタに合わせ直した回数 (割り込みを取りこぼしたときに増える。
+//                       取りこぼした回数そのものではない) と、埋めるのが間に合わなかった回数の合計。コア 0 がログに出す
+//   pix68k_dma_refill() slot は DMA のチャネルの番号 (0-15) か 16 (PWM / I2S のバッファ)。cs と block は CS と CONBLK_AD の
+//                       レジスタの場所。埋めるなら 1 (*done に番号)、埋めないなら 0、読み直しの間のエラーなら 2 を返す
+//   pix68k_dma_late()   埋めている間に、DMA がそのバッファを送り始めていた
+//   pix68k_dma_refill_reset()  音の出力を始める前に呼ぶ
+volatile unsigned pix68k_dma_resyncs = 0;
+static platform::DmaRefillState s_DmaRefill[17];
+
+namespace {
+struct CircleDmaRegs {
+    uintptr cs, block;
+    u32 readBlock() { return read32(block); }
+    u32 readCs() { return read32(cs); }
+    void writeCs(u32 v) { write32(cs, v); }
+};
+} // namespace
+
+unsigned pix68k_dma_refill(unsigned slot, uintptr cs, uintptr block, u32 intBit, u32 errorBit, const u32* blocks,
+                           unsigned n, unsigned counted, unsigned* done, u32* loaded) {
+    CircleDmaRegs regs{cs, block};
+    PeripheralEntry();
+    const unsigned r = platform::dmaRefillOnInterrupt(s_DmaRefill[slot < 16 ? slot : 16], regs, intBit, errorBit, blocks,
+                                                      n, counted, done, loaded);
+    PeripheralExit();
+    if (r & platform::DMA_REFILL_ERROR) return 2;
+    if (r & platform::DMA_REFILL_RESYNC) pix68k_dma_resyncs = pix68k_dma_resyncs + 1;
+    return (r & platform::DMA_REFILL_FILL) ? 1 : 0;
+}
+
+void pix68k_dma_late(void) { pix68k_dma_resyncs = pix68k_dma_resyncs + 1; }
+
+// 音の出力を始める前に呼ぶ: 前に動かしていたときに覚えた値を消す (止めて始め直したときに、合わせ直しと数えないように)
+void pix68k_dma_refill_reset(void) {
+    EnterCritical();
+    for (platform::DmaRefillState& st : s_DmaRefill) st = platform::DmaRefillState();
+    LeaveCritical();
+}
 }
 
 CKernel* CKernel::s_pThis = nullptr;
@@ -104,9 +146,21 @@ boolean CKernel::Initialize() {
 // チャンクを読み、書き戻す (WithComposerPresenting())。
 // キーボード、マウス、ゲームパッドはこのあと UpdateUsbDevices() で見つかる。あとからつないだものも、Circle の
 // プラグアンドプレイで同じように見つかる。2 回目からは何もしない。初期化に失敗しても、SD カードへのログの保存などはそのまま続ける
+#if RASPPI >= 4
+// Circle の xHCI のドライバ (tools/circle_ufd_patch.sh で書き換えたもの) が、USB-FDD への転送を待つループの中で呼ぶ
+extern void (*volatile g_pPix68kXHCIWaitHook)(void);
+#endif
+
 void CKernel::ScanUsb(bool serviceMachine) {
     if (m_UsbStarted) return;
     m_UsbStarted = true;
+#if RASPPI >= 4
+    // USB-FDD への転送を待つ間 (長くて 30 秒) もウォッチドッグを延ばす (RealFloppyWaitHook())。USB の装置を探す前に
+    // 登録して、外さない: USB-FDD の Configure() は、ここでの最初の探索、USB メモリを待つ FinishBootDrive()、
+    // あとからつないだときの UpdatePlugAndPlay() のどこからでも呼ばれる (fd0= / fd1= に USB-FDD を書いていなくても)。
+    // Pi 3 の DWHCI には、この待ちの時間切れも呼び出し口もない
+    g_pPix68kXHCIWaitHook = &CKernel::RealFloppyWaitHook;
+#endif
     KeepAlive();
     auto scan = [this] {
         m_UsbOk = m_USBHCI.Initialize();
@@ -137,8 +191,14 @@ void CKernel::ScanUsb(bool serviceMachine) {
 // boot ドライブが USB メモリのときは、ここからはイメージを読み書きしない (ServiceDuringUsbScan() を参照)
 void CKernel::UsbScanDelay(unsigned ms) {
     CKernel* k = s_pThis;
+    // IRQ を止めているか (AArch64 は DAIF の I、AArch32 は CPSR の I。どちらも bit 7)
+#if AARCH == 64
     u64 daif;
     asm volatile("mrs %0, daif" : "=r"(daif));
+#else
+    u32 daif;
+    asm volatile("mrs %0, cpsr" : "=r"(daif));
+#endif
     if (k == nullptr || k->m_InScanDelay || CMultiCoreSupport::ThisCore() != 0 ||
         CurrentExecutionLevel() != TASK_LEVEL || (daif & (1u << 7)) != 0) {
         CTimer::SimpleMsDelay(ms);
@@ -178,8 +238,19 @@ void CKernel::SetPixelOrderBgr() {
 // なく 768x512 を書く)。GPU の拡大はファームウェアの設定 (config.txt の scaling_kernel) で補間するので、ドットが
 // にじむことがある。表示の大きさが割り切れないか、768x512 が入らなくなるときは使わない (ログに出す)。
 // ログはまだ使えないので、結果は m_GpuScaleNote に置き、Run() がログに出す
+//
+// Raspberry Pi 2 では、オプションがなければ pix68k_gpu_scale=2 として扱う (#302)。1920x1080 に実寸で書くと、256x256 の
+// 画面は 1536x1024 に拡大して書くことになり、書き込みだけで 1 フレームに最大 23ms (合成と合わせて 26ms) かかって間に合わないことがあった (グラディウス II の
+// 68000 16MHz)。2 倍を GPU に任せると 10.7ms に収まった。表示の大きさが合わなくて使えないとき (1280x720 など) は、
+// オプションを書いていなければ警告を出さずに、ふつうのフレームバッファにする。やめるには pix68k_gpu_scale=1 と書く
 boolean CKernel::InitScreen() {
     const char* opt = m_Options.GetAppOptionString("pix68k_gpu_scale", nullptr);
+#if RASPPI == 2
+    if (opt == nullptr) {
+        opt = "2";
+        m_GpuScaleByDefault = true;
+    }
+#endif
     if (opt == nullptr) return m_Screen.Initialize();
     unsigned gx = 0, gy = 0;
     const char* p = opt;
@@ -199,7 +270,7 @@ boolean CKernel::InitScreen() {
         TPropertyTagDisplayDimensions dim;
         CBcmPropertyTags tags;
         if (!tags.GetTag(PROPTAG_GET_DISPLAY_DIMENSIONS, &dim, sizeof dim)) {
-            m_GpuScaleNote = GpuScaleNoDisplay;
+            if (!m_GpuScaleByDefault) m_GpuScaleNote = GpuScaleNoDisplay;
             return m_Screen.Initialize();
         }
         w = dim.nWidth;
@@ -208,7 +279,7 @@ boolean CKernel::InitScreen() {
     m_GpuDisplayW = w;
     m_GpuDisplayH = h;
     if (w % gx != 0 || h % gy != 0 || w / gx < (unsigned)platform::kScaleBoxW || h / gy < (unsigned)platform::kScaleBoxH) {
-        m_GpuScaleNote = GpuScaleDoesNotFit;
+        if (!m_GpuScaleByDefault) m_GpuScaleNote = GpuScaleDoesNotFit;
         return m_Screen.Initialize();
     }
     // CScreenDevice::Resize() は、まだ作っていなければ作るだけ (Initialize() と同じ)。作るときの大きさを書き換えるので、
@@ -232,8 +303,9 @@ void CKernel::LogGpuScale() {
     case GpuScaleOn:
         m_Logger.Write(FromKernel, LogNotice,
                        "screen: pix68k_gpu_scale: framebuffer %ux%u, scaled x%d y%d by the GPU to %ux%u "
-                       "(scaling_kernel=8 in config.txt for nearest neighbour)",
-                       m_Screen.GetWidth(), m_Screen.GetHeight(), m_GpuScaleX, m_GpuScaleY, m_GpuDisplayW, m_GpuDisplayH);
+                       "(scaling_kernel=8 in config.txt for nearest neighbour)%s",
+                       m_Screen.GetWidth(), m_Screen.GetHeight(), m_GpuScaleX, m_GpuScaleY, m_GpuDisplayW, m_GpuDisplayH,
+                       m_GpuScaleByDefault ? "; the default on Raspberry Pi 2 (pix68k_gpu_scale=1 turns it off)" : "");
         break;
     case GpuScaleBadOption:
         m_Logger.Write(FromKernel, LogWarning, "screen: pix68k_gpu_scale: use N or AxB (1 to 4); not scaled by the GPU");
@@ -733,12 +805,48 @@ void CKernel::StartEventStream() {
 }
 
 // コア 0 が時刻 deadline まで待つ。イベントストリームが届けば wfe で眠る (割り込みとほかのコアの sev でも起きる)
+// コア 0 が割り込みの処理に使った時間の合計 (CTimer::GetClockTicks64() の単位)。Circle の割り込みの入口
+// (exceptionstub64.S が呼ぶ InterruptHandler()) を、リンクのときに --wrap=InterruptHandler (Makefile) で
+// __wrap_InterruptHandler() に差し替えて数える。書くのは割り込みの中のコア 0 だけで、読むのもコア 0 だけ
+// (IdleUntil()。読む間に割り込みが入っても、64 ビットの読み書きは 1 回で済む)
+static volatile u64 s_Core0IrqTicks = 0;
+
+extern "C" void __real_InterruptHandler(void);
+extern "C" void __wrap_InterruptHandler(void) {
+    if (CMultiCoreSupport::ThisCore() != 0) {
+        __real_InterruptHandler();
+        return;
+    }
+    const u64 t0 = CTimer::GetClockTicks64();
+    __real_InterruptHandler();
+    s_Core0IrqTicks = s_Core0IrqTicks + (CTimer::GetClockTicks64() - t0);
+}
+
+// 待った時間を m_Core0IdleTicks に足す (画面の右下のバーのコア 0 の使用率は、1 秒からこの時間を引いて求める)。
+// 待つ間に入った割り込み (音の DMA、USB、タイマなど) の処理時間は、待った時間から除く (仕事をした時間に入れる)。
+// イベントストリームが届かず空回りで待つときも、待った時間として数える (することがなく時刻を見ているだけのため)。
+// 呼ぶのはどれもコア 0 (主ループ、ネットワークのタスク、SoundFont などを読む合間、起動の組み合わせのメニュー)
 void CKernel::IdleUntil(u64 deadline) {
+    const u64 t0 = CTimer::GetClockTicks64(), irq0 = s_Core0IrqTicks;
     if (m_EventStreamUs != 0)
         event_wait::sleepUntil(deadline);
     else
         while (CTimer::GetClockTicks64() < deadline) {
         }
+    AddCore0Idle(t0, irq0);
+}
+
+// ネットワークのタスクを動かす合間 (CHostNet::Service()) の空回りの待ち。net=on のときのコア 0 の主な待ちなので、
+// これも待った時間として数える
+void CKernel::SpinUs(unsigned us) {
+    const u64 t0 = CTimer::GetClockTicks64(), irq0 = s_Core0IrqTicks;
+    CTimer::SimpleusDelay(us);
+    AddCore0Idle(t0, irq0);
+}
+
+void CKernel::AddCore0Idle(u64 t0, u64 irq0) {
+    const u64 waited = CTimer::GetClockTicks64() - t0, irq = s_Core0IrqTicks - irq0;
+    m_Core0IdleTicks += waited > irq ? waited - irq : 0;
 }
 
 // SoC の温度 (1/1000 度)。読めなければ (QEMU など) 0

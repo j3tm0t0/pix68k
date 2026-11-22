@@ -17,7 +17,7 @@ add_library(x68k STATIC ${PIX68K_CORE_ROOT}/src/x68k/machine.cpp ${PIX68K_CORE_R
   ${PIX68K_CORE_ROOT}/src/x68k/fdd.cpp ${PIX68K_CORE_ROOT}/src/x68k/fdc.cpp ${PIX68K_CORE_ROOT}/src/x68k/dmac.cpp ${PIX68K_CORE_ROOT}/src/x68k/keyboard.cpp ${PIX68K_CORE_ROOT}/src/x68k/textscreen.cpp ${PIX68K_CORE_ROOT}/src/x68k/sram_file.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/scc.cpp ${PIX68K_CORE_ROOT}/src/x68k/mouse.cpp ${PIX68K_CORE_ROOT}/src/x68k/ppi.cpp ${PIX68K_CORE_ROOT}/src/x68k/sasi.cpp ${PIX68K_CORE_ROOT}/src/x68k/spc.cpp ${PIX68K_CORE_ROOT}/src/x68k/cd_drive.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/opm.cpp ${PIX68K_CORE_ROOT}/src/x68k/adpcm.cpp ${PIX68K_CORE_ROOT}/src/x68k/sound.cpp ${PIX68K_CORE_ROOT}/src/x68k/video_replay.cpp ${PIX68K_CORE_ROOT}/src/x68k/sound_replay.cpp
-  ${PIX68K_CORE_ROOT}/src/x68k/ts6bga.cpp ${PIX68K_CORE_ROOT}/src/x68k/state.cpp ${PIX68K_CORE_ROOT}/src/x68k/mercury.cpp ${PIX68K_CORE_ROOT}/src/x68k/neptune.cpp ${PIX68K_CORE_ROOT}/src/x68k/ym3802.cpp)
+  ${PIX68K_CORE_ROOT}/src/x68k/ts6bga.cpp ${PIX68K_CORE_ROOT}/src/x68k/state.cpp ${PIX68K_CORE_ROOT}/src/x68k/mercury.cpp ${PIX68K_CORE_ROOT}/src/x68k/opn3.cpp ${PIX68K_CORE_ROOT}/src/x68k/neptune.cpp ${PIX68K_CORE_ROOT}/src/x68k/ym3802.cpp)
 if(PIX68K_BUILD_FPU_BOARD)
   target_sources(x68k PRIVATE ${PIX68K_CORE_ROOT}/src/x68k/fpu_board.cpp)
 else()

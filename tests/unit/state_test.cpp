@@ -2317,7 +2317,14 @@ void rejectsMore() {
         CHECK_EQ(x68k::loadState(*a.m, bad.data(), n, err), true);
         Blob after;
         save(*a.m, after);
-        CHECK_EQ(same(before, after), true);
+        // 版 19 までの並びには、音を出力の周波数に直すフィルタの履歴 (版 20。"SCC " の手前の DMAC と 1 バイトの前の
+        // 256 バイト) がないので、読むと履歴は前のサンプルで埋まる。そこ (と、中身から決まるヘッダ) を除いて比べる
+        const size_t hist = findTag(before, "SCC ") - 1 - sizeof(x68k::Dmac) - 2 * 4 * x68k::Sound::RESAMPLE_TAPS;
+        CHECK_EQ(after.size, before.size);
+        CHECK_EQ(findTag(after, "SCC "), findTag(before, "SCC "));
+        const size_t histEnd = hist + 2 * 4 * x68k::Sound::RESAMPLE_TAPS, head = x68k::STATE_HEADER_SIZE;
+        CHECK_EQ(memcmp(before.data + head, after.data + head, hist - head), 0);
+        CHECK_EQ(memcmp(before.data + histEnd, after.data + histEnd, before.size - histEnd), 0);
     }
     // 断られたあとも、読もうとしなかった Machine と同じに動く
     a.frames(20);
@@ -2546,7 +2553,8 @@ void craftedStates() {
         CHECK_EQ(tryLoad("MFP prescaler at the limit", e, edge, nullptr), true);
         e.box.frames(1);
         // 音の部分の終わり (SCC の手前は DMAC と、DMA の途中か (1)) の 8 バイトが、補間の前のサンプル (左、右)
-        const size_t prev = scc - 1 - sizeof(x68k::Dmac) - 8;
+        // (版 20 から、補間の前のサンプルのあとに、出力の周波数に直すフィルタの履歴 256 バイトがある)
+        const size_t prev = scc - 1 - sizeof(x68k::Dmac) - 2 * 4 * x68k::Sound::RESAMPLE_TAPS - 8;
         for (int c = 0; c < 2; c++) {
             for (uint32_t v : {0x80000000u, 0x7fffffffu, 32768u, 0u - 32769u}) {
                 std::vector<uint8_t> bad(good.data, good.data + good.size);
@@ -2619,14 +2627,21 @@ void craftedStates() {
         // 音の部分の終わり (SCC の手前は DMAC と、DMA の途中か (1)) から逆に: 補間の前のサンプル 8、直流を切るフィルタの
         // 前の入力 8、その出力 16、低域通過フィルタ 2 段 8 + 8、サンプルの中のクロック 4、その前が ADPCM
         // (32 バイト: bool 5、左右、周波数、バイト 2 つ、+9 波形の値、+13 量子化幅の段、+17 時間の端数、+21 から 0 が 11)
-        const size_t prev = scc - 1 - sizeof(x68k::Dmac) - 8;
+        // (版 20 から、補間の前のサンプルのあとに、出力の周波数に直すフィルタの履歴 256 バイトがある)
+        const size_t prev = scc - 1 - sizeof(x68k::Dmac) - 2 * 4 * x68k::Sound::RESAMPLE_TAPS - 8;
         const size_t hpIn = prev - 8, hpOut = hpIn - 16, lp2 = hpOut - 8, lp1 = lp2 - 8, adpcm = lp1 - 4 - 32;
         CHECK_EQ(adpcm, opm + sizeof(x68k::Opm));
         // 画面: 区切りのあとに CRTC 48、動作ポート 1、高速クリアの予約 1、+50 残りフレーム数
         const size_t clear = vid + 4 + 50;
         // まーきゅりーゆにっと: 区切りのあとの +32 と +36 が左右の出力
-        CHECK_EQ(sizeof(x68k::Mercury), 40);
+        // その後ろ (+40) に YMF288 が 2 個 (1768 バイトずつ): レジスタ 512、+514 フラグ、+517 SCH (bool)、+520 タイマー A、
+        // +524 タイマー B、+528 LFO の段までのサンプル数。そのあと +3584 が次のサンプルまでのクロック (8 の倍数)、+3588 が
+        // サンプルの輪の位置、+3722 が割り込みの要求 (bool)
+        // 版 21 から、そのあと (+3728) に PCM を 62.5kHz に直すフィルタの履歴 256 バイトと、位置、0 が続いた数
+        CHECK_EQ(sizeof(x68k::Mercury), 3728 + 256 + 8);
+        CHECK_EQ(sizeof(x68k::Opn3), 1768);
         const size_t outL = merc + 4 + 32, outR = merc + 4 + 36;
+        const size_t opn0 = merc + 4 + 40, opn1 = opn0 + 1768;
         const uint64_t m1 = 0xffffffffull; // 32 ビットの -1
         for (const Case& c : {
                  Case{"OPM timer A", opm + 264, 4, 1025, false}, Case{"OPM timer A", opm + 264, 4, 1024, true},
@@ -2653,7 +2668,18 @@ void craftedStates() {
                  Case{"clear frames", clear, 4, 3, false}, Case{"clear frames", clear, 4, m1, false},
                  Case{"clear frames", clear, 4, 2, true},
                  Case{"Mercury output", outL, 4, 32768, false}, Case{"Mercury output", outR, 4, m1 - 32768, false},
-                 Case{"Mercury output", outL, 4, 32767, true}, Case{"Mercury output", outR, 4, m1 - 32767, true}}) {
+                 Case{"Mercury output", outL, 4, 32767, true}, Case{"Mercury output", outR, 4, m1 - 32767, true},
+                 Case{"OPN timer A", opn0 + 520, 4, 72 * 1024 + 1, false}, Case{"OPN timer A", opn0 + 520, 4, 72 * 1024, true},
+                 Case{"OPN timer B", opn1 + 524, 4, 1152 * 256 + 1, false}, Case{"OPN timer B", opn1 + 524, 4, 1152 * 256, true},
+                 Case{"OPN flags", opn0 + 514, 1, 4, false}, Case{"OPN flags", opn1 + 514, 1, 3, true},
+                 Case{"OPN 6 channel mode", opn0 + 517, 1, 2, false}, Case{"OPN 6 channel mode", opn0 + 517, 1, 1, true},
+                 Case{"OPN LFO count", opn0 + 528, 4, 0, false}, Case{"OPN LFO count", opn1 + 528, 4, 110, false},
+                 Case{"OPN LFO count", opn0 + 528, 4, 109, true},
+                 Case{"OPN sample clock", merc + 4 + 3584, 4, 72, false}, Case{"OPN sample clock", merc + 4 + 3584, 4, 71, false},
+                 Case{"OPN sample clock", merc + 4 + 3584, 4, 64, true},
+                 Case{"OPN sample ring", merc + 4 + 3588, 4, 16, false}, Case{"OPN sample ring", merc + 4 + 3588, 4, 15, true},
+                 Case{"OPN interrupt request", merc + 4 + 3722, 1, 2, false},
+                 Case{"OPN interrupt request", merc + 4 + 3722, 1, 1, true}}) {
             std::vector<uint8_t> bad(good.data, good.data + good.size);
             for (int i = 0; i < c.width; i++) bad[c.at + (size_t)i] = (uint8_t)(c.value >> (8 * i));
             if (tryLoad(c.what, e, bad, c.loads ? nullptr : kLayout)) e.box.frames(1);

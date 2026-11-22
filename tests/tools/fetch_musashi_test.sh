@@ -1,6 +1,6 @@
 #!/bin/sh
 # tools/fetch_musashi.sh の試験。通信はしない: curl の代わりに、にせの Musashi (m68kmake.c だけ) の tar.gz を出すコマンドを
-# PATH の先頭に置く。2 つの runner が同じ HOME で同時に動いても壊れないこと、途中で失敗したり止められたりしても
+# PATH の先頭に置く。いくつかの runner が同じ HOME で同時に動いても壊れないこと、途中で失敗したり止められたりしても
 # 作りかけが残らないことを確かめる。
 #   使い方: tests/tools/fetch_musashi_test.sh <tools/fetch_musashi.sh>
 set -u

@@ -268,6 +268,9 @@ inline const PadLayout* findPadLayout(uint16_t vid, uint16_t pid) {
     static const PadLayout kLayouts[] = {
         {0x0f0d, 0x00c1, "HORIPAD S", 14,
          {Y, B, A, X, LB, RB, LT, RT, MINUS, PLUS, L3, R3, HOME, SELECT}},
+        // HORI の PCエンジン用のパッド (PCEngine PAD) も同じ並びで、I が A (ビット 2)、II が B (ビット 1)、
+        // SELECT が - (ビット 8)、RUN が + (ビット 9) (pad_log で確かめた)。ほかのビットは使わない
+        {0x0f0d, 0x0138, "PCEngine PAD", 10, {0, B, A, 0, 0, 0, 0, 0, MINUS, PLUS}},
     };
     for (const PadLayout& l : kLayouts)
         if (l.vid == vid && l.pid == pid) return &l;

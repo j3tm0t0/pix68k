@@ -1,6 +1,7 @@
 // ADPCM (MSM6258) のテスト: 復号、サンプリング周波数、DMAC のチャネル 3 での転送、
 // Machine につないだ OPM (タイマの割り込みが MFP の GPIP3 に届くこと、CT2 で ADPCM のクロックが変わること)、
 // 音の出力 (Sound のリングバッファ、48kHz への変換)
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -589,7 +590,8 @@ void testSoundOutput() {
     }
     CHECK_NEAR(got, 48000, 2);
     int cross = 0, first = -1, last = -1;
-    for (int i = 1; i < got; i++)
+    // 初めの 0.1 秒は数えない (音の出始めの前に、出力の周波数に直すフィルタの小さな波が 0 をまたぐ)
+    for (int i = 4800; i < got; i++)
         if (out[2 * i - 2] < 0 && out[2 * i] >= 0) {
             if (first < 0) first = i;
             last = i;
@@ -611,6 +613,193 @@ void testSoundOutput() {
 // たまり具合が目標の近くに収まる (エミュレータの時間で 1ms ずつ進め、512 フレームずつ取り出す)
 // ADPCM の復号値が 0 からずれたまま止まっても (無音のデータを流し続けるドライバ)、出力に直流は残らない
 // (実機の出力はコンデンサでつながっている)。音の変化はそのまま通る
+// 出力の 48kHz の音 (左、n フレーム) から、hz の成分の大きさ (正弦波の振幅) を求める。ハン窓をかけて、その周波数だけを計算する
+double toneAmplitude(const int16_t* out, int n, double hz, double rate = 48000) {
+    const double pi = 3.14159265358979323846;
+    double re = 0, im = 0, wsum = 0;
+    for (int i = 0; i < n; i++) {
+        const double w = 0.5 - 0.5 * cos(2 * pi * i / n);
+        re += w * out[2 * i] * cos(2 * pi * hz * i / rate);
+        im += w * out[2 * i] * sin(2 * pi * hz * i / rate);
+        wsum += w;
+    }
+    return 2 * sqrt(re * re + im * im) / wsum;
+}
+
+// OPM の 1 つのオペレータだけを最大の音量で鳴らす (正弦波。KC と MUL で高さを決める)。0.5 秒分を捨ててから、
+// 続く n フレームを out に取る
+void sineThroughSound(uint8_t kc, uint8_t mul, int16_t* out, int n, int rate = 48000) {
+    x68k::Sound s;
+    s.setOutputRate(rate);
+    auto w = [&](uint8_t r, uint8_t v) {
+        s.opmWrite(1, r);
+        s.opmWrite(3, v);
+    };
+    w(0x20, 0xc7);
+    w(0x28, kc);
+    for (int k = 0; k < 4; k++) {
+        w((uint8_t)(0x40 + k * 8), mul);
+        w((uint8_t)(0x60 + k * 8), k == 0 ? 0 : 127);
+        w((uint8_t)(0x80 + k * 8), 31);
+        w((uint8_t)(0xe0 + k * 8), 15);
+    }
+    w(0x08, 0x78);
+    static int16_t skip[2 * 4096];
+    int got = 0, dropped = 0;
+    while (got < n) {
+        s.advance(4000);
+        if (dropped < rate / 2) dropped += s.ring().drain(skip, 4096);
+        else got += s.ring().drain(out + 2 * got, n - got);
+    }
+}
+
+// 62.5kHz から出力の周波数に直すフィルタ (#296): 表のどの行も合計が同じ、高い音でも関係のない周波数の成分が小さい、
+// 出力の周波数の半分より上の音が聞こえる範囲に折り返さない
+void testResampler() {
+    printf("sound: the windowed-sinc filter to the output rate\n");
+    // 表: どの行も合計が 2^15 (一定の入力が、行の並びの周期で揺れない)。行 0 は標本の位置そのもので、16 番目が最大。
+    // 行 RESAMPLE_PHASES は次の標本の位置なので、行 0 を 1 つずらしたもの
+    for (int p = 0; p <= x68k::Sound::RESAMPLE_PHASES; p++) {
+        const int16_t* row = x68k::Sound::resampleRow(p);
+        int sum = 0;
+        for (int j = 0; j < x68k::Sound::RESAMPLE_TAPS; j++) sum += row[j];
+        if (sum != 32768) {
+            printf("  row %d sums to %d\n", p, sum);
+            CHECK(sum == 32768);
+            break;
+        }
+    }
+    const int16_t* first = x68k::Sound::resampleRow(0);
+    const int16_t* last = x68k::Sound::resampleRow(x68k::Sound::RESAMPLE_PHASES);
+    for (int j = 0; j < x68k::Sound::RESAMPLE_TAPS; j++) CHECK(first[j] <= first[15]);
+    for (int j = 0; j + 1 < x68k::Sound::RESAMPLE_TAPS; j++) CHECK_NEAR(last[j + 1], first[j], 1);
+
+    const int n = 16384;
+    static int16_t out[2 * 16384];
+    // 4.7kHz の正弦波 (KC $7E)。線形補間のときは、62.5kHz で折り返した 57.8kHz の成分が 48kHz で 9.8kHz に出ていた
+    // (-44dB)。今は -60dB より小さい
+    sineThroughSound(0x7e, 1, out, n);
+    double best = 0, bestHz = 0;
+    for (double hz = 4600; hz < 4760; hz += 1) {
+        const double a = toneAmplitude(out, n, hz);
+        if (a > best) best = a, bestHz = hz;
+    }
+    CHECK(best > 3500 && best < 4200); // 1 オペレータの最大 8191 の 1/2
+    const double image = toneAmplitude(out, n, 62500 - bestHz - 48000);
+    printf("  %.0f Hz tone: amplitude %.0f, image at %.0f Hz %.1f dB\n", bestHz, best, 62500 - bestHz - 48000,
+           20 * log10(image / best + 1e-9));
+    CHECK(image < best / 1000);
+    // 28kHz の正弦波 (同じ高さの 6 倍)。48kHz では出せない音で、線形補間のときは 20kHz に -10dB で折り返していた。
+    // 今は、どの周波数にも元の大きさの 1/300 (-50dB) より大きくは出ない (大きさは実効値で見る)
+    sineThroughSound(0x7e, 6, out, n);
+    double sq = 0;
+    for (int i = 0; i < n; i++) sq += (double)out[2 * i] * out[2 * i];
+    const double rms = sqrt(sq / n);
+    printf("  %.0f Hz tone: rms %.1f in the output (the tone has rms %.0f)\n", bestHz * 6, rms, best / sqrt(2.0));
+    CHECK(rms < best / sqrt(2.0) / 300);
+    // 減衰の途中 (18kHz から 26kHz): 23.4kHz の正弦波 (5 倍) は、48kHz では 23.4kHz のまま出る。-8dB から -26dB の間
+    // (表だけなら約 -14dB。X68000 の出力の低域通過フィルタの分と合わせて約 -19dB)
+    sineThroughSound(0x7e, 5, out, n);
+    const double edge = toneAmplitude(out, n, bestHz * 5);
+    printf("  %.0f Hz tone: %.1f dB\n", bestHz * 5, 20 * log10(edge / best + 1e-9));
+    CHECK(edge < best * 0.4 && edge > best * 0.05);
+
+    // 出力の周波数に合わせた表 (resampleCenterHz())。48kHz 以上はコミットしてある表 (真ん中 22kHz)、低い周波数は
+    // 止め始めが出力の周波数の 0.55 倍になるように下げる
+    CHECK_EQ(x68k::Sound::resampleCenterHz(48000), 22000);
+    CHECK_EQ(x68k::Sound::resampleCenterHz(96000), 22000);
+    CHECK_EQ(x68k::Sound::resampleCenterHz(44100), 44100 * 55 / 100 - 4000);
+    CHECK_EQ(x68k::Sound::resampleCenterHz(32000), 13600);
+    CHECK_EQ(x68k::Sound::resampleCenterHz(8000), 3200); // 0.4 倍より下にはしない
+    // 実行時に作る表は、コミットしてある表と同じ式: 真ん中 22kHz で作ると、係数の差は 1 まで。行の合計は 2^15
+    {
+        static int16_t made[x68k::Sound::RESAMPLE_PHASES + 1][x68k::Sound::RESAMPLE_TAPS];
+        x68k::Sound::buildResampleTable(made, 22000);
+        int worst = 0, badSum = 0;
+        for (int p = 0; p <= x68k::Sound::RESAMPLE_PHASES; p++) {
+            int sum = 0;
+            for (int j = 0; j < x68k::Sound::RESAMPLE_TAPS; j++) {
+                const int d = made[p][j] - x68k::Sound::resampleRow(p)[j];
+                if (d > worst) worst = d;
+                if (-d > worst) worst = -d;
+                sum += made[p][j];
+            }
+            badSum += sum != 32768;
+        }
+        CHECK_EQ(worst <= 1, true);
+        CHECK_EQ(badSum, 0);
+        x68k::Sound low;
+        low.setOutputRate(32000);
+        CHECK_EQ(low.activeResampleRow(0) != x68k::Sound::resampleRow(0), true);
+        int sum = 0;
+        for (int j = 0; j < x68k::Sound::RESAMPLE_TAPS; j++) sum += low.activeResampleRow(100)[j];
+        CHECK_EQ(sum, 32768);
+        low.setOutputRate(48000);
+        CHECK_EQ(low.activeResampleRow(0) == x68k::Sound::resampleRow(0), true);
+    }
+    // 32kHz の出力: 4.7kHz の音はそのまま出て、18.7kHz の音 (4 倍。32kHz では 13.3kHz に折り返す) はほとんど出ない。
+    // 48kHz 用の表のままだと、18.7kHz は通す範囲のすぐ上で、ほぼそのままの大きさで折り返す
+    sineThroughSound(0x7e, 1, out, n, 32000);
+    const double low = toneAmplitude(out, n, bestHz, 32000);
+    CHECK(low > best * 0.95 && low < best * 1.05);
+    sineThroughSound(0x7e, 4, out, n, 32000);
+    sq = 0;
+    for (int i = 0; i < n; i++) sq += (double)out[2 * i] * out[2 * i];
+    printf("  32000 Hz output: %.0f Hz tone %.0f, %.0f Hz tone leaves rms %.1f\n", bestHz, low, bestHz * 4, sqrt(sq / n));
+    CHECK(sqrt(sq / n) < best / sqrt(2.0) / 100);
+    // 44.1kHz の出力: 28kHz の音 (6 倍。16kHz に折り返す) はほとんど出ない
+    sineThroughSound(0x7e, 6, out, n, 44100);
+    sq = 0;
+    for (int i = 0; i < n; i++) sq += (double)out[2 * i] * out[2 * i];
+    printf("  44100 Hz output: %.0f Hz tone leaves rms %.1f\n", bestHz * 6, sqrt(sq / n));
+    CHECK(sqrt(sq / n) < best / sqrt(2.0) / 300);
+}
+
+// まーきゅりーゆにっとの PCM (48kHz、44.1kHz) を 62.5kHz に直すフィルタ (#296): 5kHz の正弦波を入れて、出力 (48kHz) に
+// 元の音と関係のない周波数の成分が出ない。前は取り出した値をそのまま出していたので、48kHz の PCM では 9.5kHz に
+// -22dB、44.1kHz の PCM では 13.4kHz に -23dB の成分が出ていた
+void testMercuryPcmFilter() {
+    printf("sound: Mercury Unit PCM through the filter to 62.5 kHz\n");
+    const double pi = 3.14159265358979323846;
+    const int n = 16384;
+    static int16_t out[2 * 16384], skip[2 * 4096];
+    struct Case {
+        int rate;
+        uint8_t command;
+        double junkHz;
+    };
+    for (const Case& c : {Case{48000, 0xbe, 9500}, Case{44100, 0x8e, 13400}}) {
+        x68k::Sound s;
+        s.setOutputRate(48000);
+        x68k::Mercury m;
+        s.mercuryAttached(true);
+        s.mercuryWrite(m, 0x91, c.command); // 等倍、ステレオ、L と R を出す
+        CHECK_EQ((int)m.rate(), c.rate);
+        long words = 0;
+        int got = 0, dropped = 0;
+        while (got < n) {
+            while (m.drq()) { // L、R の順に同じ値を書く
+                const int16_t v = (int16_t)lrint(16000 * sin(2 * pi * 5000 * (double)(words / 2) / c.rate));
+                words++;
+                s.mercuryWrite(m, 0x80, (uint8_t)(v >> 8));
+                s.mercuryWrite(m, 0x81, (uint8_t)v);
+            }
+            s.advance(16, &m);
+            if (dropped < 24000) dropped += s.ring().drain(skip, 4096);
+            else got += s.ring().drain(out + 2 * got, n - got);
+        }
+        const double tone = toneAmplitude(out, n, 5000), junk = toneAmplitude(out, n, c.junkHz);
+        printf("  %d Hz PCM: 5000 Hz tone %.0f, %.0f Hz %.1f dB\n", c.rate, tone, c.junkHz, 20 * log10(junk / tone + 1e-9));
+        CHECK(tone > 7000 && tone < 8100); // 16000 の 1/2。X68000 の出力の低域通過フィルタで少し下がる
+        CHECK(junk < tone / 500);
+        // 全体でも、5kHz の音のほかはほとんどない (実効値で見る。振幅 tone の正弦波の実効値は tone / sqrt(2))
+        double sq = 0;
+        for (int i = 0; i < n; i++) sq += (double)out[2 * i] * out[2 * i];
+        const double rest = sq / n - tone * tone / 2;
+        CHECK(rest < tone * tone / 2 / 10000); // -40dB より小さい (OPM と ADPCM は鳴っていない)
+    }
+}
+
 void testDcBlock() {
     printf("dc block\n");
     static x68k::Sound s;
@@ -934,6 +1123,8 @@ int main() {
     testOldStateBeforePlay();
     testOpmIrqToMfp();
     testSoundOutput();
+    testResampler();
+    testMercuryPcmFilter();
     testDcBlock();
     testRateControl();
     testLatencyRecovery();

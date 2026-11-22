@@ -1551,7 +1551,11 @@ void testClipWithoutMidi() {
     for (int i = 0; i < na && i < nb; i++) {
         const int32_t l = pb[2 * i] + 16383, r = pb[2 * i + 1] - 16384;
         const int32_t wantL = l > 32767 ? 32767 : l, wantR = r < -32768 ? -32768 : r;
-        bad += pa[2 * i] != wantL || pa[2 * i + 1] != wantR;
+        // 16 ビットに止めるのは全部を足したあとの 1 か所なので、OPM だけで範囲を超えているフレーム (pb が上限か下限) は、
+        // 足す前の値が分からない。CD-ROM 装置のオーディオが逆の向きのときは、止めた値に足したもの以下 (以上) になる
+        const bool okL = pb[2 * i] == -32768 ? pa[2 * i] <= wantL : pa[2 * i] == wantL;
+        const bool okR = pb[2 * i + 1] == 32767 ? pa[2 * i + 1] >= wantR : pa[2 * i + 1] == wantR;
+        bad += !okL || !okR;
         top += l > 32767;
         bottom += r < -32768;
     }

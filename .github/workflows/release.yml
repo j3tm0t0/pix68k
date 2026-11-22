@@ -110,7 +110,22 @@ jobs:
       - name: ツールを入れる
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu rsync zip unzip curl python3-numpy python3-pil
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu rsync xz-utils zip unzip curl python3-numpy python3-pil
+      # Raspberry Pi 2 版 (32 ビット) のコンパイラは Arm GNU Toolchain 15.2.Rel1。Ubuntu のパッケージの arm-none-eabi-gcc 14.2.1 は、
+      # Cortex-A7 で未定義命令の例外になる ldrd を出し、できたカーネルが実機で止まった (tools/baremetal_arm32_check.sh)。
+      # SHA-256 は Arm が配っている .sha256asc の値
+      - name: arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1) を入れる
+        env:
+          ARM_GCC_URL: https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
+          ARM_GCC_SHA256: 597893282ac8c6ab1a4073977f2362990184599643b4c5ee34870a8215783a16
+        run: |
+          set -eu
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/arm-gcc.tar.xz" "$ARM_GCC_URL"
+          echo "$ARM_GCC_SHA256  $RUNNER_TEMP/arm-gcc.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/arm-gcc"
+          tar -xJf "$RUNNER_TEMP/arm-gcc.tar.xz" -C "$RUNNER_TEMP/arm-gcc" --strip-components=1
+          echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/arm-gcc/bin/arm-none-eabi-gcc" --version | head -1
       - name: zip を作る
         run: tools/make_release.sh "$VERSION"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

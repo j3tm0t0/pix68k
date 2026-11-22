@@ -4,14 +4,26 @@
 CIRCLEHOME ?= ../external/circle
 PIX68K_SRC ?= ../src
 
+# FPU の計算の部分 (FpuCore) は、68000 の機種の数値演算プロセッサボード (x68k/fpu_board.h) も使うので、68030 / 68060 の
+# コアを入れないビルドにも入れる。PIX68K_FPU_BOARD=0 のときだけ、ボードごと入れない (Pi 2 版。FPU の計算は 128 ビットの
+# 整数 (unsigned __int128) を使い、32 ビットの ARM の GCC にはない。tools/build_baremetal.sh 2 がそう呼ぶ)
+ifeq ($(strip $(PIX68K_FPU_BOARD)),0)
+ifeq ($(strip $(PIX68K_CPU020)),1)
+$(error PIX68K_FPU_BOARD=0 のときは PIX68K_CPU020=1 にできない (68030 / 68060 の FPU も同じ計算を使う))
+endif
+DEFINE	+= -DPIX68K_NO_FPU_BOARD
+else
+FPU_OBJS = m68k_fpu_core.o m68k_fpu_math.o
+FPU_BOARD_OBJS = x68k_fpu_board.o
+endif
+
 # X68000 本体 (src/x68k)
 X68K_OBJS = x68k_machine.o x68k_mfp.o x68k_rtc.o x68k_video.o x68k_devices.o x68k_render.o x68k_gvram.o \
 	x68k_fdd.o x68k_fdc.o x68k_dmac.o x68k_keyboard.o x68k_textscreen.o x68k_sram_file.o \
 	x68k_scc.o x68k_mouse.o x68k_ppi.o x68k_sasi.o x68k_spc.o x68k_cd_drive.o x68k_opm.o x68k_adpcm.o x68k_sound.o x68k_video_replay.o x68k_sound_replay.o x68k_state.o \
-	x68k_ts6bga.o x68k_fpu_board.o x68k_mercury.o x68k_neptune.o x68k_ym3802.o
+	x68k_ts6bga.o $(FPU_BOARD_OBJS) x68k_mercury.o x68k_opn3.o x68k_neptune.o x68k_ym3802.o
 
-# FPU の計算の部分 (FpuCore) は、68000 の機種の数値演算プロセッサボード (x68k/fpu_board.h) も使うので、常に入れる
-OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o net_bridge.o host_net.o pi5_fan.o m68k.o m68k_fpu_core.o m68k_fpu_math.o $(X68K_OBJS) \
+OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o net_bridge.o host_net.o pi5_fan.o m68k.o $(FPU_OBJS) $(X68K_OBJS) \
 	platform_sf2_synth.o platform_mt32_synth.o munt_libc.o $(MUNT_OBJS) platform_sc55_synth.o $(NUKED_OBJS)
 
 # MT-32 の音源 Munt (external/munt、LGPL 2.1 以降)。ソースは変えずに、C++ の標準ライブラリと libm のかわりに
@@ -64,6 +76,13 @@ OPTIMIZE = -O3
 
 include $(CIRCLEHOME)/Rules.mk
 
+# コア 0 が割り込みの処理に使った時間を数える (画面の右下の使用率のバー。kernel.cpp の __wrap_InterruptHandler())
+ifneq ($(strip $(CLANG)),1)
+LDFLAGS	+= --wrap=InterruptHandler
+else
+LDFLAGS	+= -Wl,--wrap=InterruptHandler
+endif
+
 # アプリの部分はフレームポインタを持たない (#224。ホスト版の Release と同じ)。Circle の Rules.mk は、KASAN のとき
 # だけ -fno-omit-frame-pointer を付け、ふだんは何も付けないので、aarch64 の GCC の既定で、関数を呼ぶ関数ごとに x29 を
 # 設定している。Circle のライブラリは変えない (この Makefile がビルドするものだけ)。例外のときに Circle が出す
@@ -91,12 +110,24 @@ $(OBJS): builtin_mem.h
 # __atomic_compare_exchange_n、__atomic_fetch_add など) が libgcc の関数 (__aarch64_cas4_acq_rel など。outline atomics) の
 # 呼び出しになる。この関数は呼ばれるたびに LSE の有無の変数を読んでから LL/SC のループに入る。ベアメタルでは LSE の
 # 有無がビルドのときに決まっているので、その場の LL/SC の命令にする。Pi 5 (Cortex-A76) 向けは、付けなくても LSE の
-# 命令がその場に出ていて、libgcc の関数の呼び出しはもともとない
+# 命令がその場に出ていて、libgcc の関数の呼び出しはもともとない。
+# AArch64 だけのオプション。32 ビットの Pi 2 (Cortex-A7) 向けは、何も付けなくても 64 ビットのものまでその場の命令
+# (ldrex / strex、ldrexd / strexd) になる
+ifeq ($(strip $(AARCH)),64)
 CFLAGS += -mno-outline-atomics
+endif
+
+# memcpy() / memset() に付ける、そろっていない読み書きをさせないオプション。32 ビットの ARM では -mgeneral-regs-only も
+# 付ける: 付けないと、8 バイトの読み書きが VFP の d レジスタ (vldr / vstr) になる。付けると 4 バイトずつ 2 回になる
+ifeq ($(strip $(AARCH)),64)
+MEM_FAST_FLAGS = -mstrict-align
+else
+MEM_FAST_FLAGS = -mno-unaligned-access -mgeneral-regs-only
+endif
 
 mem_fast.o: mem_fast.cpp
 	@echo "  CPP   $@"
-	@$(CPP) $(NOBUILTIN_CPPFLAGS) -fno-builtin -fno-tree-loop-distribute-patterns -fno-tree-vectorize -mstrict-align -c -o $@ $<
+	@$(CPP) $(NOBUILTIN_CPPFLAGS) -fno-builtin -fno-tree-loop-distribute-patterns -fno-tree-vectorize $(MEM_FAST_FLAGS) -c -o $@ $<
 
 # Pi 5 は boot パーティションが NVMe にある (Rules.mk を読んだあとなら RASPPI が分かる)
 ifeq ($(strip $(RASPPI)),5)

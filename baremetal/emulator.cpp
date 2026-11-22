@@ -203,6 +203,7 @@ void Emulator::runSound() {
             if (f != seenFrames) {
                 // ステートを読んだときなどにフレームの数が戻ったら、数えずに区切りだけ合わせる
                 if (f > seenFrames) soundWork_.addFrames(busyUs, (uint32_t)(f - seenFrames));
+                addBusy(3, busyUs);
                 busyUs = 0;
                 seenFrames = f;
             }
@@ -272,6 +273,7 @@ void Emulator::runRender() {
             // フレームの数が戻ったら (今の VideoReplayer では起きないが、数え直すようになったときのため)、
             // 数えずに区切りだけ合わせる
             if (f > seenFrames) renderWork_.addFrames(busyUs, (uint32_t)(f - seenFrames));
+            addBusy(2, busyUs);
             busyUs = 0;
             seenFrames = f;
         }
@@ -413,6 +415,9 @@ void Emulator::prepareSave() {
         machine_->sound().flushJournal();
         soundJournal_.flush();
         x68k::copySoundState(*synth_, machine_->sound());
+        // まーきゅりーゆにっとの YMF288: Machine のものは音を作っていないので、音を作っているコア 3 のものから写す
+        x68k::Mercury* unit = soundReplayer_->mercury();
+        if (unit && machine_->mercury()) machine_->mercury()->copyOpnSynthFrom(*unit);
     }
 }
 
@@ -492,6 +497,7 @@ void Emulator::addFrameTiming(uint32_t cycles, uint32_t busyUs, int32_t spareUs,
     t.renderWaits = (uint32_t)(journal_.stats().waits + link_.frameWaits());
     t.soundWaits = (uint32_t)soundJournal_.stats().waits;
     t.busyUs += busyUs;
+    addBusy(1, busyUs - waitUs);
     // コア 0 に頼まれていれば、このフレームまでを区間としてコア 0 に渡し、次のフレームから新しい区間にする
     timing_.endSample();
 }

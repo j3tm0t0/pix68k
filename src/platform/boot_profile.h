@@ -202,7 +202,7 @@ inline bool profileTitle(const char* data, size_t n, char* out, size_t size, boo
 inline bool isCommonSettingKey(const char* key) {
     static const char* const kCommon[] = {"net",       "net_ip",    "net_gw",           "net_dns",    "net_name",
                                           "net_allow", "net_token", "syslog",           "keyboard",   "hat",       "pad_log",
-                                          "video_filter", "video_scale", "osd",       "render_core", "sound_core",
+                                          "video_filter", "video_scale", "osd",       "osd_bars",    "render_core", "sound_core",
                                           "midi_uart", "midi_uart_family", "write_back", "profile_wait",
                                           // 前の書き方 (v0.1.0 の scale= と scanline= は読み替え、crt= は知らせて無視する)。
                                           // pix68k.cfg に残っていても受け継ぐ

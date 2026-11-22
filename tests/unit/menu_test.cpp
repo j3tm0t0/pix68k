@@ -99,6 +99,18 @@ public:
         return true;
     }
     bool has020() const override { return cpu020; }
+    // 実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクが入っているドライブ
+    bool realFloppy[2] = {false, false};
+    int imageSaves = 0, lastImageDrive = -1;
+    const char* imageMsg = "saved as FD-602F7858.XDF";
+    bool imageOk = true;
+    bool hasRealFloppy(int drive) const override { return realFloppy[drive]; }
+    bool saveFloppyImage(int drive, MenuText& msg) override {
+        imageSaves++;
+        lastImageDrive = drive;
+        if (imageMsg) msg.add(imageMsg);
+        return imageOk;
+    }
 };
 
 // label の項目までカーソルを動かす
@@ -374,6 +386,79 @@ void testActions() {
     m.key(mk::ENTER);
     CHECK_EQ(host.resets, 1);
     CHECK_EQ(m.isOpen(), 0);
+}
+
+// label の項目があるか (カーソルは一周して元に戻る)
+bool hasItem(Menu& m, const char* label) {
+    bool found = false;
+    char first[64];
+    copyString(first, sizeof first, m.currentLabel());
+    for (int i = 0; i < 64; i++) {
+        if (strcmp(m.currentLabel(), label) == 0) found = true;
+        m.key(mk::DOWN);
+        if (strcmp(m.currentLabel(), first) == 0) break;
+    }
+    return found;
+}
+
+// いまのページの項目の数 (カーソルは一周して元に戻る)
+int countItems(Menu& m) {
+    char first[64];
+    copyString(first, sizeof first, m.currentLabel());
+    for (int n = 1; n < 64; n++) {
+        m.key(mk::DOWN);
+        if (strcmp(m.currentLabel(), first) == 0) return n;
+    }
+    return -1;
+}
+
+// 「Save FD<N> image」は、USB-FDD から読んだディスクが入っているドライブの分だけ出る
+void testFloppyImage() {
+    printf("floppy image\n");
+    FakeHost host;
+    Menu m(host);
+    Settings running;
+    m.open(running, running);
+    CHECK_EQ(hasItem(m, "Save FD0 image"), false);
+    CHECK_EQ(hasItem(m, "Save FD1 image"), false);
+    const int rows = countItems(m);
+
+    host.realFloppy[1] = true;
+    m.open(running, running);
+    CHECK_EQ(hasItem(m, "Save FD0 image"), false);
+    CHECK_EQ(hasItem(m, "Save FD1 image"), true);
+    CHECK_EQ(countItems(m), rows + 1);
+    // FD1 の次の行に出る
+    moveTo(m, "FD1");
+    m.key(mk::DOWN);
+    CHECK_EQ(strcmp(m.currentLabel(), "Save FD1 image"), 0);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.imageSaves, 1);
+    CHECK_EQ(host.lastImageDrive, 1);
+    CHECK_EQ(strcmp(m.status(), "saved as FD-602F7858.XDF"), 0);
+    CHECK_EQ(m.isOpen(), 1);
+    // 左右のキーでは何も起きない
+    m.key(mk::LEFT);
+    m.key(mk::RIGHT);
+    CHECK_EQ(host.imageSaves, 1);
+    // 失敗したら、相手の文をそのまま出す
+    host.imageMsg = "cannot write FD-602F7858.XDF";
+    host.imageOk = false;
+    m.key(mk::ENTER);
+    CHECK_EQ(host.imageSaves, 2);
+    CHECK_EQ(strcmp(m.status(), "cannot write FD-602F7858.XDF"), 0);
+    // 文がなければ「image saved」
+    host.imageMsg = nullptr;
+    host.imageOk = true;
+    m.key(mk::ENTER);
+    CHECK_EQ(strcmp(m.status(), "image saved"), 0);
+
+    host.realFloppy[0] = true;
+    m.open(running, running);
+    CHECK_EQ(countItems(m), rows + 2);
+    moveTo(m, "Save FD0 image");
+    m.key(mk::ENTER);
+    CHECK_EQ(host.lastImageDrive, 0);
 }
 
 void testKeyFilter() {
@@ -805,6 +890,64 @@ void testScale() {
     ms.key(mk::UP);
     ms.key(mk::UP);
     CHECK_EQ(strcmp(ms.currentLabel(), "Save settings"), 0);
+}
+
+// 画面の右下の使用率のバー (osd_bars=) の項目は、hasOsdBars() のとき (ベアメタル版) だけ出す。既定は off で、
+// 変えたらすぐに知らせる
+void testOsdBars() {
+    printf("osd_bars\n");
+    CHECK_EQ(Settings().osdBars, 0);
+    {
+        FakeHost h;
+        Menu m(h);
+        Settings s;
+        m.open(s, s);
+        int found = 0; // ホスト版には出さない
+        for (int i = 0; i < 40; i++, m.key(mk::DOWN))
+            if (strcmp(m.currentLabel(), "OSD bars") == 0) found++;
+        CHECK_EQ(found, 0);
+    }
+    struct BarsHost : FakeHost {
+        int on = -1, calls = 0;
+        bool hasOsdBars() const override { return true; }
+        void osdBarsChanged(int v) override {
+            on = v;
+            calls++;
+        }
+    } bh;
+    Menu m(bh);
+    Settings running, saved;
+    m.open(running, saved);
+    CHECK_EQ(moveTo(m, "OSD bars"), 1);
+    char v[Menu::COLS + 1];
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "off"), 0);
+    m.key(mk::RIGHT);
+    CHECK_EQ(m.pending().osdBars, 1);
+    CHECK_EQ(bh.on, 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "on"), 0);
+    m.key(mk::LEFT);
+    CHECK_EQ(bh.on, 0);
+    CHECK_EQ(bh.calls, 2);
+    // 保存してあるのは off、メニューで on にして保存せずに閉じた → 開き直すと on (いま動いている値) を出し、
+    // Save settings で on を保存する
+    m.key(mk::RIGHT);
+    CHECK_EQ(bh.on, 1);
+    m.key(mk::ESC);
+    CHECK_EQ(m.isOpen(), 0);
+    running.osdBars = bh.on; // ベアメタル版の osdBarsChanged() は、いま動いている設定を書き換える
+    m.open(running, saved);
+    CHECK_EQ(moveTo(m, "OSD bars"), 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "on"), 0);
+    CHECK_EQ(moveTo(m, "Save settings"), 1);
+    m.key(mk::ENTER);
+    CHECK_EQ(bh.settingsSaves, 1);
+    CHECK_EQ(bh.saved.osdBars, 1);
+    const SettingKey* k = findSettingKey("osd_bars");
+    CHECK_EQ(k != nullptr, 1);
+    if (k) {
+        CHECK_EQ(k->restart, 0);
+        CHECK_EQ(k->host, 0);
+    }
 }
 
 // 画面の隅の数字 (osd=) の項目は、どちらの環境にも出し、開いたときはいまの値を出す。変えたらすぐに知らせる
@@ -1405,8 +1548,11 @@ void testFit480() {
     } host;
     static const int kWidths[] = {640, 720};
     static const int kCpus[] = {68000, 68030, 68060};
+    // real = 1: 「Save FD0 image」「Save FD1 image」の 2 行が増えたとき (USB-FDD から読んだディスクが入っている)
+    for (int real = 0; real < 2; real++)
     for (int w : kWidths)
         for (int cpu : kCpus) {
+            host.realFloppy[0] = host.realFloppy[1] = real != 0;
             Menu m(host);
             Settings running, saved;
             running.cpu = saved.cpu = cpu;
@@ -1476,11 +1622,13 @@ int main() {
     testFitPages();
     testScale();
     testOsd();
+    testOsdBars();
     testDiscardConfirm();
     testNavigate();
     testDisks();
     testJapaneseNames();
     testActions();
+    testFloppyImage();
     testKeyFilter();
     testDraw();
     return finish();

@@ -42,7 +42,10 @@
 //                         scsi_ex_rom=...   外付け SCSI ボードの ROM のファイル (/ で始まらなければ /pix68k から)
 //                         fpu_board=off     on なら数値演算プロセッサボード (CZ-6BP1 相当、MC68881) をつなぐ ($E9E000。
 //                                           FLOAT3.X などから使う)。2 なら 2 枚目も $E9E080 につなぐ
-//                         mercury=off       on ならまーきゅりーゆにっと (16 ビットの PCM、$ECC080、DMAC のチャネル 2) をつなぐ
+//                         mercury=off       on ならまーきゅりーゆにっと (16 ビットの PCM と YMF288 2 個、$ECC080、DMAC のチャネル 2、
+//                                           割り込みはレベル 4) をつなぐ
+//                         mercury_rhythm=   YMF288 のリズム音源の音 (2608_BD.WAV など 6 つの WAV。platform/opn_rhythm.h) を置いた
+//                                           ディレクトリ (/ で始まらなければ /pix68k から。書かなければ /pix68k)。なければリズムは鳴らない
 //                         neptune=off       on ならネットワークボード Neptune-X (NE2000 互換、$ECE000、IRQ2) をつなぐ。
 //                                           有線の Ethernet でフレームを出し入れする (net_bridge.h)
 //                         neptune_mac=...   ボードの MAC アドレス (既定 02:68:6b:00:00:01)。pi なら Pi の MAC アドレスを使う
@@ -122,6 +125,7 @@
 #include <circle/machineinfo.h>
 #include <circle/string.h>
 #include <circle/synchronize.h>
+#include <circle/usb/usbfloppydevice.h>
 #include <circle/util.h>
 
 #include "event_wait.h"
@@ -130,12 +134,19 @@
 #include "platform/disk_cache_size.h"
 #include "platform/disk_sync.h"
 #include "platform/file_replace.h"
+#include "platform/floppy_image_save.h"
 #include "platform/net_config.h"
 #include "platform/net_files.h"
+#include "platform/real_floppy.h"
 #include "platform/setting_warning.h"
 #include "platform/mt32_synth.h"
+#include "platform/opn_rhythm.h"
 #include "platform/sc55_synth.h"
 #include "platform/sf2_synth.h"
+
+// 音の DMA が送り終えたバッファの番号を合わせ直した回数 (kernel.cpp)
+extern "C" volatile unsigned pix68k_dma_resyncs;
+extern "C" void pix68k_dma_refill_reset(void);
 
 static const char FromMachine[] = "x68k";
 
@@ -148,7 +159,9 @@ const unsigned kSpeedReportInterval = 10; // 速さをログに出す間隔 (秒
 const unsigned kMaxSpeedReportInterval = 2; // 最高速モードの CPU の速さをログに出す間隔 (秒)
 // 画面の隅の数字の絵 (platform::renderOsd())。68KB あるので、CKernel の中 (main() のスタックに置かれる。
 // スタックは 128KB) には置かない。書くのは、写す役を持っているコアだけ (CKernel::ShowFrame())
-alignas(16) u32 s_OsdImage[platform::OSD_IMAGE_PIXELS];
+alignas(16) uint32_t s_OsdImage[platform::OSD_IMAGE_PIXELS];
+// 画面の右下の使用率のバーの絵 (platform::renderOsdBars()。38KB)
+alignas(16) uint32_t s_BarsImage[platform::OSD_BAR_PIXELS];
 // 画面の左上のメッセージ (POST /message。platform/osd_message.h) に使うメモリ (85KB ほど)。初めて POST /message が来たときに
 // コア 0 がヒープに確保し、s_pMsg に置く (.bss に置くと、aarch64-linux-gnu-gcc のビルドでカーネルの大きさの上限を超えるため。
 // 使わなければ確保しない)。一度確保したら放さない。
@@ -159,7 +172,7 @@ struct MessageMem {
     platform::MessageGlyphs shown;
     platform::MessageLayout layout;
     platform::MessageGlyphs build;
-    alignas(16) u32 image[platform::MSG_IMAGE_PIXELS];
+    alignas(16) uint32_t image[platform::MSG_IMAGE_PIXELS];
 };
 MessageMem* s_pMsg = nullptr;
 // ハードディスクのイメージは全体をメモリに読むので、大きさに上限を置く。
@@ -204,6 +217,34 @@ void ReleaseHighHeap(uint8_t* p) { CMemorySystem::HeapFree(p); }
 // n バイトを malloc したときに減るヒープの大きさ (SoundFont を読むときの見積もり。platform::LoadLimit)
 uint64_t HeapBlockBytes(size_t n) { return platform::heapBlockBytes(n, kHeapModel); }
 } // namespace
+
+// まーきゅりーゆにっとの YMF288 のリズムの音を SD カードから読む (最初の 1 回だけ。読んだ音は持ち続ける)
+void CKernel::LoadOpnRhythm() {
+    static platform::OpnRhythm rhythm;
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    CString dir;
+    if (m_Settings.mercuryRhythm[0] == '/') dir.Format("%s%s", m_BootDrive, m_Settings.mercuryRhythm);
+    else if (m_Settings.mercuryRhythm[0]) dir.Format("%s/pix68k/%s", m_BootDrive, m_Settings.mercuryRhythm);
+    else dir.Format("%s/pix68k", m_BootDrive);
+    int found = 0;
+    for (int i = 0; i < x68k::Opn3::RHYTHMS; i++) {
+        CString path;
+        path.Format("%s/%s", (const char*)dir, platform::kOpnRhythmFiles[i]); // FAT は大文字と小文字を区別しない
+        unsigned size = 0;
+        u8* file = ReadWholeFile(path, size);
+        if (file == nullptr) continue;
+        if (rhythm.add(i, file, size)) {
+            found++;
+        } else {
+            m_Logger.Write(FromMachine, LogWarning, "%s: not a 16-bit PCM WAV file; not used", (const char*)path);
+            delete[] file;
+        }
+    }
+    if (found) x68k::Opn3::setRhythm(&rhythm.set);
+    m_Logger.Write(FromMachine, LogNotice, "Mercury Unit: %d rhythm sounds from %s", found, (const char*)dir);
+}
 
 // ファイル全体をヒープに読む。読めなければ nullptr
 u8* CKernel::ReadWholeFile(const char* path, unsigned& size) {
@@ -755,6 +796,7 @@ bool CKernel::LoadDisk(int drive, const char* name) {
             return false;
         }
     }
+    if (const int unit = platform::realFloppyUnit(name); unit >= 0) return LoadRealFloppy(drive, unit);
     CString path, tmp;
     unsigned size = 0;
     u8* data = nullptr;
@@ -832,6 +874,310 @@ bool CKernel::LoadDisk(int drive, const char* name) {
     return true;
 }
 
+namespace {
+// Circle の USB-FDD (ufd1。CBI の UFI) を、読むだけのドライブとして見せる (platform/real_floppy.h)。
+// Circle のドライバは tools/circle_ufd_patch.sh で書き換えてあり、1024 バイト/セクタを読め、書き込みは送らない
+class CircleFloppy final : public platform::RealFloppySource {
+public:
+    explicit CircleFloppy(CUSBFloppyDiskDevice* dev) : dev_(dev) {}
+    bool geometry(uint32_t& blockBytes, uint32_t& blocks) override {
+        if (dev_ == nullptr) return false;
+        blockBytes_ = dev_->GetBlockSize();
+        blockBytes = blockBytes_;
+        blocks = (uint32_t)(dev_->GetSize() / blockBytes_);
+        return true;
+    }
+    bool read(uint32_t lba, uint32_t count, uint8_t* dst) override {
+        if (dev_ == nullptr || blockBytes_ == 0) return false;
+        const size_t bytes = (size_t)count * blockBytes_;
+        dev_->Seek((u64)lba * blockBytes_);
+        return dev_->Read(dst, bytes) == (int)bytes;
+    }
+
+private:
+    CUSBFloppyDiskDevice* dev_;
+    uint32_t blockBytes_ = 0;
+};
+} // namespace
+
+// USB-FDD への転送を待つ間 (長くて 30 秒。ドライブが読みにくいセクタを読み直している間など) に、ウォッチドッグを
+// 延ばす (pix68k_deploy のときのウォッチドッグは 15 秒)。待ちのループから何度も呼ばれるので、1 秒に 1 回だけにする。
+// Circle の xHCI のドライバ (tools/circle_ufd_patch.sh で書き換えたもの) が呼ぶ。USB の装置を探す前に ScanUsb() が
+// 登録し、外さない (USB-FDD の Configure() は、fd0= / fd1= に書いていなくても、つないであれば USB メモリを探す間や
+// あとからつないだときにも呼ばれ、そこでも 30 秒まで待つため)
+void CKernel::RealFloppyWaitHook() {
+    static u64 last = 0;
+    const u64 now = CTimer::GetClockTicks64();
+    if (s_pThis == nullptr || now - last < CLOCKHZ) return;
+    last = now;
+    s_pThis->KeepAlive();
+}
+
+// unit 番 (0 から数える) の USB-FDD (Circle の ufd<unit + 1>) に入っている実物のディスクの全体を読み、
+// 書き込み禁止のイメージとしてドライブに入れる (fd<N>=usb-fdd: か usb-fdd:<unit>。#286)。
+// 読むのは X68000 の 2HD だけ。実物のディスクには書かない (書き戻しの対象に入れず、イメージは書き込み禁止)。
+// Circle のドライバは、USB-FDD を見つけたときにディスクの大きさを 1 回だけ読み、読めたドライブにだけ、読めた順に
+// ufd1、ufd2、… と番号を付ける。ディスクを入れずに起動したドライブは数に入らず (2 台のうち 1 台目が空なら、
+// 2 台目が ufd1 になる)、起動のあとでディスクを入れ替えても気づかない (前のディスクの大きさのまま)。
+// 読み終えるまで 1 分ほどかかる (Full Speed の USB と、ドライブの回転の速さで決まる)。その間はここから戻らない
+bool CKernel::LoadRealFloppy(int drive, int unit) {
+    typedef platform::RealFloppyReader Reader;
+    // このドライブに、前に USB-FDD から読んだディスクが入っていれば、先に取り出す (同じバッファに読み直すため。
+    // 書き込み禁止なので、書き戻すものはない)。このあと読めなければ、ドライブは空になる
+    if (m_pDiskData[drive] != nullptr && m_pDiskData[drive] == m_pRealFloppyBuf[drive]) EjectDisk(drive, true);
+    // USB の装置は、ふだんは X68000 を動かし始めてから探す。ここではディスクを読む前に探し (2 回目からは何もしない)、
+    // USB-FDD が出てくるまで待つ。ドライブは見つかってからディスクの大きさを答えるまでに、モーターを回して 3 秒ほど
+    // かかる (Y-E DATA の USB-FDU を Pi 5 につないで、探し終えてから約 4.5 秒)。待つのは、最初に待ち始めてから
+    // kRealFloppyWait まで (ないドライブを 2 つ指定しても、待ち直さない)。ただし、どの呼び出しでも kRealFloppyMinWait は
+    // 待つ (1 台目を読んでいる間はプラグアンドプレイの処理を回していないので、2 台目はそのあとで見つかる)。
+    // 待つ間は Circle のプラグアンドプレイの処理だけを回し、キーボードなどの登録は UpdateUsbDevices() に任せる
+    // ufd<番号> は Circle の USB-FDD のドライバだけが登録する名前 (lib/usb/usbfloppydevice.cpp)
+    static const u64 kRealFloppyWait = 10 * (u64)CLOCKHZ;
+    static const u64 kRealFloppyMinWait = 5 * (u64)CLOCKHZ;
+    CString devName;
+    devName.Format("ufd%d", unit + 1);
+    ScanUsb(false);
+    const u64 called = CTimer::GetClockTicks64();
+    if (m_RealFloppyWaitFrom == 0) m_RealFloppyWaitFrom = called;
+    CDevice* dev = nullptr;
+    while (m_UsbOk) {
+        if (m_USBHCI.UpdatePlugAndPlay()) m_UsbDevicesPending = true;
+        dev = m_DeviceNameService.GetDevice(devName, TRUE);
+        const u64 now = CTimer::GetClockTicks64();
+        if (dev != nullptr || (now - m_RealFloppyWaitFrom >= kRealFloppyWait && now - called >= kRealFloppyMinWait)) break;
+        KeepAlive();
+        IdleUntil(now + CLOCKHZ / 100);
+    }
+    CircleFloppy src(static_cast<CUSBFloppyDiskDevice*>(dev));
+    // バッファを用意する前に、ドライブがあって読める形式かを確かめる。バッファ (約 1.2MB) はドライブごとに一度だけ
+    // 確保して使い回す (Circle は 512KB を超えるブロックを解放しても使い回さないので、解放しない)。
+    // Circle の new は足りないと全体を止めるので、空きを確かめてから確保する
+    Reader r;
+    bool noMemory = false;
+    u8* data = nullptr;
+    if (r.check(&src)) {
+        if (m_pRealFloppyBuf[drive] == nullptr) {
+            size_t freeBytes = 0;
+            if (HeapHasRoom(Reader::IMAGE_BYTES, freeBytes)) m_pRealFloppyBuf[drive] = new u8[Reader::IMAGE_BYTES];
+        }
+        data = m_pRealFloppyBuf[drive];
+        noMemory = data == nullptr;
+    }
+    if (data != nullptr && r.begin(&src, data, Reader::IMAGE_BYTES)) {
+        m_Logger.Write(FromMachine, LogNotice, "fd%d: reading the disk in USB floppy drive %d (%u tracks, about 1 minute)",
+                       drive, unit, (unsigned)Reader::TRACKS);
+        while (r.step()) {
+            KeepAlive(); // 読む間もウォッチドッグを延ばす (転送を待つ間は RealFloppyWaitHook())
+            if (r.track() % 22 == 0)
+                m_Logger.Write(FromMachine, LogNotice, "fd%d: %u/%u tracks", drive, (unsigned)r.track(),
+                               (unsigned)Reader::TRACKS);
+        }
+    }
+    if (data == nullptr || r.status() != Reader::DONE) {
+        if (noMemory) {
+            m_Logger.Write(FromMachine, LogWarning, "fd%d: USB floppy: not enough memory for the image; the drive is empty",
+                           drive);
+            return false;
+        }
+        switch (r.error()) {
+        case Reader::NO_DISK:
+            m_Logger.Write(FromMachine, LogWarning,
+                           "fd%d: USB floppy drive %d (%s) not found or no disk in it (insert the disk before power-on); the drive is empty",
+                           drive, unit, (const char*)devName);
+            break;
+        case Reader::BAD_FORMAT:
+            m_Logger.Write(FromMachine, LogWarning,
+                           "fd%d: USB floppy: %u blocks of %u bytes; only X68000 2HD (1232 blocks of 1024 bytes) is supported",
+                           drive, (unsigned)r.blocks(), (unsigned)r.blockBytes());
+            break;
+        case Reader::READ_ERROR:
+            m_Logger.Write(FromMachine, LogWarning, "fd%d: USB floppy: cannot read block %u (cylinder %u, head %u, sector %u)",
+                           drive, (unsigned)r.badBlock(), (unsigned)r.badCylinder(), (unsigned)r.badHead(),
+                           (unsigned)r.badSector());
+            break;
+        default: m_Logger.Write(FromMachine, LogWarning, "fd%d: USB floppy: cannot read the disk", drive); break;
+        }
+        return false;
+    }
+    x68k::FloppyImage* image = new x68k::FloppyImage;
+    if (image == nullptr || !image->load(data, Reader::IMAGE_BYTES, true)) {
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: USB floppy: cannot use the disk as an image", drive);
+        delete image;
+        return false;
+    }
+    if (!EjectDisk(drive)) {
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: cannot write back the current disk; not changed", drive);
+        delete image;
+        return false;
+    }
+    // 書き戻しの対象 (m_pDiskWriter->sync) には入れない。m_DiskPath と m_InUsePath も空のまま (ファイルではない)
+    m_pDisks[drive] = image;
+    m_pDiskData[drive] = data;
+    m_RealFloppy[drive] = true;
+    m_pEmulator->machine().insertDisk(drive, image);
+    // CRC-32 は、同じディスクをほかの方法で読んだイメージと比べるため (zlib の crc32() と同じ値)
+    m_Logger.Write(FromMachine, LogNotice,
+                   "fd%d: USB floppy drive %d (%u bytes, CRC-32 %08x; write-protected, the real disk is never written)", drive,
+                   unit, (unsigned)Reader::IMAGE_BYTES, (unsigned)x68k::SramSlots::crc32(data, Reader::IMAGE_BYTES));
+    return true;
+}
+
+namespace {
+// platform::saveFloppyImageFile() のファイルの操作 (FatFs)。名前を変える f_rename() (CFatOps::rename()) は、変えた先の
+// 名前があれば FR_EXIST で失敗し、上書きしない
+struct CFloppySaveFs : CFatOps {
+    platform::FsResult stat(const char* path, unsigned long long& bytes, bool& dir) {
+        FILINFO fi;
+        const platform::FsResult r = conv(f_stat(path, &fi));
+        if (r == platform::FsResult::OK) {
+            bytes = fi.fsize;
+            dir = (fi.fattrib & AM_DIR) != 0;
+        }
+        return r;
+    }
+    // <名前>.new を、ないときだけ作って書く (FA_CREATE_NEW。残っていた .new は、呼ぶ側が先に消している)。
+    // boot ドライブが USB メモリのときは、/pix68k の下で、書いたあとも空きが残るときだけ (CKernel::CanWriteNewFile())。
+    // 書く、f_sync()、f_close() のどれかに失敗すれば ERROR (手順は platform::writeNewFile())
+    struct NewFile {
+        const char* path;
+        FIL f;
+        FRESULT last = FR_OK;
+        bool note(FRESULT r) {
+            if (r != FR_OK && last == FR_OK) last = r;
+            return r == FR_OK;
+        }
+        bool openNew() { return note(f_open(&f, path, FA_WRITE | FA_CREATE_NEW)); }
+        bool write(const void* data, unsigned size, unsigned& written) {
+            UINT n = 0;
+            const bool ok = note(f_write(&f, data, size, &n));
+            written = n;
+            if (ok && n != size) note(FR_DENIED); // 媒体がいっぱい
+            return ok;
+        }
+        bool sync() { return note(f_sync(&f)); }
+        bool close() { return note(f_close(&f)); }
+    };
+    platform::FsResult write(const char* path, const void* data, unsigned size) {
+        if (!CKernel::CanWriteNewFile(path, size)) {
+            last = FR_DENIED;
+            return platform::FsResult::ERROR;
+        }
+        NewFile file{path, {}};
+        const platform::FsResult r = platform::writeNewFile(file, data, size);
+        if (r != platform::FsResult::OK) last = file.last;
+        return r;
+    }
+    // ファイルの全体を 32KB ずつ読んで、CRC-32 を求める
+    bool crc32(const char* path, uint32_t& crc) {
+        static const unsigned kChunk = 32 * 1024;
+        u8* buf = new u8[kChunk];
+        FIL f;
+        FRESULT r = buf != nullptr ? f_open(&f, path, FA_READ) : FR_NOT_ENOUGH_CORE;
+        if (r != FR_OK) {
+            last = r;
+            delete[] buf;
+            return false;
+        }
+        uint32_t state = 0xffffffffu;
+        for (;;) {
+            UINT got = 0;
+            r = f_read(&f, buf, kChunk, &got);
+            if (r != FR_OK || got == 0) break;
+            state = platform::crc32Update(state, buf, got);
+        }
+        f_close(&f);
+        delete[] buf;
+        if (r != FR_OK) {
+            last = r;
+            return false;
+        }
+        crc = ~state;
+        return true;
+    }
+};
+} // namespace
+
+// 設定メニューの「Save FD<N> image」: USB-FDD から読んだディスクを、boot ドライブの /pix68k/FD-<CRC-32>.XDF に書き出す
+// (#287。名前は platform::realFloppyImageName())。あるファイルは上書きしない。手順は platform::saveFloppyImageFile()
+// (同じ名前があれば書かない、<名前>.new に書いて読み戻し、CRC-32 が合えば名前を変える)。
+// 実物のディスクには書かない (書くのは SD カードなどの boot ドライブだけ)
+bool CKernel::saveFloppyImage(int drive, platform::MenuText& msg) {
+    if (drive < 0 || drive > 1 || !m_RealFloppy[drive] || m_pDiskData[drive] == nullptr) {
+        msg.add("FD").add((long)drive).add(" is not a disk from a USB floppy drive");
+        return false;
+    }
+    if (m_BootDrive == nullptr) {
+        msg.add("no drive to save to");
+        return false;
+    }
+    const unsigned size = (unsigned)platform::RealFloppyReader::IMAGE_BYTES;
+    const uint32_t crc = platform::crc32Of(m_pDiskData[drive], size);
+    char name[platform::REAL_FLOPPY_IMAGE_NAME_SIZE];
+    platform::realFloppyImageName(crc, name);
+    CString path, tmp;
+    path.Format("%s/pix68k/%s", m_BootDrive, name);
+    tmp.Format("%s.new", (const char*)path);
+    CFloppySaveFs fs;
+    bool tmpLeft = false; // 失敗したあと、<名前>.new を消せずに残した
+    const platform::FloppyImageSave r =
+        platform::saveFloppyImageFile(fs, path, tmp, m_pDiskData[drive], size, crc, &tmpLeft);
+    const char* const leftNote = tmpLeft ? "; could not remove the .new file" : "";
+    const char* const p = path;
+    switch (r) {
+    case platform::FloppyImageSave::SAVED:
+        m_Logger.Write(FromMachine, LogNotice, "fd%d: the disk from the USB floppy drive saved as %s (%u bytes, read back and verified)",
+                       drive, p, size);
+        msg.add("saved as ").add(name);
+        break;
+    case platform::FloppyImageSave::ALREADY:
+        m_Logger.Write(FromMachine, LogNotice, "fd%d: %s is already there (%u bytes); not written", drive, p, size);
+        msg.add("already saved as ").add(name);
+        break;
+    case platform::FloppyImageSave::OTHER_SIZE:
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: %s exists but is not a %u-byte image; not written", drive, p, size);
+        msg.add(name).add(" exists with another size; not saved");
+        break;
+    case platform::FloppyImageSave::CHECK_FAILED:
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: cannot check %s (FRESULT %d); not written", drive, p, (int)fs.last);
+        msg.add("cannot check ").add(name);
+        break;
+    case platform::FloppyImageSave::WRITE_FAILED:
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: cannot write %s (FRESULT %d)%s", drive, p, (int)fs.last, leftNote);
+        msg.add("cannot write ").add(name);
+        break;
+    case platform::FloppyImageSave::VERIFY_FAILED:
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: %s read back with another CRC-32 (FRESULT %d); %s", drive,
+                       (const char*)tmp, (int)fs.last, tmpLeft ? "could not remove it" : "removed");
+        msg.add("written file does not verify; not saved");
+        break;
+    case platform::FloppyImageSave::APPEARED:
+        m_Logger.Write(FromMachine, LogWarning, "fd%d: %s appeared while writing; left as it is%s", drive, p, leftNote);
+        msg.add(name).add(" appeared while writing; not saved");
+        break;
+    }
+    return platform::floppyImageSaved(r);
+}
+
+// HTTP のタスクが、フロッピーディスクのイメージの写しのバッファ (bytes バイト) を確保してよいか (ヒープの空きを見る。
+// Circle の new は足りないと全体を止める)
+bool CKernel::netCanAllocate(unsigned bytes) {
+    size_t freeBytes = 0;
+    return HeapHasRoom(bytes, freeBytes);
+}
+
+// GET /fd<N>.xdf: USB-FDD から読んだディスクのイメージを buf に写す (#287)。buf が nullptr なら、写さずに大きさだけを
+// 返す (HEAD)。イメージは書き込み禁止で入れてあるので、
+// X68000 が動いていても中身は変わらない。取り出すとバッファを解放するので、送る側 (HTTP のタスク) には写しを渡す
+// (取り出しも HTTP のタスクもコア 0 で、この関数の途中で切り替わることはない)
+unsigned CKernel::netFloppyImage(int drive, u8* buf, unsigned capacity) {
+    const unsigned size = (unsigned)platform::RealFloppyReader::IMAGE_BYTES;
+    if (drive < 0 || drive > 1 || !m_RealFloppy[drive] || m_pDiskData[drive] == nullptr) return 0;
+    if (buf == nullptr) return size;
+    if (capacity < size) return 0;
+    memcpy(buf, m_pDiskData[drive], size);
+    return size;
+}
+
 // ドライブのディスクを取り出し、イメージを解放する (入っていなければ何もしない)。書き戻すディスクは先に書く
 // (X68000 を止めている間に呼ぶ)。書けなければ取り出さずに false
 // discard なら、書けなくても取り出す (メニューで利用者が選んだとき。書けなかった内容は捨てる)
@@ -846,9 +1192,11 @@ bool CKernel::EjectDisk(int drive, bool discard) {
     }
     m_DiskPath[drive] = "";
     m_InUsePath[drive] = "";
+    m_RealFloppy[drive] = false;
     m_pEmulator->machine().ejectDisk(drive);
     delete m_pDisks[drive];
-    delete[] m_pDiskData[drive];
+    // USB-FDD から読んだイメージの置き場 (m_pRealFloppyBuf) は使い回すので、解放しない
+    if (m_pDiskData[drive] != m_pRealFloppyBuf[drive]) delete[] m_pDiskData[drive];
     m_pDisks[drive] = nullptr;
     m_pDiskData[drive] = nullptr;
     return true;
@@ -1514,12 +1862,19 @@ bool CKernel::StartMachine() {
     if (m_Settings.fpuBoard) {
         const int boards = m_Settings.fpuBoard >= 2 ? 2 : 1;
         ok = emu->machine().setFpuBoards(boards);
+#ifdef PIX68K_NO_FPU_BOARD
+        // Pi 2 版にはボードが入っていない (FPU の計算が 128 ビットの整数を使い、32 ビットの GCC にはないため)
+        const char* why = ": not in this build";
+#else
+        const char* why = ": out of memory";
+#endif
         m_Logger.Write(FromMachine, ok ? LogNotice : LogWarning, "FPU board (CZ-6BP1, MC68881) at $E9E000%s%s",
-                       boards >= 2 ? " and $E9E080" : "", ok ? "" : ": out of memory");
+                       boards >= 2 ? " and $E9E080" : "", ok ? "" : why);
     }
     if (m_Settings.mercury) {
         ok = emu->machine().setMercury(true);
         m_Logger.Write(FromMachine, ok ? LogNotice : LogWarning, "Mercury Unit at $ECC080%s", ok ? "" : ": out of memory");
+        if (ok) LoadOpnRhythm();
     }
     if (m_Settings.neptune) {
 #if RASPPI <= 3
@@ -1629,7 +1984,7 @@ bool CKernel::StartMachine() {
     // 変わった行だけをフレームバッファに写すための、前に写した画面の写し (platform/frame_scale.h の FrameRowCache)。
     // カーネルのオプション pix68k_fb_rows=0 なら使わず、毎回すべての行を写す (前と比べるため)
     if (m_Options.GetAppOptionDecimal("pix68k_fb_rows", 1) != 0) {
-        m_RowCache.pixels = new u32[(size_t)Emulator::PITCH * x68k::Renderer::MAX_HEIGHT];
+        m_RowCache.pixels = new uint32_t[(size_t)Emulator::PITCH * x68k::Renderer::MAX_HEIGHT];
         if (m_RowCache.pixels != nullptr) {
             m_RowCache.pitch = Emulator::PITCH;
             m_RowCache.rows = x68k::Renderer::MAX_HEIGHT;
@@ -2284,7 +2639,7 @@ void CKernel::StartCrt() {
 #endif
     int maxW = (int)m_Screen.GetWidth(), maxH = (int)m_Screen.GetHeight();
     if (maxW > ScaleLinePixels - 4) maxW = ScaleLinePixels - 4;
-    u32* mem = maxW > 0 && maxH > 0 ? new u32[platform::crtMapBytes(maxW, maxH) / 4 + 1] : nullptr;
+    uint32_t* mem = maxW > 0 && maxH > 0 ? new uint32_t[platform::crtMapBytes(maxW, maxH) / 4 + 1] : nullptr;
     if (mem != nullptr)
         platform::crtMapInit(m_CrtMap, mem, maxW, maxH);
     else
@@ -2346,10 +2701,10 @@ const platform::BezelImage* CKernel::LoadBezel(int filter) {
                        (const char*)path, h.w, h.h, sw, sh);
         return nullptr;
     }
-    u32* px = nullptr;
+    uint32_t* px = nullptr;
     u16* edges = nullptr;
     if (err == nullptr) {
-        px = new u32[(size_t)h.w * h.h];
+        px = new uint32_t[(size_t)h.w * h.h];
         edges = new u16[(size_t)h.gh * 2];
         if (px == nullptr || edges == nullptr) err = "out of memory";
     }
@@ -2477,6 +2832,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
             platform::fillOutside(base, pitch, sw, sh, scale, 0xff000000u);
         __atomic_store_n(&m_BezelShown, bezelShown, __ATOMIC_RELAXED);
         m_OsdState.invalidate();
+        m_BarsState.invalidate();
         m_MsgState.invalidate();
         m_RowCache.valid = false; // 写しを作り直す (すべての行を写す)
         m_ScreenModeChanged = true; // ログはコア 0 が出す (LogShownScreen())。合成するコアからはログに書かない
@@ -2496,10 +2852,21 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     // 縦に並べたものを右上に重ねる (platform::chooseOsd())。枠は写す範囲 (scale): video_scale=aspect、full は表ができたら
     // platform::videoFrameScale() の枠、できるまでは整数倍の枠 (枠が替わるフレームで置き直す)
     const platform::OsdRect osdRect = platform::chooseOsd(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH,
-                                                          platform::osdChars(osdValue), platform::osdRows(osdValue));
+                                                          platform::osdChars(osdValue), platform::osdRows(osdValue),
+                                                          platform::osdRowsNarrow(osdValue));
     // 置く場所がなければ、UpdateOsd() は温度を読まない (コア 0 が読む)
     __atomic_store_n(&m_OsdPlaced, osdRect.w > 0, __ATOMIC_RELAXED);
     const platform::OsdState::Step osd = m_OsdState.update(osdOn, osdValue, osdRect);
+    // 画面の右下の使用率のバー (platform/osd_bars.h)。osd_bars=on で、右上の数字を出しているときだけ出す (数字を消すとき、メニューを
+    // 開いたときと X68000 が止まったときは、バーも消える)。置く場所は右上の数字と同じ列の下の端で、右上の数字に
+    // ぶつかれば出さない。値は LoadOsd() のあとに読む (コア 0 は右上の数字より先に置く)
+    platform::OsdValue barsValue;
+    barsValue.a = __atomic_load_n(&m_OsdBars, __ATOMIC_RELAXED);
+    const platform::OsdRect barsRect =
+        platform::placeOsdBars(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH,
+                               m_OsdState.shown ? m_OsdState.rect : platform::OsdRect());
+    const platform::OsdState::Step bars = m_BarsState.update(m_OsdState.shown && __atomic_load_n(&m_Settings.osdBars, __ATOMIC_RELAXED) != 0,
+                                                             barsValue, barsRect);
     // 画面の左上のメッセージ (POST /message)。コア 0 が新しい字形を置いていたら写し、消す時刻を過ぎたら出さない。
     // 右上の数字と同じ行に並ぶときは、数字にかからないよう右を切る。描き方は右上の数字と同じ
     // まだ 1 度も POST /message が来ていなければ (s_pMsg が nullptr)、何も出さない
@@ -2535,18 +2902,31 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
         erase(msg.eraseRect);
         ForceRows(msg.eraseRect.y, msg.eraseRect.y + msg.eraseRect.h);
     }
+    if (bars.erase) {
+        erase(bars.eraseRect);
+        ForceRows(bars.eraseRect.y, bars.eraseRect.y + bars.eraseRect.h);
+    }
     // 重ねる数字やメッセージを描き直したら、重なる行を写す
     if (osd.draw && osdRect.overlay) ForceRows(osdRect.y, osdRect.y + osdRect.h);
     if (msg.draw && msgRect.overlay) ForceRows(msgRect.y, msgRect.y + msgRect.h);
+    if (bars.draw && barsRect.overlay) ForceRows(barsRect.y, barsRect.y + barsRect.h);
     if (osd.draw) platform::renderOsd(s_OsdImage, osdRect, osdValue);
+    if (bars.draw) platform::renderOsdBars(s_BarsImage, barsRect, barsValue.a);
     if (msg.draw) platform::renderMessage(mm->image, msgRect, mm->shown);
-    platform::FrameOverlay ov, ovMsg;
+    platform::FrameOverlay ov, ovMsg, ovBars;
     if (m_OsdState.overlaid()) {
         ov.pixels = s_OsdImage;
         ov.x = osdRect.x;
         ov.y = osdRect.y;
         ov.w = osdRect.w;
         ov.h = osdRect.h;
+    }
+    if (m_BarsState.overlaid()) {
+        ovBars.pixels = s_BarsImage;
+        ovBars.x = barsRect.x;
+        ovBars.y = barsRect.y;
+        ovBars.w = barsRect.w;
+        ovBars.h = barsRect.h;
     }
     if (m_MsgState.overlaid()) {
         ovMsg.pixels = mm->image;
@@ -2565,12 +2945,13 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     if (useMap)
         platform::presentCrt(frame.pixels, Emulator::PITCH, base, pitch, scale, m_CrtMap, m_ScaleLine, m_ScaleLine2,
                              m_OsdState.overlaid() ? &ov : nullptr, m_RowCache.pixels != nullptr ? &m_RowCache : nullptr,
-                             m_MsgState.overlaid() ? &ovMsg : nullptr, shownBezel != nullptr ? &cb : nullptr);
+                             m_MsgState.overlaid() ? &ovMsg : nullptr, shownBezel != nullptr ? &cb : nullptr,
+                             m_BarsState.overlaid() ? &ovBars : nullptr);
     else
         platform::presentScaled(frame.pixels, Emulator::PITCH, base, pitch, scale, m_ScaleLine,
                                 m_OsdState.overlaid() ? &ov : nullptr,
                                 m_RowCache.pixels != nullptr ? &m_RowCache : nullptr, scanline,
-                                m_MsgState.overlaid() ? &ovMsg : nullptr);
+                                m_MsgState.overlaid() ? &ovMsg : nullptr, m_BarsState.overlaid() ? &ovBars : nullptr);
     // 写した行と省いた行の数 (ログ用。コア 0 が読む)
     __atomic_store_n(&m_RowsCopied, m_RowCache.copied, __ATOMIC_RELAXED);
     __atomic_store_n(&m_RowsSkipped, m_RowCache.skipped, __ATOMIC_RELAXED);
@@ -2584,6 +2965,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     };
     if (osd.draw) drawImage(osdRect, s_OsdImage);
     if (msg.draw) drawImage(msgRect, mm->image);
+    if (bars.draw) drawImage(barsRect, s_BarsImage);
     const u64 us = (CTimer::GetClockTicks64() - t0) * 1000000 / CLOCKHZ;
     // コア 0 が読む (ログ)。書くのは写す役を持っているコアだけ
     __atomic_store_n(&m_CopyTotalUs, m_CopyTotalUs + us, __ATOMIC_RELAXED);
@@ -2594,15 +2976,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
 // フレームバッファの y0 行目から y1 行目の手前までに重なる X68000 の画面の行を、次に写すときに変わっていなくても写す
 // (FrameRowCache。ShowFrame() の中で、写す前に呼ぶ)
 void CKernel::ForceRows(int y0, int y1) {
-    if (y0 >= y1) return;
-    platform::FrameRowCache& c = m_RowCache;
-    if (c.forceY0 >= c.forceY1) {
-        c.forceY0 = y0;
-        c.forceY1 = y1;
-        return;
-    }
-    if (y0 < c.forceY0) c.forceY0 = y0;
-    if (y1 > c.forceY1) c.forceY1 = y1;
+    m_RowCache.force(y0, y1);
 }
 
 // 画面の隅の数字 (osd=on / fps) を数える。コア 0 がフレームを写した直後に呼び、前に数えてから 1 秒たっていれば、
@@ -2611,6 +2985,7 @@ void CKernel::ForceRows(int y0, int y1) {
 // 画面の隅の数字に出す Raspberry Pi のモデル (Circle の CMachineInfo から)
 int CKernel::OsdPiModel() {
     switch (CMachineInfo::Get()->GetMachineModel()) {
+    case MachineModel2B: return platform::OSD_PI_2B;
     case MachineModel3B: return platform::OSD_PI_3B;
     case MachineModel3BPlus: return platform::OSD_PI_3BPLUS;
     case MachineModel3APlus: return platform::OSD_PI_3APLUS;
@@ -2638,6 +3013,10 @@ void CKernel::UpdateOsd() {
     const uint32_t shown = m_FramesShownByCore0 + m_pEmulator->framesSelfPresented();
     uint64_t cycles, us, frames;
     m_pEmulator->stats(cycles, us, frames);
+    // 画面の右下の使用率のバー: 各コアが仕事をした時間の合計 (0 番目はコア 0 が待った時間の合計)
+    uint64_t busy[platform::OSD_BAR_CORES];
+    busy[0] = m_Core0IdleTicks / (CLOCKHZ / 1000000);
+    for (int c = 1; c < platform::OSD_BAR_CORES; c++) busy[c] = m_pEmulator->coreBusyUs(c);
     if (m_OsdTicks != 0) {
         // 置き換わった数は、前に数えてからの時間で割って 1 秒あたりにする (四捨五入)。メニューを開けずに戻ったときなど、
         // 前に数えてから 1 秒より長くたっていることがある
@@ -2686,6 +3065,24 @@ void CKernel::UpdateOsd() {
         // 1GB より下のヒープの使った量 (一度でも切り出した量。ReadHeap()。メールボックスは使わない)。縦に並べるときだけ出る
         const HeapStatus heap = ReadHeap();
         if (heap.lowBytes != 0) s.heapMB = (int)((heap.lowBytes - heap.lowUnused + 512 * 1024) / (1024 * 1024));
+        // 画面の右下の使用率のバー。コアは前に数えてからの時間 (dt) のうち仕事をしていた割合 (コア 0 は待っていない割合)、
+        // メモリは 1GB より下のヒープの使った量の割合 (右上の HEAP と同じ値。大きさが分からなければ出さない)。
+        // 出す値に丸めて (platform::osdBarShown())、変わったときだけ写す役のコアが描き直す。右上の数字より先に置く
+        // (写す役のコアは右上の数字があるときだけバーを出すので、数字が出た最初のフレームから新しい値になる)
+        {
+            const u64 dtUs = dt * 1000000 / CLOCKHZ;
+            platform::OsdBars bars;
+            for (int c = 0; c < platform::OSD_BAR_CORES; c++) {
+                const unsigned permille = platform::osdBarPermille(busy[c] - m_OsdBusyUs[c], dtUs, c == 0);
+                bars.pct[c] = m_OsdBarShown[c] = platform::osdBarShown(m_OsdBarShown[c], permille);
+            }
+            if (heap.lowBytes != 0) {
+                const unsigned permille = (unsigned)((uint64_t)(heap.lowBytes - heap.lowUnused) * 1000 / heap.lowBytes);
+                bars.pct[platform::OSD_BAR_CORES] = m_OsdBarShown[platform::OSD_BAR_CORES] =
+                    platform::osdBarShown(m_OsdBarShown[platform::OSD_BAR_CORES], permille);
+            }
+            __atomic_store_n(&m_OsdBars, platform::packOsdBars(bars), __ATOMIC_RELAXED);
+        }
         // ネットワークの IP アドレス (縦に並べるときのいちばん下。net=on でアドレスが決まっているときだけ)。
         // UpdateOsd() はコア 0 で動くので、ネットワークのタスクと同じコアで読む
         if (m_pHostNet != nullptr) s.ipv4 = m_pHostNet->IPv4();
@@ -2699,6 +3096,7 @@ void CKernel::UpdateOsd() {
     m_OsdCycles = cycles;
     m_OsdUs = us;
     m_OsdEmuFrames = frames;
+    for (int c = 0; c < platform::OSD_BAR_CORES; c++) m_OsdBusyUs[c] = busy[c];
 }
 
 // 画面の隅の数字を、フレームが来ないまま 2 秒たったら消す (X68000 が止まっている間、最後の数字が残らないように)。
@@ -2718,7 +3116,8 @@ void CKernel::ExpireOsd() {
     if (now - m_OsdPublishedTicks < 2 * CLOCKHZ) return;
     PublishOsd(platform::OsdValue());
     m_OsdTicks = 0; // フレームが来たら数え直す
-    if (m_OsdState.shown && m_pLastFrame != nullptr && m_pEmulator->paused()) ShowFrame(*m_pLastFrame, true);
+    if ((m_OsdState.shown || m_BarsState.shown) && m_pLastFrame != nullptr && m_pEmulator->paused())
+        ShowFrame(*m_pLastFrame, true);
 }
 
 // POST /message (CHttpTask、コア 0) から呼ぶ。字を並べて字形にし、写す役のコアに渡す。消す時刻は ShowFrame() が見る。
@@ -2802,6 +3201,7 @@ void CKernel::StartSound() {
     }
     // リングバッファのたまり具合の最小値の目標は 20ms (音のデバイスは 11-16ms ずつ取り出す)
     m_pEmulator->enableSound(pix68k_sound::RATE, pix68k_sound::RATE * 20 / 1000);
+    pix68k_dma_refill_reset();
     if (!dev->Start()) {
         m_Logger.Write(FromMachine, LogWarning, "sound: cannot start %s output; sound off", mode);
         delete dev;
@@ -3568,9 +3968,12 @@ void CKernel::ReportSpeed() {
     if (m_pSound != nullptr || m_NullAudio)
         // たまっている量と、たまり具合の最小値の目標 (20ms から。足りなくなったときと、間に合わない間に多く作った
         // ときに増える。x68k/sound.h)
-        m_Logger.Write(FromMachine, LogNotice, "sound: %u underrun(s), %u ms buffered, aiming for at least %u ms",
+        // 最後の数は、音の DMA が送り終えたバッファの番号を、DMA のレジスタに合わせ直した回数 (起動からの合計。kernel.cpp の
+        // pix68k_dma_resyncs)。割り込みを取りこぼしたときに増える (そのたびに、バッファ 1 つ分ほど音が飛んでいる)
+        m_Logger.Write(FromMachine, LogNotice,
+                       "sound: %u underrun(s), %u ms buffered, aiming for at least %u ms, %u DMA resync(s)",
                        m_pEmulator->audioUnderruns(), m_pEmulator->audioFill() * 1000 / pix68k_sound::RATE,
-                       m_pEmulator->audioGoal() * 1000 / pix68k_sound::RATE);
+                       m_pEmulator->audioGoal() * 1000 / pix68k_sound::RATE, (unsigned)pix68k_dma_resyncs);
     ReportSoundLevels();
     ReportDisks();
     if (m_pEmulator->soundCoreActive()) {
@@ -3591,6 +3994,14 @@ void CKernel::ReportSoundLevels() {
     if (lv.midi != 0 || lv.clipped != 0)
         m_Logger.Write(FromMachine, LogNotice, "sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix",
                        (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);
+    // 音源ごとの最大と、足したあと (MIDI の音源を足す前) に止めた数、MIDI の音源の出力が上限に届いた数、リングバッファが
+    // 満杯で捨てた数。足した音が上限の半分を超えたか、止めた、届いた、捨てたのどれかがあった区間だけ出す
+    if (lv.mix > 16384 || lv.mixClipped != 0 || lv.midiFull != 0 || lv.dropped != 0 || lv.clipped != 0)
+        m_Logger.Write(FromMachine, LogNotice,
+                       "sound sources: OPM peak %u, ADPCM %u, Mercury PCM %u, YMF288 %u, sum %u (of 32767); %u sample(s) clipped before MIDI, "
+                       "%u MIDI frame(s) at full scale, %u frame(s) dropped",
+                       (unsigned)lv.opm, (unsigned)lv.adpcm, (unsigned)lv.mercury, (unsigned)lv.opn, (unsigned)lv.mix, (unsigned)lv.mixClipped,
+                       (unsigned)lv.midiFull, (unsigned)lv.dropped);
     if (m_pMt32 != nullptr) {
         const uint32_t messages = m_pMt32->droppedMessages(), sysex = m_pMt32->droppedSysex();
         if (messages != m_Mt32DroppedLogged[0] || sysex != m_Mt32DroppedLogged[1])

@@ -25,6 +25,7 @@
 #include "platform/boot_drive.h"
 #include "platform/net_files.h"
 #include "platform/osd_message.h"
+#include "platform/floppy_image_save.h"
 #include "platform/net_http.h"
 #include "platform/serial_ring.h"
 
@@ -298,6 +299,7 @@ private:
     bool RefuseImage(const char* path, bool upload);
     void GetLog(bool head);
     void GetScreen(bool head, unsigned source = 0);
+    void GetFloppyImage(int drive, bool head);
     void Type();
     void Key();
     void Message();
@@ -318,6 +320,8 @@ private:
     char* m_pLog = nullptr;   // CLogRing::SIZE (/log)
     u8* m_pScreen = nullptr;  // 画面の写し (/screen.ppm。初めて頼まれたときに確保する)
     unsigned m_ScreenCapacity = 0;
+    u8* m_pFloppy = nullptr;  // フロッピーディスクのイメージの写し (/fd0.xdf。初めて頼まれたときに確保する)
+    unsigned m_FloppyCapacity = 0;
     char* m_pType = nullptr;  // MAX_TYPE + 1 (/type)
     unsigned m_nLeft = 0;     // m_pBuf の先頭に残っている本体のバイト数 (頭と一緒に届いた分)
     int m_Status = 0;
@@ -443,7 +447,11 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
     const bool write = m == M::PUT || m == M::POST || m == M::DELETE;
     const char* p = m_Req.path;
     const bool files = strncmp(p, "/files", 6) == 0 && (p[6] == 0 || p[6] == '/');
-    const platform::NetOp op = write ? platform::NetOp::WRITE : files ? platform::NetOp::READ_FILES : platform::NetOp::READ;
+    // /fd0.xdf、/fd1.xdf (USB-FDD から読んだディスクのイメージ) は、ファイルを読むのと同じ扱いにする (トークンが要る)
+    const int fdImage = platform::floppyImagePathDrive(p);
+    const platform::NetOp op = write                  ? platform::NetOp::WRITE
+                               : files || fdImage >= 0 ? platform::NetOp::READ_FILES
+                                                       : platform::NetOp::READ;
     // Host: が自分のアドレスか net_name= でなければ、読むだけの要求も断る (DNS リバインディング対策。
     // platform::checkHost())。アドレスは DHCP で変わることがあるので、要求ごとに読む
     {
@@ -485,6 +493,8 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
         } else {
             SendText(405, "use GET, PUT, POST or DELETE\n");
         }
+    } else if (fdImage >= 0 && (m == M::GET || m == M::HEAD)) {
+        GetFloppyImage(fdImage, m == M::HEAD);
     } else if (strcmp(p, "/log") == 0 && (m == M::GET || m == M::HEAD)) {
         GetLog(m == M::HEAD);
     } else if (strcmp(p, "/thermal") == 0 && (m == M::GET || m == M::HEAD)) {
@@ -538,6 +548,7 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
                       "GET  /log             log since boot (last 64KB)\n"
                       "GET  /thermal         temperature, ARM clock, throttling and the fan (Pi 5)\n"
                       "GET  /screen.ppm      the X68000 screen\n"
+                      "GET  /fd0.xdf         the disk read from a USB floppy drive, as an XDF image (/fd1.xdf)\n"
                       "GET  /ts6bga.ppm      the TS-6BGA framebuffer (unscaled)\n"
                       "GET  /screen2.ppm     selected HDMI 2 source (unfiltered, unscaled)\n"
                       "POST /reboot          write back disks and SRAM, then reboot\n"
@@ -783,6 +794,17 @@ void CHttpTask::PutFile(const char* path) {
     m_Env.netBeginHeavy();
     const bool dir = CUploadFs().isDirectory(full);
     FRESULT r = dir ? FR_OK : f_open(&m_File, part, FA_WRITE | FA_CREATE_ALWAYS);
+    // 置き先が /pix68k の直下で、/pix68k がまだなければ、作ってやり直す。LAN から起動する機械の SD カードには
+    // bootcode.bin しかないことがあり (Pi 2、#302)、/pix68k がないと、SD カードを抜かずには ROM も pix68k.cfg も
+    // 置けなかった。ほかのディレクトリは作らない (URL の打ち間違いでディレクトリができないように。下の 404 になる)
+    if (r == FR_NO_PATH && strncmp(path, "/pix68k/", 8) == 0 && strchr(path + 8, '/') == nullptr) {
+        CString made;
+        made.Format("%s/pix68k", drive);
+        if (f_mkdir(made) == FR_OK) {
+            m_Logger.Write(FromHttp, LogNotice, "created the directory /pix68k");
+            r = f_open(&m_File, part, FA_WRITE | FA_CREATE_ALWAYS);
+        }
+    }
     m_Env.netEndHeavy();
     if (dir) {
         SendText(400, "this is a directory; add the file name to the URL\n");
@@ -945,6 +967,49 @@ void CHttpTask::GetScreen(bool head, unsigned source) {
         SendAll(ppm, (unsigned)hn);
         for (unsigned off = 0; off < bytes; off += BUF_SIZE) {
             if (!SendAll(m_pScreen + off, bytes - off > BUF_SIZE ? BUF_SIZE : bytes - off)) break;
+            CScheduler::Get()->Yield();
+        }
+    }
+}
+
+// GET /fd<N>.xdf: USB-FDD から読んだディスクを XDF のイメージとして返す (#287)。ファイルから入れたディスクは返さない
+// (そちらは /files で読める)。写しを取ってから送る (送る間にメニューで取り出されても、解放されたバッファを読まない)。
+// 写しのバッファ (約 1.2MB) は一度確保したら使い回す (Circle は 512KB を超えるブロックを解放しても使い回さない)
+void CHttpTask::GetFloppyImage(int drive, bool head) {
+    // 入っているかと大きさだけを先に聞く (写さない)。どう答えるかは platform::floppyImageReply():
+    // なければ 404、HEAD は長さだけ、写しのバッファはヒープの空きを確かめてから確保する (足りなければ 503)。
+    // 404、HEAD、503 では何も確保しない (Circle の new は足りないと全体を止める)
+    const unsigned bytes = m_Env.netFloppyImage(drive, nullptr, 0);
+    typedef platform::FloppyImageReply Reply;
+    const Reply reply = platform::floppyImageReply(bytes, head, m_pFloppy != nullptr && m_FloppyCapacity >= bytes,
+                                                   bytes != 0 && !head && m_pFloppy == nullptr && m_Env.netCanAllocate(bytes));
+    switch (reply) {
+    case Reply::NOT_FOUND:
+        SendText(404, "no disk read from a USB floppy drive in this drive (fd0= / fd1= usb-fdd: in pix68k.cfg)\n");
+        return;
+    case Reply::HEAD_ONLY:
+        m_nBytes = bytes;
+        SendHead(200, "application/octet-stream", bytes);
+        return;
+    case Reply::NO_MEMORY:
+        SendText(503, "not enough memory for a copy of the image; try again later\n");
+        return;
+    case Reply::ALLOCATE:
+        m_pFloppy = new u8[bytes];
+        m_FloppyCapacity = m_pFloppy ? bytes : 0;
+        break;
+    case Reply::SEND: break;
+    }
+    // 写しを取る。聞いたあとで取り出されていれば 0 が返る (このタスクが止まらない間は変わらないが、確かめる)
+    if (m_pFloppy == nullptr || m_Env.netFloppyImage(drive, m_pFloppy, m_FloppyCapacity) != bytes) {
+        SendText(503, "the disk is not available; try again\n");
+        return;
+    }
+    // ここからは写し (m_pFloppy) だけを送る。送っている間にメニューで取り出されても、解放されたバッファは読まない
+    m_nBytes = bytes;
+    if (SendHead(200, "application/octet-stream", bytes)) {
+        for (unsigned off = 0; off < bytes; off += BUF_SIZE) {
+            if (!SendAll(m_pFloppy + off, bytes - off > BUF_SIZE ? BUF_SIZE : bytes - off)) break;
             CScheduler::Get()->Yield();
         }
     }
@@ -1249,6 +1314,6 @@ void CHostNet::Service(unsigned waitUs) {
         // 確かめてはいない)。前に受け取れなかったのは #117 と同じことが起きていたためかもしれないが、確かめてはいない。
         // 実機でどう待つかは決めていないので、今は空回りのまま
         const u64 left = (end - now) / (CLOCKHZ / 1000000);
-        CTimer::SimpleusDelay(left < 100 ? (unsigned)left + 1 : 100);
+        m_Env.netSpinUs(left < 100 ? (unsigned)left + 1 : 100);
     }
 }

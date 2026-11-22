@@ -409,6 +409,10 @@ void testMixSaturates() {
     CHECK_EQ(lv.base, 0u);
     CHECK_EQ(lv.midi, 20000u);
     CHECK_EQ(lv.clipped, 0u);
+    CHECK_EQ(lv.midiFull, 0u);
+    CHECK_EQ(lv.mix, 0u);
+    CHECK_EQ(lv.mixClipped, 0u);
+    CHECK_EQ(lv.dropped, 0u);
     // 16 ビットを少し超える量と、int16_t に切り詰めると符号が変わる量 (40000 は -25536、70000 は 4464 になる)
     for (int32_t level : {32768, 40000, 70000}) {
         out.level = level;
@@ -423,10 +427,133 @@ void testMixSaturates() {
         CHECK_EQ(lv.midi, (uint32_t)level);
         // 左は 32768 から、右は -32769 から止める (-32768 は範囲の中)
         CHECK_EQ(lv.clipped, (uint32_t)n);
+        // 音源が足した量が 16 ビットの上限に届いたフレーム (音源の中で止めたときの見え方) も数える
+        CHECK_EQ(lv.midiFull, (uint32_t)n);
     }
+    // 32767 ちょうどは、足しても超えないが、音源の出力は上限に届いている
+    out.level = 32767;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    n = sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.clipped, 0u);
+    CHECK_EQ(lv.midiFull, (uint32_t)n);
     lv = sound.takeLevels();
     CHECK_EQ(lv.midi, 0u);
     CHECK_EQ(lv.clipped, 0u);
+    CHECK_EQ(lv.midiFull, 0u);
+}
+
+// MIDI の音源を足す前 (OPM、ADPCM、まーきゅりーゆにっとを足してフィルタを通したあと) に 16 ビットに止めた分と、
+// 音源ごとの最大、リングバッファが満杯で捨てたフレームも記録する
+void testLevelsBeforeMidi() {
+    printf("midi: clipping before the MIDI mix, per-source peaks and dropped frames are recorded\n");
+    static int16_t buf[2 * 4096];
+    x68k::Sound sound;
+    sound.setOutputRate(48000);
+    const auto opm = [&](uint8_t reg, uint8_t v) {
+        sound.opmWrite(1, reg);
+        sound.opmWrite(3, v);
+    };
+    // OPM の 8 チャネルを、4 つのオペレータを並べる形 (CON 7) で、同じ高さ、最大の音量で鳴らす
+    const auto keyOn = [&](int channels) {
+        for (int c = 0; c < channels; c++) {
+            opm((uint8_t)(0x20 + c), 0xc7);
+            opm((uint8_t)(0x28 + c), 0x4a);
+            for (int op = 0; op < 4; op++) {
+                const uint8_t o = (uint8_t)(op * 8 + c);
+                opm((uint8_t)(0x40 + o), 1);
+                opm((uint8_t)(0x60 + o), 0);
+                opm((uint8_t)(0x80 + o), 31);
+                opm((uint8_t)(0xe0 + o), 0x0f);
+            }
+            opm(0x08, (uint8_t)(0x78 | c));
+        }
+    };
+    // 1 チャネル: OPM の最大は 4 オペレータ分の半分 (約 16382) で、止めない
+    keyOn(1);
+    for (int i = 0; i < 100; i++) {
+        sound.advance(4000);
+        sound.ring().drain(buf, 4096);
+    }
+    x68k::Sound::Levels lv = sound.takeLevels();
+    CHECK_EQ(lv.opm > 16000 && lv.opm <= 16382, true);
+    CHECK_EQ(lv.mix > 12000 && lv.mix <= 32767, true);
+    CHECK_EQ(lv.adpcm, 0u);
+    CHECK_EQ(lv.mercury, 0u);
+    CHECK_EQ(lv.mixClipped, 0u);
+    CHECK_EQ(lv.clipped, 0u);
+    CHECK_EQ(lv.dropped, 0u);
+    // 8 チャネル: 足すと 16 ビットを超えるので止める。出力は範囲の中で、止めたサンプルを数える
+    keyOn(8);
+    int over = 0;
+    for (int i = 0; i < 100; i++) {
+        sound.advance(4000);
+        const int n = sound.ring().drain(buf, 4096);
+        for (int k = 0; k < 2 * n; k++)
+            if (buf[k] == 32767 || buf[k] == -32768) over++;
+    }
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.opm > 100000, true);
+    CHECK_EQ(lv.mix > 32767, true);
+    CHECK_EQ(lv.mixClipped > 0, true);
+    CHECK_EQ(over > 0, true);
+    // 止めるのは全部を足したあとの 1 か所。OPM だけで超えたフレームは mixClipped にも clipped にも入る
+    CHECK_EQ(lv.base > 32767, true);
+    CHECK_EQ(lv.clipped, lv.mixClipped);
+    CHECK_EQ(lv.dropped, 0u);
+    // まーきゅりーゆにっとの PCM: 16 ビットの最大を書くと、足す量は半分
+    {
+        x68k::Sound pcm;
+        pcm.setOutputRate(48000);
+        x68k::Mercury m;
+        pcm.mercuryAttached(true);
+        pcm.mercuryWrite(m, 0x91, 0xbe); // 48kHz、ステレオ、L と R を出す
+        for (int i = 0; i < 4000; i++) {
+            while (m.drq()) {
+                pcm.mercuryWrite(m, 0x80, 0x7f);
+                pcm.mercuryWrite(m, 0x81, 0xff);
+            }
+            pcm.advance(64, &m);
+            // 0 から最大への段差のところは、62.5kHz に直すフィルタで最大を 1 割ほど超える。落ち着いてから測る
+            if (i == 2000) CHECK_EQ(pcm.takeLevels().mercury > 16383u, true);
+        }
+        lv = pcm.takeLevels();
+        CHECK_EQ(lv.mercury, 16383u);
+        CHECK_EQ(lv.opm, 0u);
+        CHECK_EQ(lv.opn, 0u);
+        // YMF288: 1 チャネルを、4 つのオペレータを並べる形 (アルゴリズム 7)、最大の音量で鳴らす。足す量は半分 (約 16336)
+        const auto opn = [&](uint8_t reg, uint8_t v) { m.opnWriteReg(0, 0, reg, v); };
+        for (int op = 0; op < 4; op++) {
+            const uint8_t o = (uint8_t)(op * 4);
+            opn((uint8_t)(0x30 + o), 1);
+            opn((uint8_t)(0x40 + o), 0);
+            opn((uint8_t)(0x50 + o), 31);
+            opn((uint8_t)(0x80 + o), 0x0f);
+        }
+        opn(0xb0, 7);
+        opn(0xb4, 0xc0);
+        opn(0xa4, 0x22);
+        opn(0xa0, 0x69);
+        opn(0x28, 0xf0);
+        for (int i = 0; i < 20000; i++) {
+            while (m.drq()) {
+                pcm.mercuryWrite(m, 0x80, 0);
+                pcm.mercuryWrite(m, 0x81, 0);
+            }
+            pcm.advance(64, &m);
+            if ((i & 255) == 0) pcm.ring().drain(buf, 4096);
+        }
+        lv = pcm.takeLevels();
+        CHECK_EQ(lv.opn > 15000 && lv.opn <= 16400, true);
+    }
+    // 取り出さずに作り続けると、リングバッファが満杯になって捨てる
+    sound.ring().drain(buf, 4096);
+    sound.takeLevels();
+    for (int i = 0; i < 600; i++) sound.advance(4000); // 600ms 分 (リングバッファは 340ms)
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.dropped > 0, true);
+    const int expected = 48000 * 600 / 1000 - (int)x68k::AudioRing::SIZE;
+    CHECK_EQ((int)lv.dropped >= expected - 2 && (int)lv.dropped <= expected + 2, true);
 }
 
 // 止めたフレームの数は、音を作るのと取るのが別のスレッドで重なっても、消えも重なりもしない: 取った数の合計が、
@@ -1629,6 +1756,7 @@ int main() {
     testTxInterrupt();
     testJournal();
     testMixSaturates();
+    testLevelsBeforeMidi();
     testLevelsFromAnotherThread();
     testState();
     testStream();

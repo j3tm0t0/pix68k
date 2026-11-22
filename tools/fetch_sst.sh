@@ -6,7 +6,7 @@ set -eu
 SHA=e0d5ece9670205cc84a0101081837deb446f86a3
 OUT=${1:-$HOME/.cache/pix68k/sst}
 HERE=$(cd "$(dirname "$0")" && pwd)
-# 2 つの runner が同じ HOME で同時に動いても壊れないよう、ファイルは $OUT/tmp の自分だけの名前に書いてから、mv で置く
+# 同じ機械のいくつかの runner が同じ HOME で同時に動いても壊れないよう、ファイルは $OUT/tmp の自分だけの名前に書いてから、mv で置く
 # (書きかけのファイルを、ほかの実行が読まない。途中で止められても、書きかけが残らない)
 mkdir -p "$OUT/json" "$OUT/bin" "$OUT/tmp"
 TMP=$OUT/tmp/$$

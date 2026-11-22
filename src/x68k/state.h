@@ -40,7 +40,7 @@ class Machine;
 class Sound;
 class Video;
 
-static constexpr uint32_t STATE_VERSION = 18; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
+static constexpr uint32_t STATE_VERSION = 21; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
                                              // 4: SPC の、TEMP に入れるバイトの読み込みを待っているか (Spc::tempPending_)
                                              // 5: 68000 の速さを変えて動かしたときの時間の端数 (Machine::speedFrac_)
                                              // 6: 68000 のバスのウェイトと DRAM リフレッシュの端数 (Machine の TIME の最後)
@@ -62,6 +62,12 @@ static constexpr uint32_t STATE_VERSION = 18; // 3: 拡張ボード (+60 と、�
                                              //     1/12800 サイクル (Cpu020::SUB) になった。14 までは読むときに 16 倍する
                                              // 16: 2 枚目の数値演算プロセッサボード ($E9E080)。+60 の bit4 と、中身の "FPU2"
                                              //     (1 枚目の "FPUB" の次。2 枚目があるときだけ)。0 枚か 1 枚なら並びは 15 と同じ
+// 21: まーきゅりーゆにっとの PCM を 62.5kHz に直すフィルタの履歴 ("MERC" の最後。Mercury::state())。20 までを読んだら、
+//     履歴は今の出力の値で埋める
+// 20: 音を出力の周波数に直すフィルタの履歴 ("SND " の最後。Sound::state())。19 までを読んだら、履歴は
+//     前のサンプル (線形補間のときに持っていた値) で埋める
+// 19: まーきゅりーゆにっとの YMF288 (2 個) と、その割り込みの状態 ("MERC" の PCM の 40 バイトの後ろ。Mercury::state())。
+//     18 までを読んだら、YMF288 はリセットしたときの状態にする
 // 18: TS-6BGA の BitBLT host 転送の途中の入力位置とDWORD FIFO。
 // 17: TS-6BGA の VRAM とレジスタ、+60 の bit5 (接続) と bit6 ($EF0000)。
 static constexpr uint32_t STATE_REWRITTEN_SCSI = 12;
@@ -69,6 +75,9 @@ static constexpr uint32_t STATE_REWRITTEN_ADPCM = 13;
 static constexpr uint32_t STATE_SCC_RS232C = 14;
 static constexpr uint32_t STATE_CPU020_SUB = 15;
 static constexpr uint32_t STATE_FPU_BOARD2 = 16;
+static constexpr uint32_t STATE_MERCURY_OPN = 19;
+static constexpr uint32_t STATE_SOUND_FIR = 20;
+static constexpr uint32_t STATE_MERCURY_PCM_FIR = 21;
 static constexpr uint64_t STATE_CPU020_SUB_OLD = 800; // 版 14 までの Cpu020::sub_ の単位 (1/800 サイクル)
 static constexpr size_t STATE_HEADER_SIZE = 64;
 // 読むステートの CPU の時刻 (電源を入れてからのサイクル数) を、そのまま使う上限。これを超える時刻のステートは
@@ -189,7 +198,12 @@ public:
     }
     // 添字や個数など、lo 以上 hi 以下でなければならない値。外れていれば読まない (CHECK で確かめる)。
     // 読んだ値を返す (CHECK ではメンバは変わらないので、続く値の範囲を決めるのに使う)
-    template <class T> T range(T& v, T lo, T hi) {
+    // lo と hi の型は v から決める (引数からは推論させない)。uint32_t が unsigned long の処理系 (arm-none-eabi) では、
+    // uint32_t の v に 0u や 3u を渡すと型が合わず、推論できない
+    template <class T> struct SameAs {
+        typedef T type;
+    };
+    template <class T> T range(T& v, typename SameAs<T>::type lo, typename SameAs<T>::type hi) {
         T t = v;
         local(&t, sizeof t);
         if (saving()) return t;
@@ -197,13 +211,17 @@ public:
         else if (applying()) v = t;
         return t;
     }
-    // 列挙の値 (0 以上 count 未満)。外れていれば読まない
+    // 列挙の値 (0 以上 count 未満)。外れていれば読まない。
+    // ファイルには、いつも 32 ビットで書く。列挙の型の大きさは処理系で変わる: arm-none-eabi (Pi 2 の 32 ビット版) は
+    // -fshort-enums が既定で、値が 0〜4 の列挙は 1 バイトになる。型の大きさのまま書くと、Pi 2 のステートだけ形式が
+    // ずれて、64 ビット版と読み合えない (#302)。ホスト版と 64 ビット版では、型を決めていない列挙は 4 バイトなので、
+    // 今までのステートと同じ形式になる
     template <class E> void en(E& v, int count) {
-        __underlying_type(E) t = (__underlying_type(E))v;
+        static_assert(sizeof(E) <= sizeof(uint32_t), "en() writes 32 bits");
+        uint32_t t = (uint32_t)v;
         local(&t, sizeof t);
         if (saving()) return;
-        const long long n = (long long)t;
-        if (n < 0 || n >= count) fail();
+        if (count < 0 || t >= (uint32_t)count) fail();
         else if (applying()) v = (E)t;
     }
     // ポインタも仮想関数も持たないクラスを丸ごと

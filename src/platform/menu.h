@@ -365,6 +365,23 @@ public:
     }
     // メニューで画面の隅の数字 (osd=) を変えた (すぐに反映する。呼ぶ時機は videoChanged() と同じ)
     virtual void osdChanged(int osd) { (void)osd; }
+    // 画面の右下の使用率のバー (osd_bars=。platform/osd_bars.h) をメニューで切り替えられるか (ベアメタル版だけ)
+    virtual bool hasOsdBars() const { return false; }
+    // メニューで osd_bars= を変えた (すぐに反映する。呼ぶ時機は videoChanged() と同じ)
+    virtual void osdBarsChanged(int on) { (void)on; }
+    // ドライブに入っているのが、実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクか (platform/real_floppy.h)。
+    // そうなら、メニューに「Save FD<N> image」を出す
+    virtual bool hasRealFloppy(int drive) const {
+        (void)drive;
+        return false;
+    }
+    // 実物のドライブから読んだディスクを、イメージのファイルに書き出す (同じ名前があれば上書きしない)。
+    // 結果は msg (英語の短い文)。書き出したか、同じものがもうあれば true
+    virtual bool saveFloppyImage(int drive, MenuText& msg) {
+        (void)drive;
+        (void)msg;
+        return false;
+    }
     // MIDI の行き先 (Settings::midiOut の値) をこの環境で選べるか (Pi 3 の sc55、ホスト版の uart は選べない)
     virtual bool hasMidiOut(int out) const {
         (void)out;
@@ -391,10 +408,11 @@ public:
         pending_ = saved;
         // フロッピーディスクはいま入っているものを出す (メニューの外で替わることはない)
         for (int d = 0; d < 2; d++) copyString(pending_.fd[d], Settings::PATH_SIZE, host_.diskName(d));
-        // 画面の拡大もすぐに反映する項目なので、いまの値を出す
+        // 画面の拡大もすぐに反映する項目なので、いまの値を出す (画面の隅の数字と右下のバーも同じ)
         pending_.videoScale = running.videoScale;
         pending_.videoFilter = running.videoFilter;
         pending_.osd = running.osd;
+        pending_.osdBars = running.osdBars;
         open_ = true;
         page_ = MAIN;
         cursor_ = 0;
@@ -548,8 +566,8 @@ public:
 private:
     enum Page { MAIN, FILES, BOARDS, DISPLAY };
     enum Item {
-        I_FD0, I_FD1, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
-        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_OSD,
+        I_FD0, I_FD1, I_FD0_DUMP, I_FD1_DUMP, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
+        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_OSD, I_OSD_BARS,
         I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_RESTART, I_CLOSE,
         // ここから拡張ボードのページの項目
         I_FPU_BOARD, I_MERCURY, I_NEPTUNE, I_MIDI, I_MIDI_OUT, I_BACK,
@@ -572,6 +590,9 @@ private:
     // 設定の値から決まる分 (どのページを開いているかは見ない)
     bool usable(Item it) const {
         switch (it) {
+        // 実物のドライブ (USB-FDD) から読んだディスクが入っているときだけ出す
+        case I_FD0_DUMP:
+        case I_FD1_DUMP: return host_.hasRealFloppy(it - I_FD0_DUMP);
         case I_CLOCK: return pending_.cpu == 68000 || pending_.cpu == 68060;
         case I_SCSI_EX: return pending_.cpu == 68000;
         case I_HIGH_MEM: return pending_.cpu == 68030;
@@ -583,6 +604,7 @@ private:
         case I_CURVE:
         case I_MASK: return host_.hasVideo();
         case I_BEZEL: return host_.hasVideo() && host_.hasBezel();
+        case I_OSD_BARS: return host_.hasOsdBars();
         default: return true;
         }
     }
@@ -606,8 +628,8 @@ private:
     }
     const char* label(Item it) const {
         static const char* const kLabels[I_COUNT] = {
-            "FD0", "FD1", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
-            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "OSD",
+            "FD0", "FD1", "Save FD0 image", "Save FD1 image", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
+            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "OSD", "OSD bars",
             "State slot", "Save state", "Load state", "Reset", "Save settings", "Restart", "Close",
             "FPU board", "Mercury Unit", "Neptune-X", "MIDI board", "MIDI out", "Back",
             "Scale", "Scanlines", "Curve", "Mask", "Bezel", "Back",
@@ -644,6 +666,7 @@ private:
         case I_MASK:
         case I_BEZEL: return "video_filter";
         case I_OSD: return "osd";
+        case I_OSD_BARS: return "osd_bars";
         default: return nullptr;
         }
     }
@@ -775,6 +798,9 @@ private:
             // on: 余白に出す。ベアメタル版は余白が足りなければ X68000 の画面に重ねる (IP アドレスをいつも出すため)。
             // ホスト版は重ねない。fps: どちらも重ねる (platform/osd.h の chooseOsd())
             t.add(pending_.osd == 0 ? "off" : pending_.osd == 1 ? "fps" : "on");
+            break;
+        case I_OSD_BARS:
+            t.add(pending_.osdBars ? "on" : "off");
             break;
         case I_SLOT:
             t.add((long)slot_);
@@ -966,6 +992,10 @@ private:
                                    : (pending_.osd == 0 ? 2 : pending_.osd == 2 ? 1 : 0);
             host_.osdChanged(pending_.osd);
             break;
+        case I_OSD_BARS:
+            pending_.osdBars = !pending_.osdBars;
+            host_.osdBarsChanged(pending_.osdBars);
+            break;
         case I_SLOT:
             slot_ = (slot_ + dir + 10) % 10;
             break;
@@ -1013,7 +1043,8 @@ private:
         // ページを移るだけなら状態の行は残す (拡張ボードのページで出した案内を、戻ったあとも読めるように)
         if (it != I_BOARDS && it != I_BACK && it != I_DISPLAY && it != I_DISPLAY_BACK) status_.clear();
         // ファイルの一覧を開くのは操作に数えない (FD の取り出しは一覧の中で選ぶ)。値を変える項目は change() が呼ぶ
-        if (it == I_SAVE_STATE || it == I_LOAD_STATE || it == I_RESET || it == I_SAVE_SETTINGS || it == I_CLOSE)
+        if (it == I_SAVE_STATE || it == I_LOAD_STATE || it == I_RESET || it == I_SAVE_SETTINGS || it == I_CLOSE ||
+            it == I_FD0_DUMP || it == I_FD1_DUMP)
             host_.beginAction(MENU_ACTION_OTHER);
         else if (it == I_RESTART)
             host_.beginAction(MENU_ACTION_RESTART);
@@ -1021,6 +1052,10 @@ private:
         case I_FD0:
         case I_FD1:
             openFiles(MenuFileKind::FLOPPY, it - I_FD0);
+            break;
+        case I_FD0_DUMP:
+        case I_FD1_DUMP:
+            if (host_.saveFloppyImage(it - I_FD0_DUMP, status_) && status_.str()[0] == 0) status_.add("image saved");
             break;
         case I_HD0:
             openFiles(MenuFileKind::HARD_DISK, 0);

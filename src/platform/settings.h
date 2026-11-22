@@ -45,6 +45,7 @@ struct Settings {
     int cdId = 6;               // cd_id= (CD-ROM をつなぐ SCSI ID)
     int fpuBoard = 0;           // fpu_board= (数値演算プロセッサボードの枚数 0..2。on は 1 枚、2 は 2 枚。cpu= に関係なくつなぐ)
     int mercury = 0;            // mercury= (まーきゅりーゆにっと)
+    char mercuryRhythm[PATH_SIZE] = {}; // mercury_rhythm= (まーきゅりーゆにっとの YMF288 のリズムの WAV を置いたディレクトリ)
     int neptune = 0;            // neptune= (ネットワークボード Neptune-X)
     char neptuneMac[PATH_SIZE] = {};  // neptune_mac= (ボードの MAC アドレス。空なら x68k::Neptune::DEFAULT_MAC)
     char neptuneLink[PATH_SIZE] = {}; // neptune_link= (フレームの送受信の先。空なら環境の既定。parseNeptuneLink())
@@ -88,6 +89,9 @@ struct Settings {
     // osd= (画面の隅にフレームの数、速さ、温度などを出す。platform/osd.h)。0 off、2 on: X68000 の画面の外の余白に
     // 入るときだけ出す (既定)、1 fps: 余白に入らなければ X68000 の画面に重ねる
     int osd = 2;
+    // osd_bars= (ベアメタル版だけ。osd= が off でないとき、画面の右下に各コアとメモリの使用率のバーも出すか。
+    // platform/osd_bars.h)。0 off (既定。右上の数字だけ出す)、1 on
+    int osdBars = 0;
     // 起動の組み合わせ (platform/boot_profile.h)
     char autotype[PATH_SIZE] = {}; // autotype= (X68000 を動かし始めて autotype_wait= 秒たったら打つ文字列。/type と同じエスケープ)
     int autotypeWait = 10;      // autotype_wait= (秒)
@@ -190,6 +194,7 @@ static const SettingKey kSettingKeys[] = {
     {"cd_id",        SettingKey::INT,    PIX68K_OFF(cdId),            0, 6,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"fpu_board",    SettingKey::CHOICE, PIX68K_OFF(fpuBoard),        0, 0,   nullptr, settings_detail::kFpuBoardChoices, settings_detail::kFpuBoardValues,       true,  true},
     {"mercury",      SettingKey::ONOFF,  PIX68K_OFF(mercury),         0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
+    {"mercury_rhythm", SettingKey::PATH, PIX68K_OFF(mercuryRhythm),   0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"neptune",      SettingKey::ONOFF,  PIX68K_OFF(neptune),         0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"neptune_mac",  SettingKey::PATH,   PIX68K_OFF(neptuneMac),      0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"neptune_link", SettingKey::PATH,   PIX68K_OFF(neptuneLink),     0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
@@ -216,6 +221,7 @@ static const SettingKey kSettingKeys[] = {
     {"video_filter", SettingKey::FLAGS,  PIX68K_OFF(videoFilter),     0, 0,   nullptr, kVideoFilterNames, kVideoFilterBits, false, true, kVideoFilterExclusive},
     {"video_scale",  SettingKey::CHOICE, PIX68K_OFF(videoScale),      0, 0,   nullptr, settings_detail::kVideoScaleChoices, settings_detail::kVideoScaleValues,   false, true},
     {"osd",          SettingKey::CHOICE, PIX68K_OFF(osd),             0, 0,   nullptr, settings_detail::kOsdChoices,   settings_detail::kOsdValues,               false, true},
+    {"osd_bars",     SettingKey::ONOFF,  PIX68K_OFF(osdBars),         0, 1,   nullptr, nullptr, nullptr,                                                          false, false},
     {"autotype",     SettingKey::PATH,   PIX68K_OFF(autotype),        0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"autotype_wait", SettingKey::INT,   PIX68K_OFF(autotypeWait),    0, 600, nullptr, nullptr, nullptr,                                                          true,  true},
     {"profile_wait", SettingKey::INT,    PIX68K_OFF(profileWait),     0, 60,  nullptr, nullptr, nullptr,                                                          true,  false},

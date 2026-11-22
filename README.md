@@ -13,6 +13,7 @@ The documentation is in Japanese. License: GPLv3.
 シャープの X68000 を Raspberry Pi の上で、OS を使わずに (ベアメタルで) 動かすエミュレータ。低レベル部分 (起動、USB、HDMI、SD カード、割り込み、ネットワーク) は [Circle](https://github.com/rsta2/circle) を使う。
 
 - 動く Raspberry Pi:
+  - Raspberry Pi 2 Model B (BCM2836 の版を実機で確かめている。32 ビットのカーネルで、X68000 の 68000 の機種だけ。X68030、060turbo、数値演算プロセッサボードは使えない。[baremetal.md](docs/baremetal.md) の「Raspberry Pi 2」)
   - Raspberry Pi 3 Model B+ (実機で確かめている)。Raspberry Pi 3 Model B も同じカーネルで動かすが、実機では確かめていない
   - Raspberry Pi 4 Model B (実機で確かめている)
   - Raspberry Pi 400 (Raspberry Pi 4 Model B と同じカーネルで動かすが、実機では確かめていない)
@@ -75,6 +76,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
   (Linux を入れた USB メモリなら `/boot/firmware/pix68k/`)。カーネルを LAN から起動して、SD カードを挿さずに使うこともできる
 - Raspberry Pi 5 では、ファンのコネクタのファンを温度に合わせて回す
 - 画面の右上に、fps、速さ、温度、IP アドレスなどを出す (`osd=`)
+- 画面の右下に、各コアとメモリの使用率をバーで出す (ベアメタル版。`osd_bars=on`)
 
 詳しくは [baremetal.md](docs/baremetal.md) を参照。
 
@@ -89,7 +91,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 
 | キー | 値 | 既定 | 内容 | ホスト版 |
 | --- | --- | --- | --- | --- |
-| `fd0`、`fd1` | ファイル名 | ベアメタル版は `fd0.xdf` などを探す。ホスト版はなし | フロッピーディスクのイメージ。空で書くとドライブを空にする | ○ |
+| `fd0`、`fd1` | ファイル名 | ベアメタル版は `fd0.xdf` などを探す。ホスト版はなし | フロッピーディスクのイメージ。空で書くとドライブを空にする。USB-FDD の実物のディスクを読むには、ベアメタル版は `usb-fdd:` (2 台あれば `usb-fdd:0` と `usb-fdd:1`) と書く。ホスト版は `usb-fdd:` を使わず、Linux に限り `-0 /dev/sda` のようにデバイスを渡す ([docs/disks-and-scsi.md](docs/disks-and-scsi.md)) | ○ |
 | `hd0` | ファイル名 | ベアメタル版は `hd0.hdf`。ホスト版はなし | SASI ID 0 のハードディスク (ベアメタル版は 48MB まで) ([disks-and-scsi.md](docs/disks-and-scsi.md)) | ○ |
 | `cpu` | `68000`、`68030`、`68060` | `68000` | 機種。68030 は X68030、68060 は 060turbo | ○ |
 | `clock` | `10`、`16` / `50`、`75` | `16` / `50` | CPU のクロック (MHz)。68000 は 10 か 16、68060 は 50 か 75。68030 は 25 で固定 | ○ |
@@ -109,7 +111,8 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `write_back` | `on`、`off` | `on` | X68000 が書いた内容をイメージのファイルに書き戻す | - |
 | `write_protect` | `fd0 fd1 hd0 sc0`〜`sc6` | なし | 書き込み禁止にするディスクを「,」か空白で区切って並べる | - |
 | `fpu_board` | `off`、`on`、`2` | `off` | 数値演算プロセッサボード。`2` で 2 枚 ([expansion.md](docs/expansion.md)) | ○ |
-| `mercury` | `on`、`off` | `off` | まーきゅりーゆにっと | ○ |
+| `mercury` | `on`、`off` | `off` | まーきゅりーゆにっと (16 ビットの PCM と、FM 音源の YMF288 2 個。[expansion.md](docs/expansion.md)) | ○ |
+| `mercury_rhythm` | ディレクトリ名 | なし (`/pix68k`、ホスト版は ROM のディレクトリ) | まーきゅりーゆにっとの YMF288 のリズム音源の WAV ファイル (`2608_BD.WAV` など 6 つ) を置いたディレクトリ。なければリズムは鳴らない | ○ |
 | `neptune` | `on`、`off` | `off` | ネットワークボード Neptune-X | ○ |
 | `neptune_mac` | MAC アドレス、`pi` (ベアメタル版だけ) | `02:68:6b:00:00:01` | Neptune-X の MAC アドレス。`pi` は Raspberry Pi の MAC アドレスを使う。ホスト版で `pi` を書くと、`neptune=on` のときは正しくない MAC アドレスとして終了する | ○ |
 | `neptune_link` | `eth`、`echo` など | ベアメタル版は `eth`、ホスト版は `echo` | Neptune-X のフレームの送受信先 | ○ |
@@ -270,7 +273,7 @@ SD カードのルートの `cmdline.txt` に書く。主なもの:
   USB キーボードは 4 台までいっしょに使える
 - Raspberry Pi 400: 本体のキーボードは、ラズベリーのキーを押している間ほかのキーを X68000 にしかないキーに置き換える (ラズベリー + 1〜5 が XF1〜XF5 など)
 - マウスとゲームパッド: USB マウスは X68000 のマウス、USB ゲームパッドはジョイスティック 1、2 になる。
-  ゲームパッドの Start と Select を同時に押すと、X68000 をリセットする (設定メニューの Reset と同じ。ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド (今は HORIPAD S だけ) で使える)
+  ゲームパッドの Start と Select を同時に押すと、X68000 をリセットする (設定メニューの Reset と同じ。ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド (今は HORIPAD S と PCEngine PAD) で使える)
   ホスト版では、ウィンドウの中を左クリックするとマウスを取り込み、中ボタンのクリックか Ctrl + Alt で戻す ([build-and-test.md](docs/build-and-test.md))
 
 ## ネットワークの口
@@ -297,16 +300,18 @@ curl -H 'X-Pix68k-Token: 好きな文字列' -X POST http://pix68k/reboot
 
 ```sh
 git submodule update --init
-brew install aarch64-elf-gcc qemu mtools
+brew install aarch64-elf-gcc arm-none-eabi-gcc qemu mtools
+tools/build_baremetal.sh 2          # Raspberry Pi 2     → build/baremetal-raspi2/app/kernel7.img (32 ビット。arm-none-eabi-gcc を使う)
 tools/build_baremetal.sh 3          # Raspberry Pi 3     → build/baremetal-raspi3/app/kernel8.img
 tools/build_baremetal.sh 4          # Raspberry Pi 4 / 400 → build/baremetal-raspi4/app/kernel8-rpi4.img
 tools/build_baremetal.sh 5          # Raspberry Pi 5     → build/baremetal-raspi5/app/kernel_2712.img
 tools/build_baremetal.sh 3 --qemu   # QEMU 用の Raspberry Pi 3 版。tools/qemu_smoke.sh で起動を確かめる
-tools/make_release.sh v1.0          # 3 つをビルドし、配る zip を build/release/pix68k-v1.0.zip に作る (試しなら --allow-dirty)
+tools/make_release.sh v1.0          # 4 つをビルドし、配る zip を build/release/pix68k-v1.0.zip に作る (試しなら --allow-dirty)
 ```
 
 Linux (Ubuntu) では `sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-system-arm mtools rsync zip unzip curl` を入れ、
 `PREFIX64=aarch64-linux-gnu- tools/build_baremetal.sh 3` のように `PREFIX64` を付けてビルドできる。
+Raspberry Pi 2 版は [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) の arm-none-eabi (15.2.Rel1 で確かめている) を入れてビルドする。Ubuntu のパッケージの `gcc-arm-none-eabi` (14.2.1) は使えない (Cortex-A7 で未定義命令になる命令を出す。ビルドの最後の検査で失敗する)。
 QEMU での試験、カーネルの大きさの上限などは [baremetal.md](docs/baremetal.md) にある。
 
 できたカーネルを SD カードのルートに置き換えれば動く。SD カードを一から作るときは、`tools/make_release.sh` の zip を使うか、
@@ -315,7 +320,7 @@ QEMU での試験、カーネルの大きさの上限などは [baremetal.md](do
 1. Raspberry Pi のファームウェア (Circle の `boot/` で `make` を実行するとダウンロードする) をルートに置く
 2. `config.txt` をルートに置く。Circle の `boot/config64.txt` をもとにし、`[pi4]` の節の `armstub=armstub8-rpi4.bin` の行を消し、
    `[pi5]` の節に `framebuffer_depth=32` と `framebuffer_ignore_alpha=1` を書く (ないと Raspberry Pi 5 では何も出ずに止まる)
-3. カーネル (`kernel8.img`、`kernel8-rpi4.img`、`kernel_2712.img`) をルートに置く
+3. カーネル (`kernel8.img`、`kernel8-rpi4.img`、`kernel_2712.img`) をルートに置く。Raspberry Pi 2 は `kernel7.img` で、`config.txt` に `[pi2]` の節が要る ([baremetal.md](docs/baremetal.md) の「Raspberry Pi 2」)
 
 公開リポジトリ (j3tm0t0/pix68k) に `v` で始まるタグを push すると、`.github/workflows/release.yml` が GitHub のホストの runner で
 `tools/make_release.sh` の zip と、`tools/pix68kcli/build.sh` の pix68kcli の 7 つを作り、SHA256SUMS と一緒に Releases に載せる。
@@ -464,6 +469,10 @@ pix68k は、次のソフトウェア、資料、計測の結果を使って作�
 - x68000-dev-guide (JC-000) と、chibiakumas の X68000 の解説: パレットとグラフィックのビットの並び
 - Seafy さんの「CRTC の設定 その他」(1993 年): 色 $0000 のドットを透明にする決まり
 - yunkya2 さんの wifipcm (GIMONS さんの PilederX をもとにした互換ボード) の README と pcm.c の説明: まーきゅりーゆにっとのレジスタ
+- まーきゅりーゆにっと V4 の回路図と ispLSI の論理 (公開されているもの)、MercuryDriver 0.88 (BEL. さん、nenetto さん) のソースと説明:
+  YMF288 の番地、クロック、割り込みのつなぎ方
+- YMF288 のデータシートと YM2608 のアプリケーションマニュアル (ヤマハ)、「OPLx decapsulated」(Matthew Gambrell さん、Olli Niemitalo さん)、
+  Nemesis さんの YM2612 の解析 (SpritesMind のフォーラム): YMF288 のレジスタと FM の計算
 - Makoto Kamada さんと GIMONS さんの投稿 (2015 年。posfie「X68000 の挙動いろいろ」のまとめ): MFP、ADPCM、スプライトを読み書きするときのウェイト
 - Cwik さんの計測値: 68000 の DIVS がオーバーフローしたときのサイクル数 (`tools/classify_sst.py`)
 - Motorola の M68060 User's Manual、MC68030 User's Manual、MC68881/MC68882 User's Manual: 命令の動作とサイクル数

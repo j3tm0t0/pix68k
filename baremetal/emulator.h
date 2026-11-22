@@ -116,6 +116,13 @@ public:
     // 初めて呼ぶと区間の区切りを頼んで false を返す。合成するコアが次のフレームの終わりで区切ったあとに呼ぶと、
     // 前に受け取ってからの区間 (合計の時間、フレームの数、1 フレームの最大) を返して true (platform/core_work.h)
     bool takeCoreWork(int which, platform::CoreWork& out) { return (which == 0 ? renderWork_ : soundWork_).take(out); }
+    // コア 1、2、3 が仕事をした時間の、起動してからの合計 (us。画面の右下の使用率のバー。#239)。core は 1 から 3。
+    // 書くのはそのコアだけで、フレームの区切りで 1 回足す。コア 1 はフレームの処理時間からコア 2 / 3 を待った時間を除き、
+    // 次のフレームの時刻まで待つ時間 (wfe と空回り) は入れない。コア 2 / 3 は合成に使った時間 (takeCoreWork() と同じ)。
+    // コア 0 が 1 秒ごとに読んで差を取る (takeCoreWork() は 10 秒ごとのログが区間を使うので、別に持つ)
+    uint64_t coreBusyUs(int core) const {
+        return core >= 1 && core <= 3 ? __atomic_load_n(&busyTotal_[core * BUSY_STRIDE], __ATOMIC_RELAXED) : 0;
+    }
 
     // ---- コア 0 ----
     // 入力をコア 1 に送る。リングバッファが満杯なら false (呼んだ側が後で送り直す)。
@@ -339,6 +346,13 @@ private:
     unsigned soundCoreGo_ = 0;      // 1: コア 3 で合成する、2: しない (コア 1 が決める)
     // コア 2 / コア 3 が合成に使った時間 (足すのはそのコアだけ。コア 0 が takeCoreWork() で区間ごとに受け取る)
     platform::CoreWorkMeter renderWork_, soundWork_;
+    // coreBusyUs() の合計。コアごとに 64 バイト離して置く (書くコアが違う値を、同じキャッシュラインに置かない)
+    static constexpr int BUSY_STRIDE = 8;
+    uint64_t busyTotal_[4 * BUSY_STRIDE] = {};
+    void addBusy(int core, uint64_t us) {
+        uint64_t& t = busyTotal_[core * BUSY_STRIDE];
+        __atomic_store_n(&t, t + us, __ATOMIC_RELAXED);
+    }
     uint32_t soundWakes_ = 0;       // コア 3 が wfe から起きた回数 (書くのはコア 3)
     uint32_t soundEmptyWakes_ = 0;  // そのうち記録がなかった回数 (書くのはコア 3)
     unsigned soundRate_ = 0, soundLatency_ = 0;

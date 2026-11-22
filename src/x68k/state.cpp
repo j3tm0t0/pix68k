@@ -559,10 +559,65 @@ void Adpcm::state(StateIO& s) {
     uint8_t spare[11] = {};
     s.bytes(spare, sizeof spare);
 }
+// 版 19 から YMF288 (2 個) と、その割り込みの状態が入る。版 18 までは PCM の 40 バイトだけで、読んだら YMF288 は
+// リセットしたときの状態にする
 void Mercury::state(StateIO& s) {
-    rawChecked(s, *this, [](const Mercury& t) {
+    // 版 18 までは PCM の 40 バイト、版 19 と 20 は YMF288 までの 3728 バイト、版 21 から PCM のフィルタの履歴までの全部
+    static constexpr size_t OLD_SIZE = 40, OPN_SIZE = 3728;
+    static_assert(sizeof(Mercury) == OPN_SIZE + 2 * 2 * 2 * PCM_TAPS + 8 && sizeof(Opn3) == 1768 &&
+                      __builtin_offsetof(Mercury, opn_) == OLD_SIZE && __builtin_offsetof(Mercury, pcmHist_) == OPN_SIZE,
+                  "layout of Mercury in the state");
+    const auto pcmOk = [](const Mercury& t) {
         return boolOk(t.leftNext_) && t.head_ >= 0 && t.head_ < FIFO && t.count_ >= 0 && t.count_ <= FIFO &&
-               t.outL_ >= -32768 && t.outL_ <= 32767 && t.outR_ >= -32768 && t.outR_ <= 32767; // 16 ビットの PCM
+               t.outL_ >= -32768 && t.outL_ <= 32767 && t.outR_ >= -32768 && t.outR_ <= 32767 && // 16 ビットの PCM
+               t.acc_ < 4000000; // 取り出す間隔の端数 (フィルタの表の行の番号になる。大きいと表の外を読む)
+    };
+    const auto opnOk = [](const Mercury& t) {
+        if (!t.opn_[0].stateOk() || !t.opn_[1].stateOk()) return false;
+        // BUSY の残りは、書いたときに入れる値まで (1 サンプル分の 4MHz のクロックと、いちばん長い 192 クロック)
+        for (int i = 0; i < 2; i++) {
+            if (t.opnBusy_[i] > 2 * 64 + 192 || !boolOk(t.opnUsed_[i])) return false;
+            for (int32_t v : t.opnHist_[i])
+                if (v < -(1 << 20) || v > (1 << 20)) return false;
+        }
+        // 次のサンプルまでのクロックは 8 の倍数 (FIR の相の番号になる)
+        return t.opnAcc_ < (uint32_t)Opn3::CLOCKS_PER_SAMPLE && t.opnAcc_ % 8 == 0 && t.opnPos_ < (uint32_t)OPN_TAPS &&
+               boolOk(t.irqLine_) && boolOk(t.irqLatched_);
+    };
+    if (s.version() < STATE_MERCURY_PCM_FIR) {
+        const bool opn = s.version() >= STATE_MERCURY_OPN;
+        const size_t size = opn ? OPN_SIZE : OLD_SIZE;
+        if (s.saving()) {
+            s.bytes(this, size);
+            return;
+        }
+        Mercury t(*this);
+        s.local(&t, size);
+        if (!s.ok()) return;
+        if (!pcmOk(t) || (opn && !opnOk(t))) {
+            s.fail();
+        } else if (s.applying()) {
+            // 読んだ分のあと (版 18 までは YMF288 も) は、リセットしたときの状態にする。PCM のフィルタの履歴は、
+            // 今の出力の値で埋める (前の版はその値を出し続けていたので、段差を作らない)
+            Mercury fresh;
+            memcpy((void*)&fresh, &t, size);
+            for (int j = 0; j < 2 * PCM_TAPS; j++) {
+                fresh.pcmHist_[0][j] = (int16_t)fresh.outL_;
+                fresh.pcmHist_[1][j] = (int16_t)fresh.outR_;
+            }
+            fresh.pcmPos_ = 0;
+            fresh.pcmQuiet_ = (fresh.outL_ | fresh.outR_) ? 0 : PCM_TAPS;
+            *this = fresh;
+        }
+        return;
+    }
+    rawChecked(s, *this, [&pcmOk, &opnOk](const Mercury& t) {
+        if (!pcmOk(t) || !opnOk(t)) return false;
+        // 履歴は、同じ値が 2 か所に入っている
+        for (int c = 0; c < 2; c++)
+            for (int j = 0; j < PCM_TAPS; j++)
+                if (t.pcmHist_[c][j] != t.pcmHist_[c][j + PCM_TAPS]) return false;
+        return t.pcmPos_ < (uint32_t)PCM_TAPS && t.pcmQuiet_ <= (uint32_t)PCM_TAPS;
     });
 }
 
@@ -1095,7 +1150,23 @@ void Sound::state(StateIO& s) {
     for (int32_t& v : lp2_) s.range(v, -(1 << 22), 1 << 22);
     for (int64_t& v : hpOut_) s.range(v, -((int64_t)1 << 41), (int64_t)1 << 41);
     for (int32_t& v : hpIn_) s.range(v, -(1 << 20), 1 << 20);
-    for (int32_t& v : prev_) s.range(v, -32768, 32767);
+    for (int32_t& v : prev_) s.range(v, -32768, 32767); // 版 19 までの線形補間の前のサンプル (今は使わない。並びのために残す)
+    // 出力の周波数に直すフィルタの履歴 (低域通過フィルタの出力なので、範囲も同じ)。履歴の中の位置は入れない
+    // (いちばん古いものから順に書き、読んだら位置 0 から並べる)。版 19 までは、前のサンプルで埋める (段差を作らない)
+    int32_t loaded[2][RESAMPLE_TAPS];
+    for (int c = 0; c < 2; c++) {
+        for (int j = 0; j < RESAMPLE_TAPS; j++) {
+            int32_t v = hist_[c][histPos_ + j];
+            if (s.version() >= STATE_SOUND_FIR) s.range(v, -(1 << 22), 1 << 22);
+            else if (s.applying()) v = prev_[c];
+            loaded[c][j] = v;
+        }
+    }
+    if (s.applying()) {
+        for (int c = 0; c < 2; c++)
+            for (int j = 0; j < RESAMPLE_TAPS; j++) hist_[c][j] = hist_[c][j + RESAMPLE_TAPS] = loaded[c][j];
+        histPos_ = 0;
+    }
     // 最後に記録した J_LINES の値は、読んだ値と合わない。次の setAdpcmLines() を必ず記録するようにする
     // (しないと、読む前と同じ値に戻したときに記録されず、合成するコアの値がステートの値のまま残る)
     if (s.applying()) lines_ = ~0u;
@@ -1112,6 +1183,8 @@ void Sound::copyStateFrom(const Sound& from) {
     memcpy(hpOut_, from.hpOut_, sizeof hpOut_);
     memcpy(hpIn_, from.hpIn_, sizeof hpIn_);
     memcpy(prev_, from.prev_, sizeof prev_);
+    memcpy(hist_, from.hist_, sizeof hist_);
+    histPos_ = from.histPos_;
 }
 
 void copySoundState(const Sound& from, Sound& to) { to.copyStateFrom(from); }

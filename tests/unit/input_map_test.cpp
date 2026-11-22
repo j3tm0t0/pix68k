@@ -663,6 +663,42 @@ void testPadLayout() {
     uint8_t out = 0, ev[platform::PadMenuInput::MAX_EVENTS];
     int n = 0;
     CHECK_EQ(m.update(true, platform::remapPadButtons(*h, 1u << 12), 0, false, out, ev, n), platform::PadMenuInput::OPEN);
+
+    // HORI の PCEngine PAD (0f0d:0138): II、I、SELECT、RUN がビット 1、2、8、9
+    const platform::PadLayout* p = platform::findPadLayout(0x0f0d, 0x0138);
+    CHECK_EQ(p != nullptr, 1);
+    if (p == nullptr) return;
+    CHECK_EQ(platform::remapPadButtons(*p, 1u << 1), 1u << 8);  // II (B)
+    CHECK_EQ(platform::remapPadButtons(*p, 1u << 2), 1u << 9);  // I (A)
+    CHECK_EQ(platform::remapPadButtons(*p, 1u << 8), 1u << 20); // SELECT (-)
+    CHECK_EQ(platform::remapPadButtons(*p, 1u << 9), 1u << 19); // RUN (+)
+    CHECK_EQ(platform::remapPadButtons(*p, (1u << 0) | (1u << 3) | (1u << 12)), 0u); // 使わないビット
+    // 十字キーはハット (ログの値: 上 0、右 2、下 4、左 6。離すと 15 で、HatDecoder が 8 に直す)
+    platform::GamePadInput pi;
+    pi.known = true;
+    pi.nhats = 1;
+    pi.hat = 0;
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_UP);
+    pi.hat = 2;
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_RIGHT);
+    pi.hat = 4;
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_DOWN);
+    pi.hat = 6;
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_LEFT);
+    // I はトリガ A、II はトリガ B (十字キーは離している)
+    pi.hat = 8;
+    pi.buttons = platform::remapPadButtons(*p, 1u << 2);
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_A);
+    pi.buttons = platform::remapPadButtons(*p, 1u << 1);
+    CHECK_EQ(platform::joystickBits(pi), InputSink::JOY_B);
+    // RUN + SELECT でリセット、SELECT + 上でメニュー
+    platform::PadResetCombo c2;
+    CHECK_EQ(c2.update(true, 0), 0);
+    CHECK_EQ(c2.update(true, platform::remapPadButtons(*p, (1u << 8) | (1u << 9))), 1);
+    platform::PadMenuInput m2;
+    CHECK_EQ(m2.update(true, platform::remapPadButtons(*p, 1u << 8), 0, false, out, ev, n), platform::PadMenuInput::PASS);
+    CHECK_EQ(m2.update(true, platform::remapPadButtons(*p, 1u << 8), InputSink::JOY_UP, false, out, ev, n),
+             platform::PadMenuInput::OPEN);
 }
 
 } // namespace

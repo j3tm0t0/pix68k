@@ -21,6 +21,9 @@
 //
 // このファイルは -fno-builtin -fno-tree-loop-distribute-patterns -fno-tree-vectorize -mstrict-align でビルドする
 // (Makefile。ループを memcpy() / memset() の呼び出しや NEON の命令に置き換えさせない)。
+// 32 ビットの ARM (Pi 2) では -mstrict-align のかわりに -mno-unaligned-access -mgeneral-regs-only を付ける。8 バイトの
+// 読み書きは、4 バイトのロードとストア 2 回になる (付けないと VFP の d レジスタを使う)。レジスタが足りないので、
+// r4 以降をスタックに積む (AArch64 版はスタックを使わない)。
 // ホストの試験 (tests/unit/mem_fast_test.cpp) は、PIX68K_MEM_NAME で名前を変え、PIX68K_MEM_ACCESS で読み書きの
 // 番地と大きさを調べる。
 

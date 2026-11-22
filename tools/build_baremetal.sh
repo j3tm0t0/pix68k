@@ -1,21 +1,31 @@
 #!/bin/sh
 # ベアメタル版をビルドする。
-#   使い方: tools/build_baremetal.sh <3|4|5> [--qemu]
+#   使い方: tools/build_baremetal.sh <2|3|4|5> [--qemu]
 #   PIX68K_CPU020=0 を付けると 68030 / 68060 のコアを入れない (68000 だけ)。既定は 1 (入れる)
-#   出力: build/baremetal-raspi<N>[-qemu]/app/kernel8.img (Pi 3) / kernel8-rpi4.img (Pi 4、Pi 400) / kernel_2712.img (Pi 5)
+#   出力: build/baremetal-raspi<N>[-qemu]/app/kernel7.img (Pi 2) / kernel8.img (Pi 3) / kernel8-rpi4.img (Pi 4、Pi 400) /
+#         kernel_2712.img (Pi 5)
+# Pi 2 (BCM2836、Cortex-A7) だけ 32 ビット (AArch32) で、コンパイラは arm-none-eabi-gcc (PREFIX32 で接頭辞を変えられる)。
+# Homebrew の 16.2.0 と Arm GNU Toolchain 15.2.Rel1 で確かめてある。Ubuntu のパッケージの 14.2.1 は使えない (Cortex-A7 で
+# 未定義命令になる ldrd を出す。ビルドの最後の tools/baremetal_arm32_check.sh が見つけて失敗にする)。
+# Pi 2 版は 68000 だけで、68030 / 68060 のコアと数値演算プロセッサボードは入らない (FPU の計算が 128 ビットの整数
+# (unsigned __int128) を使い、32 ビットの ARM の GCC にはないため)
 # Circle はビルド先ごとに設定が違うので、external/circle をビルドディレクトリに写してからビルドする。
 set -eu
-usage() { echo "usage: $0 <3|4|5> [--qemu]" >&2; exit 2; }
+usage() { echo "usage: $0 <2|3|4|5> [--qemu]" >&2; exit 2; }
 [ $# -ge 1 ] && [ $# -le 2 ] || usage
 N=$1
-case $N in 3|4|5) ;; *) usage ;; esac
+case $N in 2|3|4|5) ;; *) usage ;; esac
 QEMU=
 if [ $# -eq 2 ]; then
   [ "$2" = --qemu ] || usage
   [ "$N" = 3 ] || { echo "QEMU は raspi3b だけ対応している" >&2; exit 2; }
   QEMU=--qemu
 fi
-PREFIX=${PREFIX64:-aarch64-elf-}
+if [ "$N" = 2 ]; then
+  PREFIX=${PREFIX32:-arm-none-eabi-}
+else
+  PREFIX=${PREFIX64:-aarch64-elf-}
+fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/build/baremetal-raspi$N${QEMU:+-qemu}
 mkdir -p "$OUT"
@@ -29,6 +39,10 @@ rsync -a --delete --exclude .git \
   --exclude '*.o' --exclude '*.a' --exclude '*.d' --exclude '*.elf' --exclude '*.img' --exclude '*.map' \
   --exclude '*.lst' --exclude Config.mk --exclude .pix68k-config --exclude /addon/fatfs/ffconf.h \
   --exclude /include/circle/timer.h --exclude /lib/usb/dwhcidevice.cpp --exclude /lib/net/udpconnection.cpp \
+  --exclude /lib/usb/usbfloppydevice.cpp --exclude /include/circle/usb/usbfloppydevice.h --exclude /lib/usb/xhciendpoint.cpp \
+  --exclude /lib/dmachannel.cpp --exclude /lib/dma4channel.cpp --exclude /lib/sound/dmasoundbuffers.cpp \
+  --exclude /lib/usb/xhcirootport.cpp --exclude /lib/usb/usbstandardhub.cpp --exclude /lib/usb/xhcicommandmanager.cpp \
+  --exclude /include/circle/usb/xhcicommandmanager.h --exclude /lib/usb/xhciusbdevice.cpp --exclude /lib/usb/usbdevice.cpp \
   "$ROOT/external/circle/" "$OUT/circle/"
 cd "$OUT/circle"
 # FatFs の設定は tools/ffconf_patch.sh で書き換える (fast seek、UTF-8 のファイル名など。理由はそちらに書いた)。
@@ -91,9 +105,51 @@ else
   cp "$ROOT/external/circle/$UDPCONN" "$UDPCONN.tmp"
 fi
 if cmp -s "$UDPCONN.tmp" "$UDPCONN"; then rm "$UDPCONN.tmp"; else mv "$UDPCONN.tmp" "$UDPCONN"; fi
+# USB-FDD のドライバ (CUSBFloppyDiskDevice、ufd1): 1024 バイト/セクタのディスク (X68000 の 2HD) を受け付け、書き込みは
+# 送らないようにする。xHCI の転送の時間切れ (3 秒) も、USB-FDD を読む間だけ延ばせるようにする (#286。理由は
+# tools/circle_ufd_patch.sh に書いた)。ffconf.h と同じく、写した先だけを書き換える
+UFDCPP=lib/usb/usbfloppydevice.cpp
+UFDH=include/circle/usb/usbfloppydevice.h
+XHCIEP=lib/usb/xhciendpoint.cpp
+sh "$ROOT/tools/circle_ufd_patch.sh" "$ROOT/external/circle/$UFDCPP" "$UFDCPP.tmp" "$ROOT/external/circle/$UFDH" "$UFDH.tmp" \
+  "$ROOT/external/circle/$XHCIEP" "$XHCIEP.tmp"
+for f in "$UFDCPP" "$UFDH" "$XHCIEP"; do
+  if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
+done
+# DMA のチャネルと、PWM / I2S の音のバッファ: 繰り返し送る転送 (HDMI、PWM、I2S の音) で、送り終えたバッファを割り込みの回数ではなく DMA のレジスタから決める
+# (#296。割り込みを取りこぼしたあと、音が 16ms ごとに飛び続けた。理由は tools/circle_dma_patch.sh に書いた)。
+# ffconf.h と同じく、写した先だけを書き換える
+DMACPP=lib/dmachannel.cpp
+DMA4CPP=lib/dma4channel.cpp
+DMASND=lib/sound/dmasoundbuffers.cpp
+sh "$ROOT/tools/circle_dma_patch.sh" "$ROOT/external/circle/$DMACPP" "$DMACPP.tmp" "$ROOT/external/circle/$DMA4CPP" "$DMA4CPP.tmp" \
+  "$ROOT/external/circle/$DMASND" "$DMASND.tmp"
+for f in "$DMACPP" "$DMA4CPP" "$DMASND"; do
+  if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
+done
+# あとからつないだ装置: つないでからリセットするまで待ち、読めなければ探し直す (#308。理由は tools/circle_hotplug_patch.sh に
+# 書いた)。ffconf.h と同じく、写した先だけを書き換える
+XHCIRP=lib/usb/xhcirootport.cpp
+USBHUB=lib/usb/usbstandardhub.cpp
+USBDEV=lib/usb/usbdevice.cpp
+sh "$ROOT/tools/circle_hotplug_patch.sh" "$ROOT/external/circle/$XHCIRP" "$XHCIRP.tmp" "$ROOT/external/circle/$USBHUB" "$USBHUB.tmp" \
+  "$ROOT/external/circle/$USBDEV" "$USBDEV.tmp"
+for f in "$XHCIRP" "$USBHUB" "$USBDEV"; do
+  if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
+done
+# xHCI の命令が時間切れになったら命令の列を止め、装置を消すときの失敗で止まらない (#308。理由は
+# tools/circle_xhci_cmd_patch.sh に書いた)
+XHCICMD=lib/usb/xhcicommandmanager.cpp
+XHCICMDH=include/circle/usb/xhcicommandmanager.h
+XHCIDEV=lib/usb/xhciusbdevice.cpp
+sh "$ROOT/tools/circle_xhci_cmd_patch.sh" "$ROOT/external/circle/$XHCICMD" "$XHCICMD.tmp" "$ROOT/external/circle/$XHCICMDH" "$XHCICMDH.tmp" \
+  "$ROOT/external/circle/$XHCIDEV" "$XHCIDEV.tmp"
+for f in "$XHCICMD" "$XHCICMDH" "$XHCIDEV"; do
+  if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
+done
 
 # カーネルの大きさの上限 (Circle の KERNEL_MAX_SIZE。MB の単位。既定は 2MB)。.bss を含めた終わり (_end) が
-# 0x80000 + この値を超えると、Circle の sysinit() が何も表示せずに止まる。Pi 3 / Pi 4 / Pi 5 は 68030 / 68060 の命令表
+# 読み込む番地 (64 ビットは 0x80000、32 ビットの Pi 2 は 0x8000) + この値を超えると、Circle の sysinit() が何も表示せずに止まる。Pi 3 / Pi 4 / Pi 5 は 68030 / 68060 の命令表
 # (512KB ずつ) などで 2MB を超えるので 8MB にする。Circle の configure --kernel-max-size で渡す (Config.mk の DEFINE に
 # -DKERNEL_MAX_SIZE が入り、Circle のライブラリとアプリの C++ とアセンブラのすべてに渡る。KASAN を使うときの shadow の
 # 位置 (KASAN_SHADOW_MAPPING_OFFSET) も configure がこの値から決める)。
@@ -107,13 +163,19 @@ ADDONS="addon/SDCard addon/fatfs"
 [ "$N" = 5 ] && ADDONS="$ADDONS addon/nvme"
 # Linux 向けの GCC (CI の baremetal の job。PREFIX64=aarch64-linux-gnu-) かどうか。下で Config.mk に書くオプションが変わる
 command -v "${PREFIX}gcc" >/dev/null 2>&1 ||
-  { echo "コンパイラ ${PREFIX}gcc がない (PREFIX64 で接頭辞を変えられる。例: PREFIX64=aarch64-linux-gnu-)" >&2; exit 1; }
+  { echo "コンパイラ ${PREFIX}gcc がない (PREFIX64 で接頭辞を変えられる。例: PREFIX64=aarch64-linux-gnu-。Pi 2 は PREFIX32)" >&2; exit 1; }
 case $("${PREFIX}gcc" -dumpmachine) in
   *-linux-*) LINUX_GCC=1 ;;
   *) LINUX_GCC= ;;
 esac
+# Pi 2 (32 ビット) は arm-none-eabi-gcc でだけ確かめてある。Linux 向けの GCC 用に下で足すオプションには AArch64 専用の
+# もの (-mno-outline-atomics) がある
+if [ "$N" = 2 ] && [ -n "$LINUX_GCC" ]; then
+  echo "Pi 2 版は Linux 向けの GCC (${PREFIX}gcc) ではビルドできない。arm-none-eabi-gcc を使うこと" >&2
+  exit 1
+fi
 # 設定 (shim の場所を含む) が変わったときだけ作り直す
-CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
+CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1 ufd1024=1 dmaresync=3 hotplug308=2${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
 if [ ! -f .pix68k-config ] || [ "$(cat .pix68k-config)" != "$CONFIG" ]; then
   # 設定をやり直している間は .pix68k-config を置かない。途中で失敗したとき、次のビルドが前の設定のまま
   # configure を飛ばさないようにする (書くのは、この if の最後まで成功したとき)
@@ -164,14 +226,23 @@ for d in $ADDONS; do make -C "$d" -j8 >/dev/null; done
 # アプリは毎回写し直す (--delete で app/ の生成物も消えるので、毎回すべてビルドし直す。3 ファイルなので数秒)
 rsync -a --delete "$ROOT/baremetal/" "$OUT/app/"
 # 68030 / 68060 のコアは Pi 3 / Pi 4 / Pi 5 のすべてに入れる。PIX68K_CPU020=0 を付けて実行すると入れない (68000 だけ)
-case "${PIX68K_CPU020:-1}" in
-  1) CPU020=1 ;;
-  0) CPU020= ;;
-  *) echo "PIX68K_CPU020 は 0 か 1: ${PIX68K_CPU020}" >&2; exit 2 ;;
-esac
+# Pi 2 版にはどちらも入れず、数値演算プロセッサボードも入れない (このファイルの先頭の説明を参照)
+if [ "$N" = 2 ]; then
+  [ "${PIX68K_CPU020:-0}" = 0 ] || { echo "Pi 2 版には 68030 / 68060 のコアを入れられない (PIX68K_CPU020=${PIX68K_CPU020})" >&2; exit 2; }
+  CPU020=
+  FPU_BOARD=0
+else
+  case "${PIX68K_CPU020:-1}" in
+    1) CPU020=1 ;;
+    0) CPU020= ;;
+    *) echo "PIX68K_CPU020 は 0 か 1: ${PIX68K_CPU020}" >&2; exit 2 ;;
+  esac
+  FPU_BOARD=1
+fi
 # アプリの make がイメージを作ったあとで失敗したときも (set -e で抜ける)、検査していないイメージを残さない
 trap 'rm -f "$OUT"/app/kernel*.img' EXIT
-make -C "$OUT/app" -j8 CIRCLEHOME="$OUT/circle" PIX68K_SRC="$ROOT/src" PIX68K_QEMU=${QEMU:+1} PIX68K_CPU020=$CPU020
+make -C "$OUT/app" -j8 CIRCLEHOME="$OUT/circle" PIX68K_SRC="$ROOT/src" PIX68K_QEMU=${QEMU:+1} PIX68K_CPU020=$CPU020 \
+  PIX68K_FPU_BOARD=$FPU_BOARD
 ls -l "$OUT"/app/kernel*.img
 # _end が上限を超えていたら失敗にする (超えたカーネルは実機で何も表示せずに止まり、原因が分かりにくい)。
 # 確かめられなかったとき (ELF がない、nm が失敗した、_end がない) も失敗にする。どちらでも、誤って SD カードに
@@ -182,10 +253,12 @@ fail() {
   exit 1
 }
 # Circle の Rules.mk がビルド先ごとに決める名前 (app/ は毎回写し直すので、ほかの名前の ELF は残らない)
+# LOADADDR は Circle がカーネルを置く番地 (Rules.mk の LOADADDR、memorymap.h の MEM_KERNEL_START)
 case $N in
-  3) KERNEL=kernel8 ;;
-  4) KERNEL=kernel8-rpi4 ;;
-  5) KERNEL=kernel_2712 ;;
+  2) KERNEL=kernel7; LOADADDR=0x8000 ;;
+  3) KERNEL=kernel8; LOADADDR=0x80000 ;;
+  4) KERNEL=kernel8-rpi4; LOADADDR=0x80000 ;;
+  5) KERNEL=kernel_2712; LOADADDR=0x80000 ;;
 esac
 ELF=$OUT/app/$KERNEL.elf
 [ -f "$ELF" ] || fail "$ELF がない"
@@ -196,16 +269,34 @@ END=$(printf '%s\n' "$SYMS" | awk '$3 == "_end" { print $1 }')
 case $END in
   ''|*[!0-9a-fA-F]*) fail "_end が $ELF にない (nm の答え: '$END')" ;;
 esac
-LIMIT=$((0x80000 + KERNEL_MAX_SIZE))
+LIMIT=$((LOADADDR + KERNEL_MAX_SIZE))
 if [ $((0x$END)) -gt $LIMIT ]; then
-  fail "$(printf '%s の _end (0x%x) が Circle の上限 (0x%x = 0x80000 + KERNEL_MAX_SIZE) を超えている。KERNEL_MAX_SIZE_MB を大きくすること' \
-    "$ELF" $((0x$END)) $LIMIT)"
+  fail "$(printf '%s の _end (0x%x) が Circle の上限 (0x%x = 0x%x + KERNEL_MAX_SIZE) を超えている。KERNEL_MAX_SIZE_MB を大きくすること' \
+    "$ELF" $((0x$END)) $LIMIT $((LOADADDR)))"
 fi
 printf '_end 0x%x (上限 0x%x、残り %d KB)\n' $((0x$END)) $LIMIT $(((LIMIT - 0x$END) / 1024))
+# 割り込みの入口 (exceptionstub64.S) が、コア 0 の割り込みの時間を数える __wrap_InterruptHandler() (kernel.cpp) を
+# 呼んでいるか (Makefile の --wrap=InterruptHandler が外れると、画面の右下のバーの C0 が割り込みの時間を数えなくなる)
+grep -q 'bl.*<__wrap_InterruptHandler>' "$OUT/app/$KERNEL.lst" ||
+  fail "$OUT/app/$KERNEL.lst で、割り込みの入口が __wrap_InterruptHandler() を呼んでいない (Makefile の --wrap=InterruptHandler)"
 # CPU のコアと画面の合成の関数に memcpy() の呼び出しが残っていたら失敗にする (baremetal/builtin_mem.h が読まれなく
 # なったときなどに気づくため)。memcpy() / memset() (baremetal/mem_fast.cpp) が、ほかの関数、NEON、スタックを使って
 # いないことと、Circle のものがリンクされていないことも調べる (tools/baremetal_hot_mem.sh の説明を参照)
-HOT=$(sh "$ROOT/tools/baremetal_hot_mem.sh" "$OUT/app/$KERNEL.lst" "$OUT/app/$KERNEL.map") ||
-  fail "memcpy() / memset() の検査 (tools/baremetal_hot_mem.sh) で見つかった:
+# Pi 2 版では当面この検査をしない。tools/baremetal_hot_mem.sh は AArch64 の逆アセンブル (レジスタの名前、命令) を読むので、
+# 32 ビットの ARM の逆アセンブルには使えない。Circle の memcpy() / memset() がリンクされていないことだけ、map で確かめる
+if [ "$N" = 2 ]; then
+  if grep -q 'util_fast\.o' "$OUT/app/$KERNEL.map"; then
+    fail "Circle の memcpy() / memset() (lib/util_fast.S) がリンクされている ($OUT/app/$KERNEL.map)"
+  fi
+  echo "Pi 2 版: memcpy() / memset() の逆アセンブルの検査 (tools/baremetal_hot_mem.sh) はしていない"
+  # Cortex-A7 で未定義命令の例外になる ldrd / strd がないこと (Ubuntu の arm-none-eabi-gcc 14.2.1 が出す。
+  # tools/baremetal_arm32_check.sh の説明を参照)
+  ARM32=$(sh "$ROOT/tools/baremetal_arm32_check.sh" "$OUT/app/$KERNEL.lst") ||
+    fail "32 ビットのカーネルの検査 (tools/baremetal_arm32_check.sh) で見つかった:
+$ARM32"
+else
+  HOT=$(sh "$ROOT/tools/baremetal_hot_mem.sh" "$OUT/app/$KERNEL.lst" "$OUT/app/$KERNEL.map") ||
+    fail "memcpy() / memset() の検査 (tools/baremetal_hot_mem.sh) で見つかった:
 $HOT"
+fi
 trap - EXIT

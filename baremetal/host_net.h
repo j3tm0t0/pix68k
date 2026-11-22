@@ -7,7 +7,9 @@
 //   HTTP     ポート 80。1 つの接続で 1 つの要求 (応答は Connection: close)。接続は 1 つずつ順に受ける
 //              GET  /files/<パス>        ファイルを読む (ディレクトリなら一覧)
 //              PUT  /files/<パス>        ファイルを書き換える (POST も同じ。<パス>.part に書き終えてから置き換える。
-//                                        platform/net_files.h)。X68000 が使っているディスクのイメージは断る (409)
+//                                        platform/net_files.h)。X68000 が使っているディスクのイメージは断る (409)。
+//                                        /pix68k の直下に置くときは、/pix68k がなければ作る (ほかのディレクトリは
+//                                        作らず 404)
 //              GET  /log                 起動からのログ (最新 64KB。UART と同じ内容)
 //              GET  /ts6bga.ppm         TS-6BGA の仮想VRAM (PPM)
 //              GET  /screen2.ppm        第2 HDMI の選択中ソース (PPM)
@@ -88,8 +90,15 @@ public:
     virtual void netBeginHeavy() = 0;                       // SD カードの読み書きの前 (画面を合成するコアに任せる)
     virtual void netEndHeavy() = 0;                         // その後
     virtual void netIdleUntil(u64 deadline) = 0;            // 時刻 deadline (CTimer::GetClockTicks64()) まで眠る
+    virtual void netSpinUs(unsigned us) = 0;                // us マイクロ秒、空回りで待つ (待った時間として数える。#239)
     virtual bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) = 0;
     virtual bool netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) = 0;
+    // ドライブ drive に、実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクが入っていれば、そのイメージを
+    // buf に写して大きさを返す (GET /fd0.xdf、/fd1.xdf。#287)。入っていない、capacity が足りないなら 0。
+    // buf が nullptr なら、写さずに大きさだけを返す (HEAD)
+    virtual unsigned netFloppyImage(int drive, u8* buf, unsigned capacity) = 0;
+    // bytes バイトのバッファを確保してよいか (ヒープの空きを見る)
+    virtual bool netCanAllocate(unsigned bytes) = 0;
     virtual void netRequestReboot() = 0;                    // 少し後に再起動する (応答を送り終えるため)
     // 次の再起動で使う起動の組み合わせ (POST /reboot?profile=。空なら pix68k.cfg だけ)。名前とファイルを確かめ、
     // profile.sel に書く。nullptr なら前に頼まれたものを取り消す

@@ -1,9 +1,12 @@
 // 拡張ボードのテスト: 数値演算プロセッサボード (CZ-6BP1 相当、x68k/fpu_board.h) と、まーきゅりーゆにっと (x68k/mercury.h)。
+// まーきゅりーゆにっとの YMF288 の音そのものは opn3_test.cpp にある。
 // 数値演算プロセッサボードは、68000 のソフトウェアが CIR を読み書きする手順 (MC68881UM 7.5) をそのまま
 // FpuBoard に対して行う。最後に、テスト用の IPL ROM の 68000 の命令から $E9E000 を読み書きする。
 // まーきゅりーゆにっとは、レジスタ、取り出す速さ、DMAC のチャネル 2 からの転送、音の合成を別のコアで行うとき
 // (記録を当てる側) の音が 1 つのコアのときと同じになることを調べる。
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <initializer_list>
@@ -733,13 +736,13 @@ void testMercuryRegisters() {
         CHECK_EQ(s.drq(), false);
         s.writeData(0x7777); // 捨てる
         s.advance(4000000 / 48000 + 1);      // 1 サンプル取り出す
-        CHECK_EQ(s.left(), 0x1000);
-        CHECK_EQ(s.right(), 0x2000);
+        CHECK_EQ(s.sampleLeft(), 0x1000);
+        CHECK_EQ(s.sampleRight(), 0x2000);
         s.writeData(0x1100); // 空いた 2 語に L、R
         s.writeData(0x2200);
         for (int i = 0; i < x68k::Mercury::FIFO / 2; i++) s.advance(4000000 / 48000 + 1);
-        CHECK_EQ(s.left(), 0x1100);
-        CHECK_EQ(s.right(), 0x2200);
+        CHECK_EQ(s.sampleLeft(), 0x1100);
+        CHECK_EQ(s.sampleRight(), 0x2200);
     }
     // $ECC090: EXREQ (bit2) は空きがあれば 0。あふれるまで書くと 1
     u.writeCommand(0x80 | 0x30 | 0x0e); // 48kHz ステレオ
@@ -754,25 +757,25 @@ void testMercuryRegisters() {
     // 1 サンプル (L と R) を取り出す間隔: 4MHz / 48kHz = 83.3 クロック
     u.advance(64);
     CHECK_EQ(u.drq(), false);
-    CHECK_EQ(u.left(), 0);
+    CHECK_EQ(u.sampleLeft(), 0);
     u.advance(64);
     CHECK_EQ(u.drq(), true);
-    CHECK_EQ(u.left(), 0x1000);
-    CHECK_EQ(u.right(), 0x1001);
+    CHECK_EQ(u.sampleLeft(), 0x1000);
+    CHECK_EQ(u.sampleRight(), 0x1001);
     // L だけ出す
     u.writeCommand(0x80 | 0x30 | 0x06);
-    CHECK_EQ(u.left(), 0x1000);
-    CHECK_EQ(u.right(), 0);
+    CHECK_EQ(u.sampleLeft(), 0x1000);
+    CHECK_EQ(u.sampleRight(), 0);
     // モノラル: 1 語を L と R に
     u.reset();
     u.writeCommand(0x80 | 0x30 | 0x0c);
     u.writeData(0x8000);
     u.advance(128);
-    CHECK_EQ(u.left(), -32768);
-    CHECK_EQ(u.right(), -32768);
+    CHECK_EQ(u.sampleLeft(), -32768);
+    CHECK_EQ(u.sampleRight(), -32768);
     // データがなくなったら前の値のまま
     u.advance(4000);
-    CHECK_EQ(u.left(), -32768);
+    CHECK_EQ(u.sampleLeft(), -32768);
 }
 
 // DMAC のチャネル 2 でメモリから $ECC080 に送る。転送の速さがサンプリング周波数の 2 倍 (ステレオ) になる
@@ -792,7 +795,7 @@ void testMercuryDma() {
     rom.code({
         0x13fc, 0x00be, 0x00ec, 0xc091, // move.b #$be,$ecc091 (48kHz、等倍、L と R、ステレオ)
         0x1039, 0x00ec, 0xc0a1,         // move.b $ecc0a1,d0
-        0x1239, 0x00ec, 0xc0c1,         // move.b $ecc0c1,d1 (OPN は作っていない: $FF)
+        0x1239, 0x00ec, 0xc0d1,         // move.b $ecc0d1,d1 (何もない: $FF)
     });
     m68k::Registers r = runRom(m, rom);
     CHECK_EQ(r.d[7], 0);
@@ -1050,6 +1053,323 @@ void testMercuryJournal() {
     }
 }
 
+// YMF288 (x68k/opn3.h) を 68000 の命令から読み書きする: マスターとスレーブ、動作モード、識別コード、ベクタ、BUSY
+void testMercuryOpnBus() {
+    printf("mercury: YMF288 registers from 68000 code\n");
+    x68k::Machine m;
+    CHECK_EQ(m.setMercury(true), true);
+    Rom rom;
+    rom.code({
+        0x13fc, 0x0020, 0x00ec, 0xc0c1, // move.b #$20,$ecc0c1 (マスター: $20)
+        0x13fc, 0x0002, 0x00ec, 0xc0c3, // move.b #$02,$ecc0c3 (NEW = 1: YMF288 モード)
+        0x13fc, 0x00ff, 0x00ec, 0xc0c1, // move.b #$ff,$ecc0c1
+        0x1039, 0x00ec, 0xc0c3,         // move.b $ecc0c3,d0   (識別コード $02)
+        0x1239, 0x00ec, 0xc0b1,         // move.b $ecc0b1,d1   (ベクタ: リセットで $FF)
+        0x13fc, 0x00f8, 0x00ec, 0xc0b1, // move.b #$f8,$ecc0b1
+        0x1439, 0x00ec, 0xc0b1,         // move.b $ecc0b1,d2   ($F8)
+        0x13fc, 0x00ff, 0x00ec, 0xc0c9, // move.b #$ff,$ecc0c9 (スレーブ)
+        0x1639, 0x00ec, 0xc0cb,         // move.b $ecc0cb,d3   (互換モードのまま: $01)
+        0x1839, 0x00ec, 0xc0cf,         // move.b $ecc0cf,d4   (A1 = A0 = 1 の読み出し: $FF)
+        // スレーブの $30 に書いた直後のステータスは BUSY (互換モードではデータのあと 192 クロック = 24 マイクロ秒)
+        0x13fc, 0x0030, 0x00ec, 0xc0c9, // move.b #$30,$ecc0c9
+        0x13fc, 0x0071, 0x00ec, 0xc0cb, // move.b #$71,$ecc0cb
+        0x1a39, 0x00ec, 0xc0c9,         // move.b $ecc0c9,d5   ($80)
+        0x303c, 0x0064,                 // move.w #100,d0 ... 待つ
+        0x51c8, 0xfffe,                 // dbra d0,*
+        0x1039, 0x00ec, 0xc0c3,         // move.b $ecc0c3,d0   (マスターの識別コードをもう一度)
+        0xe148,                         // lsl.w #8,d0
+        0x1039, 0x00ec, 0xc0cd,         // move.b $ecc0cd,d0   (スレーブのステータス 1: BUSY は消えている)
+        0x1e39, 0x00ec, 0xc0c0,         // move.b $ecc0c0,d7   (偶数番地: $FF)
+        0x5207,                         // addq.b #1,d7        (0 になる)
+    });
+    m68k::Registers r = runRom(m, rom, 60000);
+    CHECK_EQ(r.d[6], 1);
+    CHECK_EQ(r.d[7] & 0xff, 0);
+    CHECK_EQ(r.d[0] & 0xffff, 0x0200);
+    CHECK_EQ(r.d[1] & 0xff, 0xff);
+    CHECK_EQ(r.d[2] & 0xff, 0xf8);
+    CHECK_EQ(r.d[3] & 0xff, 0x01);
+    CHECK_EQ(r.d[4] & 0xff, 0xff);
+    CHECK_EQ(r.d[5] & 0xff, 0x80);
+    CHECK_EQ(m.mercury()->opn(0).newMode(), true);
+    CHECK_EQ(m.mercury()->opn(1).newMode(), false);
+    CHECK_EQ(m.mercury()->opn(1).reg(0, 0x30), 0x71);
+    CHECK_EQ(m.mercury()->opn(0).reg(0, 0x30), 0x00);
+    CHECK_EQ(m.mercury()->vector(), 0xf8);
+    // X68000 のリセット (RESET 命令) で、ベクタは $FF に戻る
+    m.resetDevices();
+    CHECK_EQ(m.mercury()->vector(), 0xff);
+    CHECK_EQ(m.mercury()->opn(0).newMode(), false);
+}
+
+// YMF288 のタイマーの割り込み: レベル 4、ベクタは $ECC0B1 の値。/IRQ が出た変わり目で 1 回だけ要求する
+void testMercuryOpnIrq() {
+    printf("mercury: YMF288 timer interrupt\n");
+    // clear: 割り込みの処理でフラグを消すか。sr: 待っている間の SR
+    const auto run = [](bool clear, uint16_t sr, bool slave, x68k::Machine& m) {
+        CHECK_EQ(m.setMercury(true), true);
+        static Rom roms[8];
+        static int used = 0;
+        Rom& rom = roms[used++ & 7];
+        rom = Rom();
+        const uint16_t base = slave ? 0xc0c9 : 0xc0c1;
+        // 割り込みの処理 ($FE0800): 数えて、(clear なら) タイマー A のフラグを消す
+        uint32_t h = 0x800;
+        const auto put = [&rom, &h](std::initializer_list<uint16_t> words) {
+            for (uint16_t w : words) {
+                rom.put16(h, w);
+                h += 2;
+            }
+        };
+        put({0x5283}); // addq.l #1,d3
+        if (clear) {
+            put({0x13fc, 0x0027, 0x00ec, base});                   // move.b #$27,(アドレス)
+            put({0x13fc, 0x0015, 0x00ec, (uint16_t)(base + 2)});   // move.b #$15,(データ): フラグを消して動かし続ける
+        }
+        put({0x4e73}); // rte
+        rom.code({
+            0x7600,                                              // moveq #0,d3
+            0x21fc, 0x00fe, 0x0800, 0x03e0,                      // move.l #$fe0800,$3e0.w (ベクタ $F8)
+            0x13fc, 0x00f8, 0x00ec, 0xc0b1,                      // move.b #$f8,$ecc0b1
+            0x13fc, 0x0024, 0x00ec, base,                        // タイマー A: NA = 1000 (周期は 72 x 24 = 1728 クロック、432 マイクロ秒)
+            0x13fc, 0x00fa, 0x00ec, (uint16_t)(base + 2),
+            0x13fc, 0x0025, 0x00ec, base,
+            0x13fc, 0x0000, 0x00ec, (uint16_t)(base + 2),
+            0x13fc, 0x0027, 0x00ec, base,
+            0x13fc, 0x0005, 0x00ec, (uint16_t)(base + 2),        // 動かす、フラグを立てる
+            0x46fc, sr,                                          // move #sr,sr
+        });
+        // 16MHz で 320000 サイクル = 20ms
+        return runRom(m, rom, 320000);
+    };
+    {
+        x68k::Machine m;
+        const m68k::Registers r = run(true, 0x2000, false, m);
+        // 20ms / 432 マイクロ秒 = 46 回 (設定の命令の分だけ少ない)
+        if (r.d[3] < 44 || r.d[3] > 47) {
+            printf("  %u interrupts in 20ms, want about 46\n", (unsigned)r.d[3]);
+            failures++;
+        }
+        CHECK_EQ(r.d[7], 0);
+    }
+    {
+        // フラグを消さなければ /IRQ は出たままで、要求は最初の 1 回だけ (レベルではなく変わり目)
+        x68k::Machine m;
+        const m68k::Registers r = run(false, 0x2000, false, m);
+        CHECK_EQ(r.d[3], 1);
+        CHECK_EQ(m.mercury()->opn(0).irq(), true);
+        CHECK_EQ(m.mercury()->irq(), false);
+    }
+    {
+        // 割り込みのマスクが 3 なら受け付け、4 なら受け付けない (レベル 4)。受け付けない間、要求は覚えたまま
+        x68k::Machine m3, m4;
+        CHECK_EQ(run(false, 0x2300, false, m3).d[3], 1);
+        CHECK_EQ(run(false, 0x2400, false, m4).d[3], 0);
+        CHECK_EQ(m4.mercury()->irq(), true);
+    }
+    {
+        // スレーブの /IRQ はつながっていない: フラグは立つが、割り込みは起きない
+        x68k::Machine m;
+        const m68k::Registers r = run(false, 0x2000, true, m);
+        CHECK_EQ(r.d[3], 0);
+        CHECK_EQ(m.mercury()->opn(1).status(), 1);
+        CHECK_EQ(m.mercury()->irq(), false);
+    }
+}
+
+// YMF288 の音も、記録を当てた側 (別のコア) で 1 つのコアのときと同じになる。記録する側は音を作らない
+void testMercuryOpnJournal() {
+    printf("mercury: YMF288 journal replay gives the same samples\n");
+    static uint32_t buf[1 << 18];
+    x68k::VideoJournal journal;
+    journal.init(buf, 18);
+    x68k::Sound single, emu, synth;
+    x68k::Mercury singleUnit, emuUnit;
+    single.setOutputRate(48000);
+    synth.setOutputRate(48000);
+    x68k::SoundReplayer replayer(journal, synth);
+    emu.setJournal(&journal);
+    emu.mercuryAttached(true);
+    // 両方に同じ書き込みをする。chip 0 がマスター ($C1 / $C3 / $C5 / $C7)、1 がスレーブ
+    const auto wr = [&](int chip, int bank, uint8_t reg, uint8_t v) {
+        const uint32_t a = 0xc1 + (uint32_t)chip * 8 + (uint32_t)bank * 4;
+        single.mercuryWrite(singleUnit, a, reg);
+        single.mercuryWrite(singleUnit, a + 2, v);
+        emu.mercuryWrite(emuUnit, a, reg);
+        emu.mercuryWrite(emuUnit, a + 2, v);
+    };
+    for (int chip = 0; chip < 2; chip++) {
+        wr(chip, 0, 0x29, 0x83);
+        for (int bank = 0; bank < 2; bank++) {
+            for (int s = 0; s < 4; s++) {
+                wr(chip, bank, (uint8_t)(0x30 + s * 4), 0x01);
+                wr(chip, bank, (uint8_t)(0x40 + s * 4), (uint8_t)(s == 3 ? 0 : 30));
+                wr(chip, bank, (uint8_t)(0x50 + s * 4), 0x1f);
+                wr(chip, bank, (uint8_t)(0x60 + s * 4), 0x08);
+                wr(chip, bank, (uint8_t)(0x80 + s * 4), 0x2f);
+            }
+            wr(chip, bank, 0xb0, (uint8_t)(0x20 | (chip * 2 + bank)));
+            wr(chip, bank, 0xb4, 0xc0);
+            wr(chip, bank, 0xa4, (uint8_t)((3 + chip + bank) << 3 | 1038 >> 8));
+            wr(chip, bank, 0xa0, (uint8_t)1038);
+        }
+    }
+    for (int step = 0; step < 3000; step++) {
+        if (step == 10) wr(0, 0, 0x28, 0xf0);
+        if (step == 300) wr(0, 0, 0x28, 0xf4);
+        if (step == 600) wr(1, 0, 0x28, 0xf0);
+        if (step == 900) { // SSG
+            wr(1, 0, 0x00, 200);
+            wr(1, 0, 0x07, 0x3e);
+            wr(1, 0, 0x08, 12);
+        }
+        if (step == 2000) wr(0, 0, 0x28, 0x00);
+        single.advance(37, &singleUnit);
+        emu.advance(37, &emuUnit);
+    }
+    emu.flushJournal();
+    journal.publish();
+    while (replayer.step(1 << 20) != 0) {
+    }
+    static int16_t a[2 * 4096], b[2 * 4096];
+    int na = single.ring().drain(a, 4096), nb = synth.ring().drain(b, 4096);
+    CHECK_EQ(na, nb);
+    int nonzero = 0, diff = 0;
+    for (int i = 0; i < 2 * na; i++) {
+        if (a[i] != b[i]) diff++;
+        if (a[i] != 0) nonzero++;
+    }
+    CHECK_EQ(diff, 0);
+    if (na < 1000 || nonzero < na) {
+        printf("  %d frames, %d samples are not zero\n", na, nonzero);
+        failures++;
+    }
+    // 記録する側は音を作っていない (出力は 0 のまま) が、レジスタとタイマーは同じ
+    CHECK_EQ(emuUnit.opnLeft(), 0);
+    CHECK_EQ(emuUnit.opn(0).reg(0, 0xb0), 0x20);
+    CHECK_EQ(emuUnit.opn(1).reg(0, 0x08), 12);
+    // ステートを保存する前に、音を作っている側から音の状態を写す。CPU の側だけが持つ値は変わらない
+    emuUnit.writeVector(0x55);
+    emuUnit.opn(0).writeAddress(1, 0x77);
+    emuUnit.copyOpnSynthFrom(*replayer.mercury());
+    CHECK_EQ(emuUnit.opnLeft(), replayer.mercury()->opnLeft());
+    CHECK_EQ(emuUnit.opn(1).envelope(0, 3), replayer.mercury()->opn(1).envelope(0, 3));
+    CHECK_EQ(emuUnit.vector(), 0x55);
+    CHECK_EQ(emuUnit.opn(0).address(), 0x77);
+    CHECK_EQ(emuUnit.opn(0).bank(), 1);
+}
+
+// YMF288 の約 55.6kHz のサンプルを 62.5kHz に直すところ: 大きさが変わらず、折り返しの成分が小さい
+void testMercuryOpnResample() {
+    printf("mercury: YMF288 output resampled to 62.5kHz\n");
+    x68k::Mercury m;
+    // S4 だけの正弦波。F-Number 1900、Block 7 は 8MHz で約 6443Hz
+    m.opnWriteReg(0, 0, 0x29, 0x83);
+    for (int s = 0; s < 4; s++) {
+        m.opnWriteReg(0, 0, (uint8_t)(0x30 + s * 4), 0x01);
+        m.opnWriteReg(0, 0, (uint8_t)(0x40 + s * 4), (uint8_t)(s == 3 ? 0 : 127));
+        m.opnWriteReg(0, 0, (uint8_t)(0x50 + s * 4), 0x1f);
+        m.opnWriteReg(0, 0, (uint8_t)(0x80 + s * 4), 0x0f);
+    }
+    m.opnWriteReg(0, 0, 0xb0, 0x07);
+    m.opnWriteReg(0, 0, 0xb4, 0xc0);
+    m.opnWriteReg(0, 0, 0xa4, (uint8_t)(7 << 3 | 1900 >> 8));
+    m.opnWriteReg(0, 0, 0xa0, (uint8_t)1900);
+    m.opnWriteReg(0, 0, 0x28, 0xf0);
+    const double tone = 1900.0 * 64 * 8000000 / 144 / 1048576; // (F-Number << Block) / 2 が 20 ビットで 1 周する位相の増分
+    const int n = 62500;
+    static double x[62500];
+    int peak = 0;
+    for (int i = 0; i < 2000; i++) m.advance(64);
+    for (int i = 0; i < n; i++) {
+        m.advance(64);
+        CHECK_EQ(m.opnLeft(), m.opnRight());
+        x[i] = m.opnLeft();
+        if (abs(m.opnLeft()) > peak) peak = abs(m.opnLeft());
+    }
+    if (peak < 8100 || peak > 8250) {
+        printf("  peak %d, want about 8168\n", peak);
+        failures++;
+    }
+    // f Hz の成分の大きさ (1 秒分の和)
+    const auto level = [n](double f) {
+        double re = 0, im = 0;
+        for (int i = 0; i < n; i++) {
+            const double w = 2 * 3.14159265358979323846 * f * i / 62500;
+            re += x[i] * cos(w);
+            im += x[i] * sin(w);
+        }
+        return sqrt(re * re + im * im);
+    };
+    // 折り返し: チップのサンプリング周波数 (55556Hz) から音の周波数を引いたものが、62.5kHz で折り返して出る
+    const double main = level(tone), alias = level(62500 - (8000000.0 / 144 - tone));
+    const double db = 20 * log10(alias / main);
+    if (db > -55) { // 線形補間では、48kHz の出力で測って約 -38dB だった
+        printf("  alias at %.1f dB below the tone, want less than -55 dB\n", db);
+        failures++;
+    }
+    // 書いていないチップしかなければ 0
+    x68k::Mercury idle;
+    for (int i = 0; i < 100; i++) idle.advance(64);
+    CHECK_EQ(idle.opnLeft(), 0);
+}
+
+// YMF288 の状態がステートに入る。版 18 までのステートを読むと、YMF288 はリセットしたときの状態になる
+void testMercuryOpnState() {
+    printf("mercury: YMF288 in the state\n");
+    Rom rom;
+    rom.code({
+        0x13fc, 0x0020, 0x00ec, 0xc0c1, 0x13fc, 0x0002, 0x00ec, 0xc0c3, // マスター: YMF288 モード
+        0x13fc, 0x00a2, 0x00ec, 0xc0cd, 0x13fc, 0x0069, 0x00ec, 0xc0cf, // スレーブ: $1A2 = $69
+        0x13fc, 0x00e4, 0x00ec, 0xc0b1,                                 // ベクタ $E4
+        0x13fc, 0x0026, 0x00ec, 0xc0c1, 0x13fc, 0x0000, 0x00ec, 0xc0c3, // タイマー B (いちばん長い周期)
+        0x13fc, 0x0027, 0x00ec, 0xc0c1, 0x13fc, 0x000a, 0x00ec, 0xc0c3,
+    });
+    static Rom rom2, rom3;
+    rom2 = rom;
+    rom3 = rom;
+    x68k::Machine a;
+    a.setMercury(true);
+    runRom(a, rom);
+    static uint8_t buf[1 << 24];
+    size_t n = 0;
+    CHECK_EQ(x68k::saveState(a, buf, sizeof buf, n), true);
+    const uint32_t left = a.mercury()->opnClocksToIrq();
+    CHECK_EQ(left > 0, true);
+
+    x68k::Machine b;
+    b.setMercury(true);
+    runRom(b, rom2, 200);
+    const char* err = nullptr;
+    CHECK_EQ(x68k::loadState(b, buf, n, err), true);
+    CHECK_EQ(b.mercury()->opn(0).newMode(), true);
+    CHECK_EQ(b.mercury()->opn(1).reg(1, 0xa2), 0x69);
+    CHECK_EQ(b.mercury()->vector(), 0xe4);
+    CHECK_EQ(b.mercury()->opnClocksToIrq(), left);
+    // 続きを動かすと、どちらも同じ時刻にタイマーのフラグが立つ
+    a.run(3000000);
+    b.run(3000000);
+    CHECK_EQ(a.mercury()->opn(0).status(), 2);
+    CHECK_EQ(b.mercury()->opn(0).status(), 2);
+    CHECK_EQ(a.cycles(), b.cycles());
+
+    // 版 18 の並び (YMF288 がない) で書いて読む: PCM の状態は戻り、YMF288 はリセットしたときの状態
+    x68k::Machine c;
+    c.setMercury(true);
+    runRom(c, rom3);
+    c.mercury()->writeCommand(0xbe);
+    size_t n18 = 0;
+    CHECK_EQ(x68k::saveState(c, buf, sizeof buf, n18, 18), true);
+    CHECK_EQ(n18 < n, true);
+    c.mercury()->writeCommand(0);
+    CHECK_EQ(x68k::loadState(c, buf, n18, err), true);
+    CHECK_EQ(c.mercury()->command(), 0xbe);
+    CHECK_EQ(c.mercury()->opn(0).newMode(), false);
+    CHECK_EQ(c.mercury()->opn(1).reg(1, 0xa2), 0x00);
+    CHECK_EQ(c.mercury()->vector(), 0xff);
+    CHECK_EQ(c.mercury()->opnClocksToIrq(), 0);
+}
+
 // ステートの保存と読み込みに、2 枚のボードの状態が入る。ボードの有無が違えば読まない
 void testBoardState() {
     printf("boards: state save / load\n");
@@ -1193,7 +1513,9 @@ void testBoardState() {
     size_t n16 = 0;
     CHECK_EQ(x68k::saveState(c, buf, sizeof buf, n16), true);
     CHECK_EQ(buf[8], x68k::STATE_VERSION);
-    CHECK_EQ(n16, n15); // 版 16 で増えたのは 2 枚目の数値演算プロセッサボードだけ (なければ同じ並び)
+    // 版 16 で増えたのは 2 枚目の数値演算プロセッサボードだけ (なければ同じ並び)。版 20 で、音を出力の周波数に直す
+    // フィルタの履歴 (256 バイト) が増えた
+    CHECK_EQ(n16, n15 + 2 * 4 * x68k::Sound::RESAMPLE_TAPS);
     CHECK_EQ(x68k::loadState(c, buf, n16, err), true);
 }
 
@@ -1261,7 +1583,7 @@ void testSecondBoardState() {
     // 1 枚の版 15 と版 16 は同じ並び
     size_t m16 = 0;
     CHECK_EQ(x68k::saveState(c, buf, sizeof buf, m16), true);
-    CHECK_EQ(m16, m15);
+    CHECK_EQ(m16, m15 + 2 * 4 * x68k::Sound::RESAMPLE_TAPS); // 版 20 の、音のフィルタの履歴の分
 
     // 2 枚のステートは、ボードのない Machine にも読まない
     x68k::Machine d;
@@ -1288,6 +1610,11 @@ int main() {
     testMercuryDma();
     testMercuryPcl();
     testMercuryJournal();
+    testMercuryOpnBus();
+    testMercuryOpnIrq();
+    testMercuryOpnJournal();
+    testMercuryOpnResample();
+    testMercuryOpnState();
     testBoardState();
     testSecondBoardState();
     if (failures) {

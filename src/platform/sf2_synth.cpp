@@ -125,6 +125,9 @@ double sqrtd(double x) {
 struct BlockHeader { // 16 バイト (中身を 16 バイトにそろえる)
     BlockHeader* prev;
     BlockHeader* next;
+#if UINTPTR_MAX == 0xffffffffu
+    BlockHeader* pad[2]; // 32 ビットのホスト (armhf など) でも 16 バイトにする
+#endif
 };
 static_assert(sizeof(BlockHeader) == 16, "header must keep 16-byte alignment");
 

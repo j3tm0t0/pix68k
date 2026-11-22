@@ -6,14 +6,15 @@
 #   (SOURCE.txt に「試しに作ったもの」と書く。配らない)
 #   配る zip は、公開リポジトリ (j3tm0t0/pix68k) の CI (.github/workflows/release.yml) で作る。origin がそれでなければ、
 #   SOURCE.txt に書くコミットが公開リポジトリにないので、警告を出して「試し」として作る
-# ベアメタル版を Raspberry Pi 3 / 4 (400) / 5 の分ビルドし (tools/build_baremetal.sh)、Raspberry Pi のファームウェア
+# ベアメタル版を Raspberry Pi 2 / 3 / 4 (400) / 5 の分ビルドし (tools/build_baremetal.sh)、Raspberry Pi のファームウェア
 # (Circle の boot/Makefile と同じ版。device tree は pix68k が対応する機種のものだけ)、config.txt、cmdline.txt、空の pix68k/ (ROM の置き方の README.txt)、
 # LICENSE、NOTICE、同梱のライブラリのライセンス、ソースの場所を書いた SOURCE.txt を入れる。
 # モニタの枠の絵 (video_filter= の cz-600de / cz-600db) は、tools/bezel_cz600d.py で描いて tools/bezel_pack.py で .bin にし、
 # pix68k/ に入れる (絵と .bin はリポジトリに入れない)。
 # IPL ROM、CGROM、ディスクのイメージ、SoundFont、MIDI の音源の ROM は入れない。最後に zip の中の一覧を調べ、
 # 決めた名前 (完全一致) 以外のファイルか、ROM やディスクのイメージに見える名前があれば zip を消して失敗する。
-# 要るもの: tools/build_baremetal.sh が要るもの (aarch64-elf-gcc か PREFIX64 のコンパイラ、rsync)、curl、zip、unzip、
+# 要るもの: tools/build_baremetal.sh が要るもの (aarch64-elf-gcc か PREFIX64 のコンパイラ、Pi 2 版の arm-none-eabi-gcc か
+# PREFIX32 のコンパイラ、rsync)、curl、zip、unzip、
 # shasum か sha256sum、python3 と numpy と Pillow (枠の絵)。ソースの URL は PIX68K_SOURCE_URL で変えられる (既定 https://github.com/j3tm0t0/pix68k)
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -57,10 +58,11 @@ mkdir -p "$OUT"
 rm -rf "$STAGE" "$ZIP"
 
 # 1. ベアメタル版のビルド
-for n in 3 4 5; do
+for n in 2 3 4 5; do
   tools/build_baremetal.sh "$n"
 done
 mkdir -p "$STAGE/pix68k" "$STAGE/overlays" "$STAGE/licenses"
+cp build/baremetal-raspi2/app/kernel7.img "$STAGE/"
 cp build/baremetal-raspi3/app/kernel8.img "$STAGE/"
 cp build/baremetal-raspi4/app/kernel8-rpi4.img "$STAGE/"
 cp build/baremetal-raspi5/app/kernel_2712.img "$STAGE/"
@@ -88,7 +90,8 @@ case $FW_REV in
   *[!0-9a-f]*|'') echo "ファームウェアの版がコミットの 16 進でない: '$FW_REV'" >&2; exit 1 ;;
 esac
 # device tree は、pix68k が対応する機種 (Raspberry Pi 4 Model B、400、5) のものだけを入れる。Circle の一覧にある
-# Zero 2 W、CM0、CM4、CM5、Raspberry Pi 500 のものは入れない (Raspberry Pi 3 は device tree を使わない)
+# Zero 2 W、CM0、CM4、CM5、Raspberry Pi 500 のものは入れない (Raspberry Pi 2 と Raspberry Pi 3 は device tree を使わない。
+# Pi 2 Model B は、device tree を置かずに起動することを実機で確かめた。#302)
 KEEP_DTB="bcm2711-rpi-4-b.dtb bcm2711-rpi-400.dtb bcm2712-rpi-5-b.dtb bcm2712d0-rpi-5-b.dtb"
 FILES=
 for f in $FW_FILES; do
@@ -143,12 +146,24 @@ fi
 
 # 3. config.txt。Circle の boot/config64.txt をもとに、pix68k に合わせて次を変えたもの:
 #    [pi4] の armstub の行を消す (FIQ を使うときだけ要る)。[pi5] の framebuffer の 2 行を有効にする (ないと Pi 5 で画面を作れない)。
-#    pix68k が動かない機種 (Zero 2 W、Pi 2) の節は入れない
+#    pix68k が動かない機種 (Zero 2 W) の節は入れない。
+#    [pi2] は 32 ビットのカーネル (kernel7.img、0x8000 に読む)。Pi 2 のカーネルは、1920x1080 ではフレームバッファを 960x540 にして
+#    2 倍の拡大を GPU に任せる (baremetal/kernel.cpp の InitScreen()。#302)。scaling_kernel=8 は、その拡大を最近傍にする
+#    (実機のモニタで、文字の輪郭がにじまないことを確かめた)。disable_overscan=1 がないと、Pi 2 のファームウェアは画面の縁を
+#    48 画素ずつ空け、表示の大きさが 2 で割り切れても 768x512 が入らなくなる
 cat > "$STAGE/config.txt" <<'EOF'
 # pix68k の config.txt (Circle の boot/config64.txt をもとにしたもの)
 arm_64bit=1
 kernel_address=0x80000
 initial_turbo=0
+
+# Raspberry Pi 2 Model B (32 ビット。X68000 の 68000 の機種だけ)
+[pi2]
+arm_64bit=0
+kernel_address=0x8000
+kernel=kernel7.img
+disable_overscan=1
+scaling_kernel=8
 
 [pi3]
 kernel=kernel8.img
@@ -181,7 +196,7 @@ IPL ROM、CGROM、ディスクのイメージは入っていない。自分で�
 
   IPLROM.DAT      X68000 の IPL ROM (128KB)。なければ X68000 は動かない
   CGROM.DAT       CGROM (768KB)。なければ文字が出ない
-  IPLROM30.DAT    X68030 と 060turbo を動かすときの IPL ROM (128KB)
+  IPLROM30.DAT    X68030 と 060turbo を動かすときの IPL ROM (128KB)。Raspberry Pi 2 では X68030 と 060turbo は動かない
   IPLROM060.DAT   060turbo の IPL ROM (なくてよい)
   fd0.xdf         FD0 に入れるフロッピーディスクのイメージ (.dim、.d88 も可)。fd1.xdf は FD1
   hd0.hdf         SASI ID 0 のハードディスクのイメージ
@@ -226,7 +241,7 @@ if [ -n "$TAG" ]; then WHERE="タグ ${TAG} (コミット ${COMMIT})"; else WHER
     echo "これは試しに作ったもの (公開リポジトリでないところでビルドしたので、下のコミットは公開リポジトリにない)。配らないこと。"
   fi
   echo
-  echo "このパッケージのカーネル (kernel8.img、kernel8-rpi4.img、kernel_2712.img) は GPLv3 で配布する。"
+  echo "このパッケージのカーネル (kernel7.img、kernel8.img、kernel8-rpi4.img、kernel_2712.img) は GPLv3 で配布する。"
   echo "同梱のライブラリのライセンスは NOTICE と licenses/ にある。カーネルを作ったソース一式は次の場所にある。"
   echo
   echo "  pix68k のソース: ${SOURCE_URL} (${WHERE})"
@@ -256,11 +271,11 @@ rm -f "$SUMS_OUT"
 (cd "$STAGE" && zip -q -r -X "$ZIP" .)
 
 # 8. 中身を調べる: 決めた名前 (完全一致) 以外のファイルと、ROM やディスクのイメージに見える名前があれば失敗する
-ALLOWED="kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt
+ALLOWED="kernel7.img kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt
 pix68k/ pix68k/README.txt pix68k/bezel-cz-600de.bin pix68k/bezel-cz-600db.bin overlays/ licenses/ licenses/mt32emu-COPYING.LESSER.txt licenses/nuked-sc55-LICENSE.txt
 licenses/tinysoundfont-LICENSE.txt $FW_FILES"
 for f in $FW_OVERLAYS; do ALLOWED="$ALLOWED overlays/$f"; done
-REQUIRED="kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt pix68k/README.txt
+REQUIRED="kernel7.img kernel8.img kernel8-rpi4.img kernel_2712.img config.txt cmdline.txt LICENSE NOTICE SOURCE.txt pix68k/README.txt
 pix68k/bezel-cz-600de.bin pix68k/bezel-cz-600db.bin
 LICENCE.broadcom COPYING.linux bootcode.bin start.elf start4.elf fixup.dat fixup4.dat
 $KEEP_DTB"

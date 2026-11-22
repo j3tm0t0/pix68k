@@ -268,19 +268,81 @@ struct FrameOverlay {
     int x = 0, y = 0, w = 0, h = 0; // フレームバッファの中の位置と大きさ
 };
 
+namespace frame_scale_detail {
+// 重ねる絵の、写す範囲に重なる横の範囲 (s.dstX からの位置)
+struct OverlaySpan {
+    const FrameOverlay* img;
+    int x0, x1;
+};
+static constexpr int MAX_OVERLAYS = 3; // presentScaled() と presentCrt() に渡せる重ねる絵の数 (右上の数字、左上のメッセージ、右下のバー)
+// ovs の n 個 (MAX_OVERLAYS まで。nullptr は飛ばす) のうち、写す範囲に横に重なるものを out に入れ、左にあるものを先に
+// 並べる。入れた数を返す
+inline int overlaySpans(const FrameOverlay* const* ovs, int n, const FrameScale& s, OverlaySpan* out) {
+    int k = 0;
+    for (int i = 0; i < n && i < MAX_OVERLAYS; i++) {
+        const FrameOverlay* o = ovs[i];
+        if (o == nullptr || o->pixels == nullptr || o->w <= 0 || o->h <= 0) continue;
+        int x0 = o->x > s.dstX ? o->x - s.dstX : 0;
+        int x1 = o->x + o->w - s.dstX;
+        if (x1 > s.dstW) x1 = s.dstW;
+        if (x0 >= x1) continue;
+        int j = k++;
+        for (; j > 0 && out[j - 1].x0 > x0; j--) out[j] = out[j - 1];
+        out[j] = OverlaySpan{o, x0, x1};
+    }
+    return k;
+}
+} // namespace frame_scale_detail
+
 // 前に写した X68000 の画面の写し (presentScaled() が、変わっていない行をフレームバッファに書かずに済ませるため)。
 // 写す役のコアだけが触る。pixels は pitch 画素 x rows 行で、src と同じ位置に、前に写した画素 (アルファを足す前) を置く。
 // valid が false なら、すべての行を写して写しを作り直す (フレームバッファをほかの処理が書いたとき、倍率が変わったとき)。
-// フレームバッファの forceY0 行目から forceY1 行目の手前までに重なる行は、変わっていなくても写す (画面の隅の数字を
-// 描いた、消したなど)。copied と skipped は、写した行と省いた行の数 (X68000 の画面の行で数える。足していく)。
+// フレームバッファの forceY0 行目から forceY1 行目の手前まで、forceY2 行目から forceY3 行目の手前までに重なる行は、
+// 変わっていなくても写す (画面の隅の数字を描いた、消したなど。force() で足す)。copied と skipped は、写した行と省いた行の数 (X68000 の画面の行で数える。足していく)。
 // scanline は前に写したときのスキャンライン。違うスキャンラインで写すときは、すべての行を写す (暗くする行が変わるため)
 struct FrameRowCache {
     uint32_t* pixels = nullptr;
     int pitch = 0, rows = 0;
     bool valid = false;
     bool scanline = false;
-    int forceY0 = 0, forceY1 = 0;
+    int forceY0 = 0, forceY1 = 0, forceY2 = 0, forceY3 = 0;
     uint32_t copied = 0, skipped = 0;
+    // fy0 行目から fy1 行目の手前までが、変わっていなくても写す範囲に重なるか
+    bool forced(int fy0, int fy1) const {
+        return (fy0 < forceY1 && fy1 > forceY0) || (fy0 < forceY3 && fy1 > forceY2);
+    }
+    // y0 行目から y1 行目の手前までを、変わっていなくても写す範囲に足す。範囲は 2 つまで持ち、空いていればそこに入れ、
+    // 両方使っていれば、合わせたときに広がりが小さいほうに合わせる (右上の数字と右下のバーが同じフレームで変わったとき、
+    // 間の変わっていない行まで写さないため)
+    void force(int y0, int y1) {
+        if (y0 >= y1) return;
+        // 範囲に足したときに増える行の数 (空の範囲なら y1 - y0)
+        auto added = [y0, y1](int a0, int a1) {
+            if (a0 >= a1) return y1 - y0;
+            return ((y1 > a1 ? y1 : a1) - (y0 < a0 ? y0 : a0)) - (a1 - a0);
+        };
+        auto join = [y0, y1](int& a0, int& a1) {
+            if (a0 >= a1) {
+                a0 = y0;
+                a1 = y1;
+            } else {
+                if (y0 < a0) a0 = y0;
+                if (y1 > a1) a1 = y1;
+            }
+        };
+        // 増える行が少ないほうに足す (同じなら 1 つ目。どちらも空なら 1 つ目に入る)
+        if (added(forceY2, forceY3) < added(forceY0, forceY1))
+            join(forceY2, forceY3);
+        else
+            join(forceY0, forceY1);
+        // 2 つの範囲が重なれば 1 つにする
+        if (forceY0 < forceY1 && forceY2 < forceY3 && forceY2 < forceY1 && forceY0 < forceY3) {
+            if (forceY2 < forceY0) forceY0 = forceY2;
+            if (forceY3 > forceY1) forceY1 = forceY3;
+            forceY2 = forceY3 = 0;
+        }
+    }
+    void clearForce() { forceY0 = forceY1 = forceY2 = forceY3 = 0; }
 };
 
 namespace frame_scale_detail {
@@ -332,7 +394,7 @@ inline bool syncRow(uint32_t* __restrict prev, const uint32_t* __restrict in, in
 
 // src (1 行 srcPitch 画素) を s のとおりに拡大して fb (1 行 fbPitch バイト) に写す。画素は不透明にする
 // (アルファが 0 だと黒く出るファームウェアがあるため)。line は s.dstW + 3 画素以上で、ふつうのメモリ。
-// ov (と ov2) があれば、重なる部分はその絵を書く。scanline が true で縦の倍率が 2 以上なら、各行の最後の 1 回を暗くする
+// ov (と ov2、ov3) があれば、重なる部分はその絵を書く。scanline が true で縦の倍率が 2 以上なら、各行の最後の 1 回を暗くする
 // (上の「スキャンライン」。line を書き換える)。
 // cache があれば、前に写したときと同じ行はフレームバッファに書かない (FrameRowCache)。比べるのはふつうのメモリどうし
 // なので、Device のメモリのフレームバッファに書くより速い (画面がほとんど変わらない起動の間やディスクを読む間に、
@@ -340,27 +402,13 @@ inline bool syncRow(uint32_t* __restrict prev, const uint32_t* __restrict in, in
 template <class Store = DeviceStore>
 inline void presentScaled(const uint32_t* src, int srcPitch, uint8_t* fb, size_t fbPitch, const FrameScale& s,
                           uint32_t* line, const FrameOverlay* ov = nullptr, FrameRowCache* cache = nullptr,
-                          bool scanline = false, const FrameOverlay* ov2 = nullptr) {
-    // 重ねる絵 (ov と ov2) の重なる横の範囲 (s.dstX からの位置)。重ならないものは数えない。左にあるものを先にする
-    struct Span {
-        const FrameOverlay* img;
-        int x0, x1;
-    } spans[2];
-    int nspans = 0;
-    const FrameOverlay* const ovs[2] = {ov, ov2};
-    for (const FrameOverlay* o : ovs) {
-        if (o == nullptr || o->pixels == nullptr || o->w <= 0 || o->h <= 0) continue;
-        int x0 = o->x > s.dstX ? o->x - s.dstX : 0;
-        int x1 = o->x + o->w - s.dstX;
-        if (x1 > s.dstW) x1 = s.dstW;
-        if (x0 >= x1) continue;
-        spans[nspans++] = Span{o, x0, x1};
-    }
-    if (nspans == 2 && spans[1].x0 < spans[0].x0) {
-        const Span t = spans[0];
-        spans[0] = spans[1];
-        spans[1] = t;
-    }
+                          bool scanline = false, const FrameOverlay* ov2 = nullptr,
+                          const FrameOverlay* ov3 = nullptr) {
+    // 重ねる絵 (ov、ov2、ov3) の重なる横の範囲 (s.dstX からの位置)。重ならないものは数えない。左にあるものを先にする
+    using Span = frame_scale_detail::OverlaySpan;
+    Span spans[frame_scale_detail::MAX_OVERLAYS];
+    const FrameOverlay* const ovs[frame_scale_detail::MAX_OVERLAYS] = {ov, ov2, ov3};
+    const int nspans = frame_scale_detail::overlaySpans(ovs, frame_scale_detail::MAX_OVERLAYS, s, spans);
     // 写しが s の写す範囲を収められなければ使わない
     if (cache != nullptr && (cache->pixels == nullptr || s.srcX + s.srcW > cache->pitch || s.srcY + s.srcH > cache->rows))
         cache = nullptr;
@@ -374,7 +422,7 @@ inline void presentScaled(const uint32_t* src, int srcPitch, uint8_t* fb, size_t
         if (cache != nullptr) {
             uint32_t* prev = cache->pixels + (size_t)(s.srcY + y) * cache->pitch + s.srcX;
             const int fy0 = s.dstY + y * ky;
-            const bool forced = all || (fy0 < cache->forceY1 && fy0 + ky > cache->forceY0);
+            const bool forced = all || cache->forced(fy0, fy0 + ky);
             if (forced) {
                 frame_scale_detail::copyPixels(prev, in, srcW);
             } else if (frame_scale_detail::syncRow(prev, in, srcW)) {
@@ -406,7 +454,7 @@ inline void presentScaled(const uint32_t* src, int srcPitch, uint8_t* fb, size_t
     if (cache != nullptr) {
         cache->valid = true;
         cache->scanline = scanline;
-        cache->forceY0 = cache->forceY1 = 0;
+        cache->clearForce();
     }
 }
 

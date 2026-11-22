@@ -913,7 +913,8 @@ void testMachine() {
         CHECK_EQ(sizes[3], sizes[2]);        // 版 13 は ADPCM の中身の並びが変わっただけ
         CHECK_EQ(x68k::STATE_SCC_RS232C, 14u);
         // 版 14 で SCC の並びが変わった: チャネルごとの 16 バイト x 2 が、40 バイト x 2 + ポインタ 4 + 時刻 8 になった
-        CHECK_EQ(sizes[4], sizes[3] + 2 * (40 - 16) + 4 + 8);
+        // 今の版は、さらに版 20 の音のフィルタの履歴 (256 バイト) が増えている
+        CHECK_EQ(sizes[4], sizes[3] + 2 * (40 - 16) + 4 + 8 + 2 * 4 * x68k::Sound::RESAMPLE_TAPS);
     }
     // 前の実装が書いた固定データ (tests/data/gen_neptune_state.cpp で作った。同じ実装で書いて読むだけだと、書く側と
     // 読む側が同時にずれても分からないため): 版 10 と版 13 を今の実装で読む

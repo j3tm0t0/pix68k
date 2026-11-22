@@ -3,7 +3,7 @@
 // 「時刻を見て、まだなら wfe」を繰り返せば、周期 1 つ分の遅れで起きられる。
 // ほかに wfe が戻るのは、どれかのコアの sev (コア 1 がコア 2 / 3 を起こすために送る)、割り込み (マスクしていなければ)。
 // 余計に起きても時刻を見て眠り直すだけなので、困ることはない。
-// イベントストリームは CNTKCTL_EL1 の設定で、コアごとに有効にする (ほかのコアには届かない)。
+// イベントストリームは CNTKCTL_EL1 (AArch32 では CNTKCTL) の設定で、コアごとに有効にする (ほかのコアには届かない)。
 #pragma once
 
 #include <circle/timer.h>
@@ -16,25 +16,50 @@ namespace event_wait {
 // 呼んだコアでイベントストリームを有効にし、周期 (us) を返す (0 なら有効にしていない)。
 // 周期は CNTFRQ_EL0 から、20us 以上で最も短いものを選ぶ (platform/event_stream.h。
 // Pi 3 の 19.2MHz で約 27us、Pi 4 / 5 の 54MHz で約 38us、QEMU の 62.5MHz で約 33us)
-inline unsigned enableStream() {
+//
+// AArch32 (Pi 2) では、カウンタは 1MHz (CLOCKHZ) で進む: ファームウェアが分周 (ARM_LOCAL_PRESCALER) を 0x6AAAAAB
+// (19.2MHz を 1MHz にする値) にしていて、Circle の CTimer は、この値と CNTFRQ = 19.2MHz を確かめたうえで、カウンタを
+// そのまま us として使う (lib/timer.cpp)。CNTFRQ の 19.2MHz は実際の周波数と違うので、CLOCKHZ から周期を決める
+// (1MHz で 32us。実機のログの時刻が外の時計と合うことは確かめた)。レジスタは CP15 の c14 (CNTKCTL は mrc / mcr p15, 0, <r>, c14, c1, 0) で、ビットの並びは同じ
+#if AARCH == 64
+typedef u64 Reg;
+inline u64 counterHz() {
     u64 frq;
     asm volatile("mrs %0, CNTFRQ_EL0" : "=r"(frq));
-    const platform::EventStreamPeriod p = platform::chooseEventStream(frq);
-    if (p.periodUs == 0) return 0;
-    u64 k;
+    return frq;
+}
+inline Reg readCntkctl() {
+    Reg k;
     asm volatile("mrs %0, CNTKCTL_EL1" : "=r"(k));
-    k &= ~(u64)0xFC;                   // EVNTEN (bit 2)、EVNTDIR (bit 3)、EVNTI (bit 4-7) を消す
-    k |= (u64)p.evnti << 4 | 1u << 2; // EVNTI、EVNTEN = 1 (カウンタの bit EVNTI が 0 から 1 になるたびにイベント)
-    asm volatile("msr CNTKCTL_EL1, %0; isb" ::"r"(k) : "memory");
+    return k;
+}
+inline void writeCntkctl(Reg k) { asm volatile("msr CNTKCTL_EL1, %0; isb" ::"r"(k) : "memory"); }
+#else
+typedef u32 Reg;
+inline u64 counterHz() { return CLOCKHZ; }
+inline Reg readCntkctl() {
+    Reg k;
+    asm volatile("mrc p15, 0, %0, c14, c1, 0" : "=r"(k));
+    return k;
+}
+inline void writeCntkctl(Reg k) { asm volatile("mcr p15, 0, %0, c14, c1, 0; isb" ::"r"(k) : "memory"); }
+#endif
+
+inline unsigned enableStream() {
+    const platform::EventStreamPeriod p = platform::chooseEventStream(counterHz());
+    if (p.periodUs == 0) return 0;
+    Reg k = readCntkctl();
+    k &= ~(Reg)0xFC;                   // EVNTEN (bit 2)、EVNTDIR (bit 3)、EVNTI (bit 4-7) を消す
+    k |= (Reg)p.evnti << 4 | 1u << 2; // EVNTI、EVNTEN = 1 (カウンタの bit EVNTI が 0 から 1 になるたびにイベント)
+    writeCntkctl(k);
     return p.periodUs;
 }
 
 // 呼んだコアでイベントストリームを止める (確かめて使わないと決めたとき)
 inline void disableStream() {
-    u64 k;
-    asm volatile("mrs %0, CNTKCTL_EL1" : "=r"(k));
-    k &= ~(u64)(1u << 2); // EVNTEN = 0
-    asm volatile("msr CNTKCTL_EL1, %0; isb" ::"r"(k) : "memory");
+    Reg k = readCntkctl();
+    k &= ~(Reg)(1u << 2); // EVNTEN = 0
+    writeCntkctl(k);
 }
 
 // 時刻 (CTimer::GetClockTicks64()) が deadline になるまで wfe で眠る。
