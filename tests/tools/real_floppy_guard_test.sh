@@ -105,7 +105,7 @@ first 'TryWrite() は何も送らずに -1 を返す' 'int CUSBFloppyDiskDevice:
 first 'Reset() は SEND DIAGNOSTIC を送らずに 0 を返す' 'int CUSBFloppyDiskDevice::Reset (' 'return 0;'
 # Command() は、入口で 5 つのコマンド以外とデータアウトを断ってから、装置に送る (ControlMessage)
 CMD=$(body "$T/o.cpp" 'int CUSBFloppyDiskDevice::Command (')
-allow=$(printf '%s\n' "$CMD" | awk '/switch \(\*\(const u8 \*\) pCmdBlk\)/ { on = 1 } on && /^\tcase / { print $2 } on && /default:/ { exit }' | sort | tr '\n' ' ')
+allow=$(printf '%s\n' "$CMD" | awk '/switch \(\*\(const u8 \*\) pCmdBlk\)/ { on = 1 } on && /^\tcase / { print $2 } on && /default:/ { exit }' | LC_ALL=C sort | tr '\n' ' ')
 want='SCSI_OP_INQUIRY: SCSI_OP_READ: SCSI_OP_READ_CAPACITY: SCSI_OP_TEST_UNIT_READY: SCSI_REQUEST_SENSE: '
 if [ "$allow" = "$want" ]; then ok 'Command() が通すのは 5 つのコマンドだけ'; else ng "Command() が通すコマンド: $allow"; fi
 order=$(printf '%s\n' "$CMD" | awk '/default:/ { d = NR } /if \(nBufLen > 0 && !bIn\)/ { o = NR } /ControlMessage/ && !c { c = NR } END { print (d && o && c && d < c && o < c) ? "ok" : "ng" }')
