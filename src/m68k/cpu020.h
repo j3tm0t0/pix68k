@@ -385,7 +385,8 @@ public:
     template <int S, bool M060> CPU020_INLINE void opCmpm(uint16_t op, For<M060>);
     template <int S, int OP, bool M060> CPU020_INLINE void opImm(uint16_t op, For<M060>);
     template <int OP> void opImmSr(uint16_t op);
-    template <int S, bool SUB, bool M060> CPU020_INLINE void opAddqSubq(uint16_t op, For<M060>);
+    template <int S, bool M060> CPU020_INLINE void opAddq(uint16_t op, For<M060>);
+    template <int S, bool M060> CPU020_INLINE void opSubq(uint16_t op, For<M060>);
     template <int S, bool M060> CPU020_INLINE void opMove(uint16_t op, For<M060>);
     template <int S, bool M060> CPU020_INLINE void opMovea(uint16_t op, For<M060>);
     CPU020_INLINE void opMoveq(uint16_t op);

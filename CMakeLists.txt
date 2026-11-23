@@ -282,6 +282,11 @@ target_link_libraries(opn3_bench x68k)
 add_executable(fdc_test tests/unit/fdc_test.cpp)
 target_link_libraries(fdc_test x68k)
 add_test(NAME fdc_test COMMAND fdc_test)
+# FUK (USB でつなぐ実物の FDC と FDD。x68k/fuk.h) を、手順を真似る偽物の装置 (tests/unit/fuk_fake.h) で確かめる
+add_executable(fuk_test tests/unit/fuk_test.cpp)
+target_link_libraries(fuk_test x68k)
+target_compile_options(fuk_test PRIVATE -Wall -Wextra)
+add_test(NAME fuk_test COMMAND fuk_test)
 add_executable(keyboard_test tests/unit/keyboard_test.cpp)
 target_link_libraries(keyboard_test x68k)
 add_test(NAME keyboard_test COMMAND keyboard_test)
@@ -309,6 +314,12 @@ target_include_directories(host_serial_test PRIVATE host src)
 target_link_libraries(host_serial_test x68k Threads::Threads)
 target_compile_options(host_serial_test PRIVATE -Wall -Wextra)
 add_test(NAME host_serial_test COMMAND host_serial_test)
+# ホスト版の FUK のシリアルポートの口 (pty の先に偽物の装置を置く) と、ベアメタル版のリング
+add_executable(host_fuk_test tests/unit/host_fuk_test.cpp host/host_fuk.cpp)
+target_include_directories(host_fuk_test PRIVATE host src tests/unit)
+target_link_libraries(host_fuk_test x68k Threads::Threads)
+target_compile_options(host_fuk_test PRIVATE -Wall -Wextra)
+add_test(NAME host_fuk_test COMMAND host_fuk_test)
 add_executable(input_map_test tests/unit/input_map_test.cpp)
 target_include_directories(input_map_test PRIVATE src)
 target_compile_options(input_map_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
@@ -414,12 +425,15 @@ add_test(NAME usb_guard_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/usb_guar
 # 実物のフロッピーディスクに書かないための仕組み (#286): Circle の USB-FDD のドライバの書き換え (tools/circle_ufd_patch.sh) の
 # 結果と、ホスト版が読み取り専用で開いて書き戻さないこと
 add_test(NAME real_floppy_guard_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/real_floppy_guard_test.sh ${CMAKE_SOURCE_DIR})
+# Circle の USB シリアルのドライバの書き換え (tools/circle_fuk_patch.sh。#295): 足した関数が入ること、書き換える行がなければ失敗すること
+add_test(NAME circle_fuk_patch_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/circle_fuk_patch_test.sh ${CMAKE_SOURCE_DIR})
 # 音の DMA の割り込み処理の書き換え (tools/circle_dma_patch.sh、#296) が、狙った所に 1 回ずつ入ること
 # (submodule の external/circle がなければ飛ばす)
 add_test(NAME circle_dma_patch_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/circle_dma_patch_test.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(circle_dma_patch_test PROPERTIES SKIP_RETURN_CODE 77)
 # あとからつないだ USB の装置 (#308): Circle の書き換え (tools/circle_hotplug_patch.sh) が、つないでから待って探し直すこと
 add_test(NAME circle_hotplug_patch_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/circle_hotplug_patch_test.sh ${CMAKE_SOURCE_DIR})
+add_test(NAME circle_genet_patch_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/circle_genet_patch_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME circle_xhci_cmd_patch_test COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tools/circle_xhci_cmd_patch_test.sh ${CMAKE_SOURCE_DIR})
 add_executable(host_real_floppy_test tests/unit/host_real_floppy_test.cpp host/real_floppy_dev.cpp)
 target_include_directories(host_real_floppy_test PRIVATE ${CMAKE_SOURCE_DIR}/host ${CMAKE_SOURCE_DIR}/tests/unit ${CMAKE_SOURCE_DIR}/src)
@@ -429,7 +443,7 @@ add_test(NAME host_real_floppy_test COMMAND host_real_floppy_test)
 # pix68k.cfg の読み書きと項目の表 (platform/config_text.h、settings.h)、設定メニュー (platform/menu.h)、
 # ベアメタル版のネットワークの口の部品 (platform/net_*.h、key_type.h)、読み書きするドライブの選び方 (platform/boot_drive.h)、
 # 起動の組み合わせ (platform/boot_profile.h)、実物のフロッピーディスクドライブからの読み出し (platform/real_floppy.h)
-foreach(t config_test menu_test file_replace_test net_test boot_drive_test boot_profile_test real_floppy_test
+foreach(t config_test menu_test file_replace_test net_test boot_drive_test boot_profile_test real_floppy_test display_select_test
           floppy_image_save_test)
   add_executable(${t} tests/unit/${t}.cpp)
   target_link_libraries(${t} x68k)
@@ -498,8 +512,9 @@ add_test(NAME state_test COMMAND state_test)
 set_tests_properties(state_test PROPERTIES TIMEOUT 600)
 
 # 本物の IPL ROM で起動して画面を書き出す。ROM (~/.cache/pix68k/rom) がなければテストは飛ばす
-add_executable(x68k_boot tests/x68k/boot_ipl.cpp)
-target_link_libraries(x68k_boot x68k)
+add_executable(x68k_boot tests/x68k/boot_ipl.cpp host/host_fuk.cpp)
+target_include_directories(x68k_boot PRIVATE host)
+target_link_libraries(x68k_boot x68k Threads::Threads)
 add_test(NAME x68k_boot_no_disk COMMAND x68k_boot -f 600 -o "" --check-no-disk)
 set_tests_properties(x68k_boot_no_disk PROPERTIES SKIP_RETURN_CODE 77)
 # Human68k を起動し、キーボードから DIR を打って一覧が出るかを見る。ROM か起動ディスクがなければ飛ばす
@@ -507,6 +522,10 @@ set(HUMAN68K_DISK "$ENV{HOME}/.cache/pix68k/disk/HUMAN302.XDF" CACHE FILEPATH "H
 add_test(NAME x68k_boot_type_dir COMMAND x68k_boot -0 ${HUMAN68K_DISK} -f 900 -o "" --type "dir\\n"
   --expect "A>dir" --expect "COMMAND            X")
 set_tests_properties(x68k_boot_type_dir PROPERTIES SKIP_RETURN_CODE 77)
+# FUK (x68k/fuk.h) の先の偽物の装置に入れたディスクから Human68k が起動し、DIR が打てて、ファイルを書けること
+add_test(NAME x68k_boot_fuk COMMAND x68k_boot --fuk ${HUMAN68K_DISK} -f 1500 -o "" --type "copy command.x fuktest.x\\ndir fuktest.x\\n"
+  --after 900 --expect "A>dir" --expect "fuktest            x")
+set_tests_properties(x68k_boot_fuk PROPERTIES SKIP_RETURN_CODE 77)
 # 10MHz (初代〜SUPER) の設定でも Human68k が起動して DIR が打てること
 add_test(NAME x68k_boot_10mhz COMMAND x68k_boot --clock 10 -0 ${HUMAN68K_DISK} -f 900 -o "" --type "dir\\n"
   --expect "A>dir" --expect "COMMAND            X")
@@ -750,7 +769,7 @@ if(PIX68K_HOST)
     find_package(SDL2 CONFIG)
   endif()
   if(SDL2_FOUND)
-    add_executable(pix68k host/main.cpp host/host_ether.cpp host/host_serial.cpp host/real_floppy_dev.cpp)
+    add_executable(pix68k host/main.cpp host/host_ether.cpp host/host_serial.cpp host/host_fuk.cpp host/real_floppy_dev.cpp)
     target_include_directories(pix68k PRIVATE src)
     target_compile_options(pix68k PRIVATE -Wall -Wextra)
     target_link_libraries(pix68k x68k midisynth SDL2::SDL2 Threads::Threads)

@@ -127,21 +127,40 @@ template <int OP> void Cpu020::opImmSr(uint16_t op) {
     else setCCR((uint8_t)v);
 }
 
-template <int S, bool SUB, bool M060> void Cpu020::opAddqSubq(uint16_t op, For<M060>) {
+// ADDQ と SUBQ は、bool のテンプレート引数で切り替えずに別の関数にする (#351)。Xcode 15 の Apple clang 15.0.0 では
+// ADDQ が SUBQ として動いた。切り替えの bool が decode の eaSpec() まで届く形を誤ってコンパイルしたと見ている (未確認)
+template <int S, bool M060> void Cpu020::opAddq(uint16_t op, For<M060>) {
     int mode = MODE, reg = REG;
     uint32_t q = REG9;
     if (q == 0) q = 8;
     if (mode == 1) {
-        a_[reg] = SUB ? a_[reg] - q : a_[reg] + q;
+        a_[reg] += q;
         return;
     }
     if (mode == 0) {
-        setD<S>(reg, SUB ? sub<S>(q, d_[reg], 0, false) : add<S>(q, d_[reg], 0, false));
+        setD<S>(reg, add<S>(q, d_[reg], 0, false));
         return;
     }
     uint32_t addr = eaAddr<M060>(mode, reg, S);
     uint32_t d = readS<S>(addr);
-    writeS<S>(addr, SUB ? sub<S>(q, d, 0, false) : add<S>(q, d, 0, false));
+    writeS<S>(addr, add<S>(q, d, 0, false));
+}
+
+template <int S, bool M060> void Cpu020::opSubq(uint16_t op, For<M060>) {
+    int mode = MODE, reg = REG;
+    uint32_t q = REG9;
+    if (q == 0) q = 8;
+    if (mode == 1) {
+        a_[reg] -= q;
+        return;
+    }
+    if (mode == 0) {
+        setD<S>(reg, sub<S>(q, d_[reg], 0, false));
+        return;
+    }
+    uint32_t addr = eaAddr<M060>(mode, reg, S);
+    uint32_t d = readS<S>(addr);
+    writeS<S>(addr, sub<S>(q, d, 0, false));
 }
 
 // ---------------------------------------------------------------- 転送

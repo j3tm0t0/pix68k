@@ -34,7 +34,8 @@ IPL ROM、CGROM、ディスクのイメージは置いていないので、そ�
 - `host-linux` (Ubuntu、GCC): ホスト版のビルドと ctest、`pico_kbd` のホストの試験
 - `host-macos` (macOS、clang): ホスト版のビルドと ctest
 - `baremetal` (Ubuntu、`aarch64-linux-gnu-gcc`): ベアメタル版 (QEMU 用の Raspberry Pi 3、Raspberry Pi 3 の 68000 だけの版、Raspberry Pi 3、Raspberry Pi 4、Raspberry Pi 5) のビルドと、
-  ROM の要らない QEMU での起動の確認 (`tools/qemu_smoke.sh`)。ベアメタル版は `PREFIX64=aarch64-linux-gnu-` でビルドする
+  ROM の要らない QEMU での起動の確認 (`tools/qemu_smoke.sh`)。ベアメタル版は `PREFIX64=aarch64-linux-gnu-` でビルドする。
+  Raspberry Pi 2 の 32 ビット版は、開発用のリポジトリの CI では `arm-none-eabi-gcc` (Arm GNU Toolchain) でビルドだけする (QEMU での起動は確かめない)。公開リポジトリの CI ではビルドしない
 
 音 (OPM の FM 音源と ADPCM) はホスト版では SDL2 で 48kHz で出す。`--no-audio` で出さない。`--wav out.wav` で、出す代わりに WAV に書く
 (`--no-wait` と組み合わせられる)。`x68k_boot` も `--wav` で WAV を書ける。

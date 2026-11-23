@@ -43,7 +43,7 @@
 //   --check-prompt: --expect "A>" と同じ (Human68k のプロンプトが出ているか)
 //   --check-no-disk: ディスクがないときの「ディスクから起動できません」がテキスト画面に出ているかを調べ、
 //                    出ていれば 0、出ていなければ 1 で終わる。ROM がなければ 77 (ctest の SKIP_RETURN_CODE)
-//   --type 文字列: -f のフレーム数だけ動かしたあと、キーボードからこの文字列を打つ (\n は改行、\p は 5 秒待つ、
+//   --type 文字列: -f のフレーム数だけ動かしたあと、キーボードからこの文字列を打つ (\n は改行、\p は 5 秒待つ、\w は 2 秒待つ、
 //                  \d は ↓、\u は ↑、\e は ESC)。
 //                  打ち終えてから --after のフレーム数 (既定 300) だけ動かす
 //   --expect 文字列: 終わったときのテキスト画面 (CGROM の 8x16 の字形で読んだもの) に、この文字列が
@@ -55,6 +55,18 @@
 //   --save-hdf ファイル: 終わったときの SASI のディスク (-h) の中身を書き出す (FORMAT.X が書いた管理情報を見るため)
 //   --save-0 ファイル: 終わったときの FD0 (-0) の中身を書き出す (XDF などのベタのイメージだけ。D88 は書き出さない)。
 //                     書き出せなければ 1 で終わる
+//   --fuk ファイル: 内蔵の FDC の代わりに FUK (x68k/fuk.h) を使い、相手に偽物の装置 (tests/unit/fuk_fake.h) を置く。
+//                  ファイルは偽物の装置のドライブ 0 に入れる 2HD の XDF。-0 / -1 は使わない
+//   --fuk-latency us: 偽物の装置の返事が届くまでの時間 (X68000 の時間で。既定 1000)
+//   --save-fuk ファイル: 終わったときの偽物の装置のディスクの中身を書き出す
+//   --fuk-ports A,B: 偽物の装置の代わりに、2 本のシリアルポート (host/host_fuk.h。実物の FUK や、
+//                  tools/pico_fukemu の hostsim の pty) につなぐ。X68000 を実時間に合わせて動かす (フレームごとに待つ)
+//   --fuk1 ファイル: 偽物の装置のドライブ 1 に入れる 2HD の XDF
+//   --fuk-realtime U:C:H:R:割合: 偽物の装置が、ユニット U の C H R から始まる Read を、R から EOT までディスクから読んだ
+//                  時刻に答える (#320。データは 1 バイトずつ読んだ時刻に送る)。割合 (%) だけ、
+//                  そのセクタを読む時間を長くする (何回でも指定できる)
+//   --fuk-head: --fuk-realtime の Read のデータを、読み始めの時刻にまとめて送る (リザルトは読み終えた時刻)
+//   --fuk-one-sector: --fuk-realtime の Read を、最初のセクタだけ読んで終える
 //   --neptune: Neptune-X をつなぎ、線の向こうに試験用の相手 (platform/ether_peer.h の EchoPeer。どの IP アドレスの
 //              ARP にも答え、ping に答える) を置く。終わったときに、相手が答えた ARP と ping の数を表示する
 //   --wav ファイル: 音 (OPM と ADPCM) を 48kHz の WAV に書く
@@ -68,6 +80,10 @@
 #include <string.h>
 #include <time.h>
 
+#include "../unit/fuk_fake.h"
+#include "../../host/host_fuk.h"
+#include <chrono>
+#include <thread>
 #include "x68k/machine.h"
 #include "x68k/render.h"
 #include "x68k/textscreen.h"
@@ -218,6 +234,9 @@ static void unescape(const char* in, char* out, size_t size) {
         } else if (in[0] == '\\' && in[1] == 'p') {
             out[n++] = '\x01'; // 待つ
             in++;
+        } else if (in[0] == '\\' && in[1] == 'w') {
+            out[n++] = '\x05'; // 少し待つ
+            in++;
         } else if (in[0] == '\\' && (in[1] == 'd' || in[1] == 'u' || in[1] == 'e')) {
             out[n++] = in[1] == 'd' ? '\x02' : in[1] == 'u' ? '\x03' : '\x04'; // ↓、↑、ESC
             in++;
@@ -285,6 +304,13 @@ int main(int argc, char** argv) {
     uint8_t* hdfData = nullptr;
     size_t hdfSize = 0;
     const char* saveFd0 = nullptr;
+    const char* fukPath = nullptr;
+    const char* saveFuk = nullptr;
+    unsigned fukLatency = 1000;
+    const char* fuk1Path = nullptr;
+    const char* fukPorts = nullptr;
+    bool fukHead = false, fukOneSector = false;
+    std::vector<FakeFuk::Realtime> fukRealtime;
     bool neptune = false;
     bool stream = false;
     static x68k::DiskCache streamCache;
@@ -355,6 +381,23 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--save-hds") && i + 1 < argc) saveHds = argv[++i];
         else if (!strcmp(argv[i], "--save-hdf") && i + 1 < argc) saveHdf = argv[++i];
         else if (!strcmp(argv[i], "--save-0") && i + 1 < argc) saveFd0 = argv[++i];
+        else if (!strcmp(argv[i], "--fuk") && i + 1 < argc) fukPath = argv[++i];
+        else if (!strcmp(argv[i], "--save-fuk") && i + 1 < argc) saveFuk = argv[++i];
+        else if (!strcmp(argv[i], "--fuk-latency") && i + 1 < argc) fukLatency = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fuk1") && i + 1 < argc) fuk1Path = argv[++i];
+        else if (!strcmp(argv[i], "--fuk-ports") && i + 1 < argc) fukPorts = argv[++i];
+        else if (!strcmp(argv[i], "--fuk-head")) fukHead = true;
+        else if (!strcmp(argv[i], "--fuk-one-sector")) fukOneSector = true;
+        else if (!strcmp(argv[i], "--fuk-realtime") && i + 1 < argc) {
+            FakeFuk::Realtime rt;
+            double pct = 0;
+            if (sscanf(argv[++i], "%d:%d:%d:%d:%lf", &rt.unit, &rt.c, &rt.h, &rt.r, &pct) != 5) {
+                fprintf(stderr, "--fuk-realtime: bad value '%s' (U:C:H:R:PERCENT)\n", argv[i]);
+                return 2;
+            }
+            rt.stretch = pct / 100.0;
+            fukRealtime.push_back(rt);
+        }
         else if (!strcmp(argv[i], "--neptune")) neptune = true;
         else if (!strcmp(argv[i], "--stream")) stream = true;
         else if (!strcmp(argv[i], "--scsi-ex-rom") && i + 1 < argc) scsiExRom = argv[++i];
@@ -470,6 +513,68 @@ int main(int argc, char** argv) {
     static x68k::FloppyImage images[2];
     uint8_t* fd0Data = nullptr;
     size_t fd0Size = 0;
+    // FUK: 偽物の装置の時間は X68000 の時間 (サイクル数) から作る。同じ入力なら、いつも同じ結果になる
+    static FakeFuk fukDev;
+    static x68k::Fuk fuk(fukDev);
+    if (fukPath) {
+        size_t size;
+        uint8_t* data = loadWhole(fukPath, size);
+        if (!data) {
+            fprintf(stderr, "cannot open disk image %s\n", fukPath);
+            return missing;
+        }
+        if (size != FakeFuk::IMAGE_BYTES) return cannotLoad("FUK disk image (not a 2HD XDF)", fukPath);
+        fukDev.image.assign(data, data + size);
+        if (fuk1Path) {
+            size_t size1;
+            uint8_t* data1 = loadWhole(fuk1Path, size1);
+            if (!data1) {
+                fprintf(stderr, "cannot open disk image %s\n", fuk1Path);
+                return missing;
+            }
+            if (size1 != FakeFuk::IMAGE_BYTES) return cannotLoad("FUK disk image (not a 2HD XDF)", fuk1Path);
+            fukDev.image1.assign(data1, data1 + size1);
+        }
+        fukDev.realtime = fukRealtime;
+        fukDev.realtimeStream = !fukHead;
+        fukDev.realtimeOneSector = fukOneSector;
+        fukDev.latencyUs = fukLatency;
+        fukDev.clock = [](void* arg) {
+            x68k::Machine* machine = (x68k::Machine*)arg;
+            return machine->cycles() * 1000000u / machine->config().cpuHz; // 試験の長さ (数分) ではあふれない
+        };
+        fukDev.clockArg = &m;
+        if (!fuk.start(1000)) {
+            fprintf(stderr, "--fuk: the fake device was not identified\n");
+            return 1;
+        }
+        m.setFuk(&fuk);
+    }
+    static x68k::Fuk* portFuk = nullptr;
+    if (fukPorts) {
+        char a[512], b[512];
+        const char* comma = strchr(fukPorts, ',');
+        if (!comma || (size_t)(comma - fukPorts) >= sizeof a) {
+            fprintf(stderr, "--fuk-ports: want PORT_A,PORT_B\n");
+            return 2;
+        }
+        snprintf(a, sizeof a, "%.*s", (int)(comma - fukPorts), fukPorts);
+        snprintf(b, sizeof b, "%s", comma + 1);
+        char err[256] = {0};
+        x68k::FukLink* link = openHostFukLinkAt(a, b, err, sizeof err);
+        if (!link) {
+            fprintf(stderr, "--fuk-ports: %s\n", err);
+            return 1;
+        }
+        portFuk = new x68k::Fuk(*link);
+        if (!portFuk->start(3000)) {
+            fprintf(stderr, "--fuk-ports: the device was not identified\n");
+            return 1;
+        }
+        m.setFuk(portFuk);
+    }
+    const auto wallStart = std::chrono::steady_clock::now();
+    const uint64_t emuStart = m.cycles();
     for (int d = 0; d < 2; d++) {
         if (!disk[d]) continue;
         if (!fileExists(disk[d])) {
@@ -623,6 +728,13 @@ int main(int argc, char** argv) {
     static int16_t audio[2 * 4096];
     auto runFrame = [&]() {
         m.runFrame();
+        if (portFuk) { // 相手は実時間で動くので、X68000 も実時間に合わせる
+            const uint64_t us = (m.cycles() - emuStart) * 1000000u / m.config().cpuHz;
+            // 眠らずに回って待つ。sleep_until() は Mac で 100 ms ほど遅れて戻ることがあり (15 ms 眠ると 120 ms 後に
+            // 戻った)、そのあと X68000 が速く動いて追いつくので、FUK のバイトを届いた時刻の間隔で渡せなくなる
+            const auto target = wallStart + std::chrono::microseconds(us);
+            while (std::chrono::steady_clock::now() < target) std::this_thread::yield();
+        }
         if (stream && hdsData) serviceStream(sd, streamCache, hdsData);
         if (!sound) return;
         int n;
@@ -669,6 +781,13 @@ int main(int argc, char** argv) {
                     // \p: キューが空になってから 300 フレーム (約 5 秒) 待つ (起動を待つときなど)
                     if (m.keyboard().queued() > 0) break;
                     for (int i = 0; i < 300; i++) runFrame();
+                    p++;
+                    break;
+                }
+                if (*p == '\x05') {
+                    // \w: キューが空になってから 120 フレーム (約 2 秒) 待つ (ゲームの画面が変わるのを待つ)
+                    if (m.keyboard().queued() > 0) break;
+                    for (int i = 0; i < 120; i++) runFrame();
                     p++;
                     break;
                 }
@@ -725,6 +844,39 @@ int main(int argc, char** argv) {
     } else if (saveFd0) {
         fprintf(stderr, "--save-0: no disk in FD0\n");
         saveFailed = true;
+    }
+    if (portFuk) {
+        const x68k::Fuk::Stats& st = portFuk->stats();
+        printf("fuk: %u reads, %u read frames, %u write frames, %u timeouts, %u stray, %u streamed reads, %u timed reads (lead %llu us, data %llu us in all)\n", st.reads,
+               st.readFrames, st.writeFrames, st.timeouts, st.stray, st.streamedReads, st.timedReads,
+               (unsigned long long)st.leadUs, (unsigned long long)st.spanUs);
+        printf("fuk: %u late reads (%u us at most); last TC after", st.lateReads, st.lateMaxUs);
+        for (unsigned i = st.tcReads > 6 ? st.tcReads - 6 : 0; i < st.tcReads; i++) printf(" %u", st.tcUs[i % 6]);
+        printf(" us\n");
+    }
+    if (fukPath) {
+        const x68k::Fuk::Stats& st = fuk.stats();
+        printf("fuk: %u late reads (%u us at most); last TC after", st.lateReads, st.lateMaxUs);
+        for (unsigned i = st.tcReads > 6 ? st.tcReads - 6 : 0; i < st.tcReads; i++) printf(" %u", st.tcUs[i % 6]);
+        printf(" us\n");
+        printf("fuk: %u reads, %u read frames, %u write frames, %u waits (%llu us, %u timed out), %u timeouts, %u stray, "
+               "%u overlapped reads, %u refused writes, %u cancelled writes, %u timed reads (lead %llu us in all)\n",
+               st.reads, st.readFrames, st.writeFrames, st.waits, (unsigned long long)st.waitUs, st.waitTimeouts,
+               st.timeouts, st.stray, fukDev.overlappedReads, st.refusedWrites, st.cancelledWrites, st.timedReads,
+               (unsigned long long)st.leadUs);
+        if (!fukRealtime.empty())
+            printf("fuk: %u real-time reads, %u streamed reads, %u timed reads\n", fukDev.realtimeReads, st.streamedReads, st.timedReads);
+        // Human68k の書き込みは DMA で行われる: 断ったものや、0 で埋めたものがあってはならない
+        if (st.timeouts != 0 || fukDev.overlappedReads != 0 || st.refusedWrites != 0 || st.cancelledWrites != 0) saveFailed = true;
+        if (saveFuk) {
+            FILE* f = fopen(saveFuk, "wb");
+            bool ok = f && fwrite(fukDev.image.data(), 1, fukDev.image.size(), f) == fukDev.image.size();
+            if (f && fclose(f) != 0) ok = false;
+            if (!ok) {
+                fprintf(stderr, "cannot write %s\n", saveFuk);
+                saveFailed = true;
+            }
+        }
     }
     if (out[0]) {
         writeScreen(screen, x68k::Renderer::MAX_WIDTH, renderer.width(), renderer.height(), out);

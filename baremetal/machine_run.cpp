@@ -50,6 +50,7 @@
 //                                           有線の Ethernet でフレームを出し入れする (net_bridge.h)
 //                         neptune_mac=...   ボードの MAC アドレス (既定 02:68:6b:00:00:01)。pi なら Pi の MAC アドレスを使う
 //                         neptune_link=eth  eth (有線の Ethernet、既定) か echo (ネットワークにつながず、ARP と ping に答える。試験用)
+//                         fuk=off           on で、USB につないだ FUK (実物の FDC と FDD) を内蔵の FDC の代わりに使う (Pi 4 / Pi 5)
 //                         rs232c=off        RS-232C (SCC のチャネル A) の相手。tcp:PORT なら net=on の TCP の PORT で待ち受け、
 //                                           つないできた相手とバイトをやり取りする (host_net.h の RS-232C)
 //                         midi=off          on なら MIDI ボード CZ-6BM1 (YM3802、$EAFA00、IRQ4) をつなぐ
@@ -63,6 +64,8 @@
 //                                           まま)。X68000 を動かし始めてから読み、読み終えるまでに送った MIDI のうち、
 //                                           音は鳴らさない (プログラムチェンジなどの設定は、読み終えたときに送り直す)
 //                         midi_voices=48    SoundFont の音源の同時に鳴らすボイスの数 (4 から 256)
+//                         vol_opm=0         音量 (dB。-40 から 12 の整数か off)。vol_opm、vol_adpcm、vol_mercury (まーきゅりーゆにっとの
+//                                           PCM)、vol_ymf288、vol_midi、vol_cd、vol_master (全体)。既定はどれも 0
 //                         midi_mt32_ctrl=.. MT-32 / CM-32L の CONTROL の ROM (64KB か 128KB。/ で始まらなければ /pix68k から)
 //                         midi_mt32_pcm=..  MT-32 / CM-32L の PCM の ROM (512KB か 1MB)。2 つとも SoundFont と同じく、
 //                                           X68000 を動かし始めてから読む
@@ -138,11 +141,14 @@
 #include "platform/net_config.h"
 #include "platform/net_files.h"
 #include "platform/real_floppy.h"
+#include "fuk_usb.h"
+#include "x68k/fuk.h"
 #include "platform/setting_warning.h"
 #include "platform/mt32_synth.h"
 #include "platform/opn_rhythm.h"
 #include "platform/sc55_synth.h"
 #include "platform/sf2_synth.h"
+#include "platform/sound_info.h"
 
 // 音の DMA が送り終えたバッファの番号を合わせ直した回数 (kernel.cpp)
 extern "C" volatile unsigned pix68k_dma_resyncs;
@@ -920,6 +926,123 @@ void CKernel::RealFloppyWaitHook() {
 // ufd1、ufd2、… と番号を付ける。ディスクを入れずに起動したドライブは数に入らず (2 台のうち 1 台目が空なら、
 // 2 台目が ufd1 になる)、起動のあとでディスクを入れ替えても気づかない (前のディスクの大きさのまま)。
 // 読み終えるまで 1 分ほどかかる (Full Speed の USB と、ドライブの回転の速さで決まる)。その間はここから戻らない
+// fuk=on: FUK (USB でつなぐ実物の FDC と FDD。x68k/fuk.h) を探し、見つかれば内蔵の FDC の代わりに使う (#295)。
+// コア 1 を動かす前に呼ぶ: USB の装置を先に探し (ふだんは X68000 を動かし始めてから探す)、FUK の 2 本のポートを
+// 見分けてから Machine に渡す (IPL ROM が FDC を見に行く前に済ませる)。見つからなければ内蔵の FDC のまま動かす
+// (あとからつないでも使わない。つないで再起動する)。使い始めたあとの抜き差しは Fuk が扱う (ServiceFuk())
+void CKernel::StartFuk(Emulator* emu) {
+    char a[platform::Settings::PATH_SIZE], b[platform::Settings::PATH_SIZE];
+    const platform::FukPorts kind = platform::parseFuk(m_Settings.fuk, a, b, sizeof a);
+    if (kind == platform::FukPorts::OFF) return;
+    if (kind == platform::FukPorts::BAD) {
+        m_Logger.Write(FromMachine, LogWarning, "fuk=%s: use off or on; using the built-in FDC", m_Settings.fuk);
+        return;
+    }
+#if RASPPI <= 3
+    // Pi 3 の USB (DWHCI) は、同じ装置に受信と送信の転送を同時に出せない (fuk_usb.h)
+    (void)emu;
+    m_Logger.Write(FromMachine, LogWarning, "fuk=%s: needs a Pi 4 or Pi 5; using the built-in FDC", m_Settings.fuk);
+#else
+    ScanUsb(false);
+    if (!m_UsbOk) {
+        m_Logger.Write(FromMachine, LogWarning, "fuk=%s: USB is not available; using the built-in FDC", m_Settings.fuk);
+        return;
+    }
+    // 起動のときにつながっている装置は、ScanUsb() が探し終えている。ハブの先などで遅れて出てくる分だけ待つ
+    static const u64 kFukWait = 2 * (u64)CLOCKHZ;
+    // リング (500KB ほど) は、FUK が見つかってから確保する (Circle は 512KB を超えるブロックを解放しても使い回さない)
+    const u64 from = CTimer::GetClockTicks64();
+    bool found = false;
+    for (;;) {
+        if (m_USBHCI.UpdatePlugAndPlay()) m_UsbDevicesPending = true;
+        found = CFukUsb::Present();
+        const u64 now = CTimer::GetClockTicks64();
+        if (found || now - from >= kFukWait) break;
+        KeepAlive();
+        IdleUntil(now + CLOCKHZ / 100);
+    }
+    if (found) {
+        m_pFukUsb = new CFukUsb;
+        found = m_pFukUsb->Scan();
+    }
+    if (found) {
+        m_pFuk = new x68k::Fuk(*m_pFukUsb);
+        m_pFuk->setLeadUs((uint32_t)m_Settings.fukLead);
+        found = m_pFuk->start(2000);
+        if (!found) {
+            const CFukUsb::Counters& c = m_pFukUsb->GetCounters();
+            m_Logger.Write(FromMachine, LogWarning,
+                           "fuk=%s: the device (USB %04x:%04x) did not answer (sent %u+%u bytes, received %u+%u, %u send failures, "
+                           "%u receive stops); using the built-in FDC",
+                           m_Settings.fuk, CFukUsb::VENDOR, CFukUsb::PRODUCT, c.txBytes[0], c.txBytes[1], c.rxBytes[0],
+                           c.rxBytes[1], c.sendFailures, c.receiveStops);
+        }
+    } else {
+        m_Logger.Write(FromMachine, LogWarning, "fuk=%s: no device (USB %04x:%04x, two serial ports) found; using the built-in FDC",
+                       m_Settings.fuk, CFukUsb::VENDOR, CFukUsb::PRODUCT);
+    }
+    if (!found) {
+        delete m_pFuk;
+        m_pFuk = nullptr;
+        delete m_pFukUsb;
+        m_pFukUsb = nullptr;
+        return;
+    }
+    emu->machine().setFuk(m_pFuk);
+    m_FukChanges = m_pFuk->linkChanges();
+    m_Logger.Write(FromMachine, LogNotice,
+                   "FUK connected (USB %04x:%04x); it replaces the built-in FDC (fd0= and fd1= are not used, states cannot be saved)",
+                   CFukUsb::VENDOR, CFukUsb::PRODUCT);
+#endif
+}
+
+// 主ループから: FUK を抜いたあとに挿し直したら、つなぎ直す (見分けは Fuk がコア 1 でやり直す)。つながりが変わったらログに出す
+void CKernel::ServiceFuk() {
+    if (m_pFukUsb == nullptr) return;
+    m_pFukUsb->Scan();
+    const unsigned changes = m_pFuk->linkChanges(); // コア 1 が書く (atomic)
+    if (changes == m_FukChanges) return;
+    m_FukChanges = changes;
+    if (m_pFuk->readyShared()) m_Logger.Write(FromMachine, LogNotice, "FUK: connected");
+    else
+        m_Logger.Write(FromMachine, LogWarning,
+                       "FUK: not connected (unplugged, not answering or a USB transfer failed); commands end with not ready. "
+                       "After a USB transfer error, unplug the device and plug it in again");
+}
+
+// FUK とのやり取りの数 (前のログから読み出しが増えたときだけ出す)。コア 1 が 4 ms に 1 回ほど見せる写しを読む
+void CKernel::ReportFuk() {
+    if (m_pFuk == nullptr) return;
+    const x68k::Fuk::Stats st = m_pFuk->snapshot();
+    if (st.reads == m_FukReadsLogged) return;
+    m_FukReadsLogged = st.reads;
+    const CFukUsb::Counters& c = m_pFukUsb->GetCounters();
+    m_Logger.Write(FromMachine, LogNotice,
+                   "fuk: %u reads (reply in %u us on average, %u us at most), %u read frames, %u write frames; waited %u times "
+                   "(%u us, %u timed out), yielded %u us; %u timeouts, %u links, %u stray bytes, %u cancelled writes",
+                   st.reads, st.replies ? (unsigned)(st.replyUs / st.replies) : 0, st.replyMaxUs, st.readFrames,
+                   st.writeFrames, st.waits, (unsigned)st.waitUs, st.waitTimeouts, (unsigned)st.yieldUs, st.timeouts, st.links,
+                   st.stray, st.cancelledWrites);
+    m_Logger.Write(FromMachine, LogNotice,
+                   "fuk usb: sent %u+%u bytes, received %u+%u, %u IPIs, %u send failures, %u receive stops, %u removals, "
+                   "%u bytes dropped",
+                   c.txBytes[0], c.txBytes[1], c.rxBytes[0], c.rxBytes[1], c.ipis, c.sendFailures, c.receiveStops, c.removals,
+                   m_pFukUsb->RxDropped());
+    if (st.timedReads != 0) {
+        // DMA の Read を届いた時刻の間隔で渡したもの (#320)。TC の長さは古いほうから並べる
+        unsigned us[6];
+        const unsigned n = st.tcReads < 6 ? st.tcReads : 6;
+        for (unsigned i = 0; i < n; i++) us[i] = st.tcUs[(st.tcReads - n + i) % 6];
+        for (unsigned i = n; i < 6; i++) us[i] = 0;
+        m_Logger.Write(FromMachine, LogNotice,
+                       "fuk: %u timed reads (%u while arriving), lead %u ms in all (%u us on average), data %u ms in all, "
+                       "%u late (%u us at most), %u stamps dropped; the last %u TC after %u %u %u %u %u %u us",
+                       st.timedReads, st.streamedReads, (unsigned)(st.leadUs / 1000), (unsigned)(st.leadUs / st.timedReads),
+                       (unsigned)(st.spanUs / 1000), st.lateReads, st.lateMaxUs, m_pFukUsb->droppedStamps(), n, us[0], us[1],
+                       us[2], us[3], us[4], us[5]);
+    }
+}
+
 bool CKernel::LoadRealFloppy(int drive, int unit) {
     typedef platform::RealFloppyReader Reader;
     // このドライブに、前に USB-FDD から読んだディスクが入っていれば、先に取り出す (同じバッファに読み直すため。
@@ -1850,6 +1973,9 @@ bool CKernel::StartMachine() {
     delete[] ipl;
     delete[] cg;
     delete[] scsiRom;
+    // 音量 (pix68k.cfg の vol_*=。#300)
+    if (ok)
+        for (int i = 0; i < platform::Settings::VOLUMES; i++) emu->setVolume((x68k::Sound::Volume)i, m_Settings.volume[i]);
     if (!ok) {
         m_Logger.Write(FromMachine, LogError, "out of memory; showing the test pattern");
         delete emu;
@@ -1901,25 +2027,28 @@ bool CKernel::StartMachine() {
     // 明示的な opt-in。接続済みの第2ディスプレイだけを使う。
     const unsigned tsPort = m_Options.GetAppOptionDecimal("pix68k_ts6bga", 0);
     if (tsPort != 0) {
-        if ((tsPort == 1 || tsPort == 2) && CBcmFrameBuffer::GetNumDisplays() >= 2) {
+        // 主の画面に選ばなかった方の口 (#329。モニタのある口を選ぶので、主の画面が番号 1 のこともある。番号 1 と決め打ちしない)
+        const DisplayChoice& dc = s_Display;
+        const int tsIndex = platform::otherDisplay(dc.info, dc.n, dc.index);
+        if ((tsPort == 1 || tsPort == 2) && CBcmFrameBuffer::GetNumDisplays() >= 2 && tsIndex >= 0) {
             CBcmPropertyTags tags;
             TPropertyTagSimple select;
-            select.nValue = 1;
+            select.nValue = (unsigned)tsIndex;
             // Pi 5 は表示サイズの変更を無視するので、ファームウェアの実サイズを使う。
             // display 選択に失敗したときは primary のバッファを確保し直さない。
             const bool selected = tags.GetTag(PROPTAG_SET_DISPLAY_NUM, &select, sizeof select, 4);
             const unsigned selectedValue = select.nValue;
             // Pi 5 は成功時も nValue=0 を返す。Circle と同じくタグの成否で判定する。
             if (selected)
-                m_TsDisplay = new CBcmFrameBuffer(0, 0, 32, 0, 0, 1);
+                m_TsDisplay = new CBcmFrameBuffer(0, 0, 32, 0, 0, (unsigned)tsIndex);
             TPropertyTagSimple depth;
             depth.nValue = 0;
             const bool initialized = m_TsDisplay && m_TsDisplay->Initialize();
             const bool depthRead = initialized && tags.GetTag(0x00040005, &depth, sizeof depth);
             bool ready = initialized && depthRead && depth.nValue == 32;
             m_Logger.Write(FromMachine, LogNotice,
-                "TS-6BGA HDMI 2: select=%u value=%u, init=%u depth-query=%u depth=%u, buffer=%X size=%u pitch=%u (%ux%u)",
-                unsigned(selected), selectedValue, unsigned(initialized), unsigned(depthRead), depth.nValue,
+                "TS-6BGA display %d (%s): select=%u value=%u, init=%u depth-query=%u depth=%u, buffer=%X size=%u pitch=%u (%ux%u)",
+                tsIndex, platform::displayIdName(dc.info[tsIndex].idKnown, dc.info[tsIndex].id), unsigned(selected), selectedValue, unsigned(initialized), unsigned(depthRead), depth.nValue,
                 m_TsDisplay ? m_TsDisplay->GetBuffer() : 0, m_TsDisplay ? m_TsDisplay->GetSize() : 0,
                 m_TsDisplay ? m_TsDisplay->GetPitch() : 0, m_TsDisplay ? m_TsDisplay->GetWidth() : 0,
                 m_TsDisplay ? m_TsDisplay->GetHeight() : 0);
@@ -1933,17 +2062,19 @@ bool CKernel::StartMachine() {
             }
             if (!ready || !emu->initTs6bga(tsPort == 2 ? 0xef0000 : 0xee0000)) {
                 delete m_TsDisplay; m_TsDisplay = nullptr;
-                m_Logger.Write(FromMachine, LogWarning, "TS-6BGA: cannot initialize HDMI 2 or allocate VRAM");
+                m_Logger.Write(FromMachine, LogWarning, "TS-6BGA: cannot initialize the second display or allocate VRAM");
             } else {
-                SetPixelOrderBgr(); // Initialize() が選んだ display 1 に設定
+                SetPixelOrderBgr(); // Initialize() が選んだ TS-6BGA の画面に設定
                 for (unsigned y = 0; y < m_TsDisplay->GetHeight(); ++y)
                     platform::frame_scale_detail::fillRow<platform::DeviceStore>((uint32_t*)(uintptr_t)
                         (m_TsDisplay->GetBuffer() + y * m_TsDisplay->GetPitch()), 0xff000000u,
                         m_TsDisplay->GetWidth());
-                m_Logger.Write(FromMachine, LogNotice, "TS-6BGA at $%X, HDMI 2 %ux%u, scanout on core 0",
-                               tsPort == 2 ? 0xef0000 : 0xee0000, m_TsDisplay->GetWidth(), m_TsDisplay->GetHeight());
+                m_Logger.Write(FromMachine, LogNotice, "TS-6BGA at $%X, %s %ux%u, scanout on core 0",
+                               tsPort == 2 ? 0xef0000 : 0xee0000,
+                               platform::displayIdName(dc.info[tsIndex].idKnown, dc.info[tsIndex].id),
+                               m_TsDisplay->GetWidth(), m_TsDisplay->GetHeight());
             }
-            select.nValue = 0;
+            select.nValue = dc.index; // 主の画面に戻す
             tags.GetTag(PROPTAG_SET_DISPLAY_NUM, &select, sizeof select, 4);
         } else {
             m_Logger.Write(FromMachine, LogWarning, "TS-6BGA: use pix68k_ts6bga=1 or 2; two connected displays required");
@@ -1967,6 +2098,7 @@ bool CKernel::StartMachine() {
             }
         }
     }
+    StartFuk(emu);
     StartSound();
     if (m_Settings.midi) StartMidi();
     // ディスクの書き戻し (write_back=on のとき) と、大きなイメージの読み込み。受け渡しのバッファはコア 1 を動かす前に確保する
@@ -2041,6 +2173,7 @@ TShutdownMode CKernel::RunMachine() {
 
     const u64 start = CTimer::GetClockTicks64();
     u64 lastSpeed = start, lastMaxSpeed = start, lastDump = start, lastSram = start, lastAlive = start;
+    platform::SoundRunClock soundClock(start);
     u64 lastDeployTry = 0;
     unsigned lastMask = 0;
     bool renderReported = false;
@@ -2068,6 +2201,7 @@ TShutdownMode CKernel::RunMachine() {
             UpdateUsbDevices();
         else
             WithComposerPresenting([this] { UpdateUsbDevices(); });
+        ServiceFuk();
         // Circle のスピンロックを QEMU で待っているコアを起こす (RunM0() を参照)
         asm volatile("sev");
         unsigned mask = __atomic_load_n(&m_Cores.startedMask, __ATOMIC_RELAXED);
@@ -2132,12 +2266,23 @@ TShutdownMode CKernel::RunMachine() {
 
         u64 now = CTimer::GetClockTicks64();
         if (now - lastSpeed >= kSpeedReportInterval * CLOCKHZ) {
-            WhileComposerPresents([this] { ReportSpeed(); });
+            WhileComposerPresents([this] {
+                ReportSpeed();
+                ReportFuk();
+            });
             lastSpeed = now;
         }
         if (m_MaxSpeed && now - lastMaxSpeed >= kMaxSpeedReportInterval * CLOCKHZ) {
             WhileComposerPresents([this] { ReportMaxSpeed(); });
             lastMaxSpeed = now;
+        }
+        // ミキサーの画面の直近 10 秒 (TakeSoundLevels()) は、X68000 が動いていた時間の 1 秒ごとに進める
+        // (platform::SoundRunClock。X68000 を止めている間 (メニュー、deploy の再起動待ち、ほかの理由でコア 1 が止まって
+        // いるとき) と、止めていた次の回の時間は数えない)
+        const bool soundPaused = m_MenuActive || m_DeployHeld || m_pEmulator->paused();
+        if (soundClock.update(now, soundPaused, CLOCKHZ)) {
+            TakeSoundLevels();
+            m_SoundWindow.tick();
         }
         ControlFan();
         if (m_FrameTimingPending) WhileComposerPresents([this] { ReportFrameTiming(); });
@@ -2853,7 +2998,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     // platform::videoFrameScale() の枠、できるまでは整数倍の枠 (枠が替わるフレームで置き直す)
     const platform::OsdRect osdRect = platform::chooseOsd(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH,
                                                           platform::osdChars(osdValue), platform::osdRows(osdValue),
-                                                          platform::osdRowsNarrow(osdValue));
+                                                          platform::osdRowsNarrow(osdValue), platform::osdRows(osdValue, false));
     // 置く場所がなければ、UpdateOsd() は温度を読まない (コア 0 が読む)
     __atomic_store_n(&m_OsdPlaced, osdRect.w > 0, __ATOMIC_RELAXED);
     const platform::OsdState::Step osd = m_OsdState.update(osdOn, osdValue, osdRect);
@@ -3086,6 +3231,8 @@ void CKernel::UpdateOsd() {
         // ネットワークの IP アドレス (縦に並べるときのいちばん下。net=on でアドレスが決まっているときだけ)。
         // UpdateOsd() はコア 0 で動くので、ネットワークのタスクと同じコアで読む
         if (m_pHostNet != nullptr) s.ipv4 = m_pHostNet->IPv4();
+        // 音源の行 (縦に並べるときの数字の下。#310)。鳴ったかは、ミキサーの画面と同じ値の、前に見てから閉じた 1 秒の区間で見る
+        platform::osdSound(s, platform::soundSources(m_Settings), m_SoundWindow.takeUnread());
         // 1 枚も合成していなければ (X68000 が止まっている) 出さない (ExpireOsd())
         PublishOsd(published != m_OsdFrames[0] ? platform::packOsd(s) : platform::OsdValue());
     }
@@ -3989,8 +4136,25 @@ void CKernel::ReportSpeed() {
 // 止めたフレームがあった区間だけ出す。音が割れるときに、振り切れているのか (止めたフレームが多い)、MIDI の音源の
 // 出力そのものが上限に張りついているのか (最大が 32767)、どちらでもないのかを見分けるためのもの。
 // MT-32 の音源が捨てたメッセージ (待ち行列が満杯) とシステムエクスクルーシブ (長すぎ) の数は、増えたときに出す
-void CKernel::ReportSoundLevels() {
+void CKernel::TakeSoundLevels() {
+    if (m_pEmulator == nullptr) return;
     const x68k::Sound::Levels lv = m_pEmulator->takeAudioLevels();
+    m_SoundWindow.add(lv);
+    x68k::Sound::mergeLevels(m_SoundLog, lv);
+}
+
+// ミキサーの画面 (設定メニューの Sound mixer) に出す値: X68000 が動いていた直近の 10 秒ほど (platform::SoundWindow)
+bool CKernel::soundInfo(SoundInfo& info) {
+    if (m_pEmulator == nullptr) return false;
+    TakeSoundLevels();
+    platform::fillSoundInfo(info, m_SoundWindow.recent(), platform::soundSources(m_Settings));
+    return true;
+}
+
+void CKernel::ReportSoundLevels() {
+    TakeSoundLevels();
+    const x68k::Sound::Levels lv = m_SoundLog;
+    m_SoundLog = {};
     if (lv.midi != 0 || lv.clipped != 0)
         m_Logger.Write(FromMachine, LogNotice, "sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix",
                        (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);

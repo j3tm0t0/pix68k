@@ -48,9 +48,10 @@ static constexpr int OSD_CHARS_MAX = OSD_CHARS + 16; // 横 1 行の上限 (「 
 static constexpr int OSD_V_COLS = 15;  // 縦に並べるときの 1 行の文字数 (「255.255.255.255」)
 static constexpr int OSD_V_ITEM = 11;  // IP アドレスのほかの行の文字数の上限 (上の注釈を参照)
 static constexpr int OSD_V_ITEMS = 8;  // IP アドレスのほかの行の数 (Pi、MPU、フレーム、速さ、ヒープ、温度、ファン、クロックを下げたか)
-static constexpr int OSD_V_ROWS = OSD_V_ITEMS + 1; // 縦に並べるときの行数の上限 (IP アドレスの行を足す)
+static constexpr int OSD_V_SOUND_ROWS = 4; // 音源の行の数の上限 (OPM と ADPCM、まーきゅりーゆにっと、MIDI、CD。#310)
+static constexpr int OSD_V_ROWS = OSD_V_ITEMS + OSD_V_SOUND_ROWS + 1; // 縦に並べるときの行数の上限 (音源と IP アドレスの行を足す)
 static constexpr int OSD_V_ROWS_NARROW = OSD_V_ROWS + 1; // 狭い並び (1 行 OSD_V_ITEM 文字) の行数の上限 (IP アドレスが 2 行)
-// formatOsdRows() が作る文字数の上限 (横 1 行より多い。狭い並びの OSD_V_ITEM * OSD_V_ROWS_NARROW = 110 より多い)
+// formatOsdRows() が作る文字数の上限 (横 1 行より多い。狭い並びの OSD_V_ITEM * OSD_V_ROWS_NARROW = 154 より多い)
 static constexpr int OSD_TEXT_MAX = OSD_V_COLS * OSD_V_ROWS;
 // 絵の画素数の上限 (縦に並べて、いちばん多い行数のとき。横 1 行は OSD_CHARS_MAX * 8 * 16 で、これより小さい)
 static constexpr int OSD_IMAGE_PIXELS = OSD_V_COLS * 8 * OSD_V_ROWS * 16;
@@ -58,6 +59,18 @@ static constexpr int OSD_MODE_OFF = 0, OSD_MODE_FPS = 1, OSD_MODE_ON = 2; // Set
 static constexpr int OSD_PAD_X = 8;    // 画面の右端からの間 (画素)
 static constexpr int OSD_PAD_Y = 4;    // 画面の上端からの間 (画素)
 static constexpr uint32_t OSD_FG = 0xffffffffu, OSD_BG = 0xff000000u;
+static constexpr uint32_t OSD_DIM = 0xff707070u; // 鳴っていない音源の名前の色 (#310)
+// 縦に並べるときの文字のうち、bit 7 を立てた文字は OSD_DIM で描く (renderOsdRow())。文字は 0x20〜0x7e なので bit 7 は空いている
+static constexpr unsigned OSD_DIM_BIT = 0x80;
+// 音源 (OsdStats::soundSources、soundActive のビット。#310)
+enum OsdSound {
+    OSD_SND_OPM = 1, OSD_SND_ADPCM = 2, OSD_SND_PCM = 4, OSD_SND_OPN = 8, OSD_SND_MIDI = 16, OSD_SND_CD = 32,
+    OSD_SND_ALL = 63
+};
+// MIDI の行き先 (Settings::midiOut、0 sf2、1 uart、2 none、3 mt32、4 sc55) の短い名前 (画面に出す。5 文字まで)
+inline const char* osdMidiOutName(int midiOut) {
+    return midiOut == 0 ? "SF2" : midiOut == 1 ? "UART" : midiOut == 3 ? "MT-32" : midiOut == 4 ? "SC-55" : "none";
+}
 // 詰められるいちばん大きい値 (これより大きい値はこの値にする)
 static constexpr unsigned OSD_FPS_DECI_MAX = 9999; // fps (0.1 単位。999.9)
 static constexpr unsigned OSD_COUNT_MAX = 999;     // 置き換わった数、速さ (%)
@@ -134,6 +147,10 @@ struct OsdStats {
     int pi = OSD_PI_NONE;                     // Raspberry Pi のモデル (OsdPi)。OSD_PI_NONE なら出さない (縦に並べるときだけ出す)
     unsigned armMHz = 0;                      // ARM のクロック (MHz。osdArmMHzShown() で丸めた値。0 ならモデルだけ出す)
     uint32_t ipv4 = 0;                        // IP アドレス (192.168.1.27 なら 0xc0a8011b)。0 なら出さない (縦でも横 1 行でも出す)
+    // 音源 (#310。縦に並べるときだけ、数字の下、IP アドレスの上に出す)。soundSources はつないでいる音源 (OsdSound のビット。
+    // 0 なら音源の行を出さない)、soundActive はそのうち直近 1 秒に鳴ったもの (鳴っていない音源は灰色)、midiOut は MIDI の行き先
+    unsigned soundSources = 0, soundActive = 0;
+    int midiOut = 0;
 };
 
 // 詰めた数字。a が 0 なら「まだ数字がない」(a の bit 63 が 1 なら数字がある)。下位からの並び:
@@ -142,7 +159,7 @@ struct OsdStats {
 //   b: 0-2 ファンの段階に 1 を足した値 (0 なら出さない)、3-13 回転数 (10rpm 単位)、14-23 ヒープの MB に 1 を足した値
 //      (0 なら出さない)、24-25 MPU (0 出さない、1 68000、2 68030、3 68060)、26-33 MPU のクロック (MHz)、
 //      34-38 Pi のモデル (OsdPi)、39-47 ARM のクロック (10MHz 単位)、48-61 最高速モードの実効のクロック (MHz。0 なら出さない)
-//   c: 0-31 IP アドレス (0 なら出さない。上位 32 ビットは使わない)
+//   c: 0-31 IP アドレス (0 なら出さない)、32-37 つないでいる音源、38-43 鳴った音源、44-46 MIDI の行き先 (#310)
 struct OsdValue {
     uint64_t a = 0, b = 0, c = 0;
     bool valid() const { return a != 0; }
@@ -174,6 +191,8 @@ inline OsdValue packOsd(const OsdStats& s) {
     if (s.pi > OSD_PI_NONE && s.pi < OSD_PI_COUNT)
         v.b |= (uint64_t)s.pi << 34 | ((capTo(s.armMHz, OSD_ARM_MHZ_MAX) + 5) / 10) << 39;
     v.c = s.ipv4;
+    v.c |= (uint64_t)(s.soundSources & OSD_SND_ALL) << 32 | (uint64_t)(s.soundActive & s.soundSources & OSD_SND_ALL) << 38 |
+           (uint64_t)(s.midiOut >= 0 && s.midiOut <= 4 ? s.midiOut : 2) << 44;
     return v;
 }
 
@@ -202,6 +221,10 @@ inline OsdStats unpackOsd(const OsdValue& v) {
     s.pi = pi < OSD_PI_COUNT ? (int)pi : OSD_PI_OTHER;
     s.armMHz = s.pi != OSD_PI_NONE ? (unsigned)(v.b >> 39 & 511) * 10 : 0;
     s.ipv4 = (uint32_t)v.c;
+    s.soundSources = (unsigned)(v.c >> 32 & OSD_SND_ALL);
+    s.soundActive = (unsigned)(v.c >> 38 & OSD_SND_ALL) & s.soundSources;
+    const unsigned midi = (unsigned)(v.c >> 44 & 7);
+    s.midiOut = midi <= 4 ? (int)midi : 2;
     return s;
 }
 
@@ -226,6 +249,10 @@ struct Text {
     void ch(char c) { buf[n++] = c; }
     void str(const char* s) {
         while (*s) buf[n++] = *s++;
+    }
+    // bright でなければ OSD_DIM で描く文字にして足す (縦に並べるときだけ使う)
+    void str(const char* s, bool bright) {
+        while (*s) buf[n++] = (char)(bright ? *s++ : ((unsigned char)*s++ | OSD_DIM_BIT));
     }
     void num(unsigned v) {
         char d[10];
@@ -328,6 +355,44 @@ inline void ipTwoRows(Text& a, Text& b, uint32_t ip) {
     b.ch('.');
     b.num(ip & 255);
 }
+
+// 音源の行 (#310)。つないでいる音源を、1 行 1 つの組で out[0] から順に作り、作った行の数を返す (OSD_V_SOUND_ROWS まで)。
+// 鳴っていない音源の名前は OSD_DIM_BIT を立てる。並びは「OPM ADPCM」「MERC PCM+OPN3」(狭い並びでは「PCM+OPN3」)、
+// 「MIDI:MT-32」、「CD」。MIDI の行き先が UART のときは、鳴ったかが分からないので明るく出す
+inline int soundRows(Text* out, const OsdStats& s, bool narrow) {
+    const unsigned src = s.soundSources, on = s.soundActive;
+    if (src == 0) return 0;
+    int k = 0;
+    out[k].str("OPM", (on & OSD_SND_OPM) != 0);
+    out[k].ch(' ');
+    out[k].str("ADPCM", (on & OSD_SND_ADPCM) != 0);
+    k++;
+    if (src & (OSD_SND_PCM | OSD_SND_OPN)) {
+        if (!narrow) out[k].str("MERC ", (on & (OSD_SND_PCM | OSD_SND_OPN)) != 0);
+        out[k].str("PCM", (on & OSD_SND_PCM) != 0);
+        out[k].str("+", (on & (OSD_SND_PCM | OSD_SND_OPN)) != 0);
+        out[k].str("OPN3", (on & OSD_SND_OPN) != 0);
+        k++;
+    }
+    if (src & OSD_SND_MIDI) {
+        const bool bright = s.midiOut == 1 || (on & OSD_SND_MIDI) != 0;
+        out[k].str("MIDI:", bright);
+        out[k].str(osdMidiOutName(s.midiOut), bright);
+        k++;
+    }
+    if (src & OSD_SND_CD) {
+        out[k].str("CD", (on & OSD_SND_CD) != 0);
+        k++;
+    }
+    return k;
+}
+
+// 音源の行の数 (soundRows() が作る数)
+inline int soundRowCount(const OsdStats& s) {
+    if (s.soundSources == 0) return 0;
+    return 1 + ((s.soundSources & (OSD_SND_PCM | OSD_SND_OPN)) ? 1 : 0) + ((s.soundSources & OSD_SND_MIDI) ? 1 : 0) +
+           ((s.soundSources & OSD_SND_CD) ? 1 : 0);
+}
 } // namespace osd_detail
 
 // packed を横 1 行で出すときの文字数。「THR」(4 文字) は出すときだけ足す
@@ -343,12 +408,13 @@ inline int osdChars(const OsdValue& packed) {
     return n;
 }
 
-// packed を縦に並べるときの行数 (formatOsdRows() が作る、最後の空でない行まで)。数字がなければ OSD_V_ITEMS
-inline int osdRows(const OsdValue& packed) {
+// packed を縦に並べるときの行数 (formatOsdRows() が作る、最後の空でない行まで)。数字がなければ OSD_V_ITEMS。
+// sound が false なら音源の行 (#310) を数えない (X68000 の画面に重ねるときは音源の行を出さない)
+inline int osdRows(const OsdValue& packed, bool sound = true) {
     if (!packed.valid()) return OSD_V_ITEMS;
     const OsdStats s = unpackOsd(packed);
     int n = s.throttled ? 8 : s.fanLevel >= 0 ? 7 : s.tempDeciC >= 0 ? 6 : s.heapMB >= 0 ? 5 : 4; // 速さの行 (4 行目) はいつもある
-    return n + (packed.hasIp() ? 1 : 0);
+    return n + (sound ? osd_detail::soundRowCount(s) : 0) + (packed.hasIp() ? 1 : 0);
 }
 
 // 狭い並び (1 行 OSD_V_ITEM 文字) のときの行数。IP アドレスが 11 文字を超えるときは 2 行に分けるので 1 行多い
@@ -391,7 +457,9 @@ inline void formatOsd(char* out, const OsdValue& packed, int width = OSD_CHARS) 
 // 数字がなければ空白だけ。
 // cols が OSD_V_ITEM なら狭い並び: 1 行 cols 文字に右寄せし、IP アドレスが入らなければ 2 行に分ける (rows は
 // osdRowsNarrow() の値、OSD_V_ROWS_NARROW まで)。cols は OSD_V_COLS か OSD_V_ITEM (ほかの値は OSD_V_COLS として扱う)
-inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_ITEMS, int cols = OSD_V_COLS) {
+// sound が false なら音源の行 (#310) を出さない (X68000 の画面に重ねるとき。IP アドレスは数字のすぐ下に来る)
+inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_ITEMS, int cols = OSD_V_COLS,
+                          bool sound = true) {
     const bool narrow = cols == OSD_V_ITEM;
     if (!narrow) cols = OSD_V_COLS;
     const int maxRows = narrow ? OSD_V_ROWS_NARROW : OSD_V_ROWS;
@@ -444,9 +512,11 @@ inline void formatOsdRows(char* out, const OsdValue& packed, int rows_ = OSD_V_I
             }
         }
         if (s.throttled) rows[7].str("THROTTLED");
+        // 音源の行 (#310) は数字の最後の行のすぐ下、IP アドレスはその下
+        int k = OSD_V_ITEMS;
+        while (k > 0 && rows[k - 1].n == 0) k--;
+        if (sound) k += osd_detail::soundRows(rows + k, s, narrow);
         if (packed.hasIp()) {
-            int k = OSD_V_ITEMS;
-            while (k > 0 && rows[k - 1].n == 0) k--;
             if (narrow && osd_detail::ipNeedsTwoRows(s.ipv4))
                 osd_detail::ipTwoRows(rows[k], rows[k + 1], s.ipv4);
             else
@@ -510,8 +580,10 @@ inline OsdRect placeOsdVertical(int fbW, int fbH, int picX, int picY, int picW, 
 // 置く場所を決める (このファイルの先頭の 1. から 3.)。mode は Settings::osd。chars は横 1 行にするときの文字数
 // (osdChars())、rows は縦に並べるときの行数 (osdRows())、rowsNarrow は狭い並びの行数 (osdRowsNarrow()。0 以下なら
 // 狭い並びは使わない)
+// rowsOverlay は、縦に並べて X68000 の画面に重ねるときの行数 (osdRows(packed, false)。音源の行を出さず、隠す範囲を
+// 広げない。0 以下なら rows)
 inline OsdRect chooseOsd(int mode, int fbW, int fbH, int picX, int picY, int picW, int picH, int chars = OSD_CHARS,
-                         int rows = OSD_V_ITEMS, int rowsNarrow = 0) {
+                         int rows = OSD_V_ITEMS, int rowsNarrow = 0, int rowsOverlay = 0) {
     if (mode == OSD_MODE_OFF) return OsdRect();
     const OsdRect v = placeOsdVertical(fbW, fbH, picX, picY, picW, picH, rows);
     if (v.w > 0 && !v.overlay) return v;
@@ -521,7 +593,9 @@ inline OsdRect chooseOsd(int mode, int fbW, int fbH, int picX, int picY, int pic
     }
     const OsdRect h = placeOsd(fbW, fbH, picX, picY, picW, picH, 1, chars);
     if (h.w > 0 && !h.overlay) return h;
-    if (v.w > 0) return v;
+    // ここまで来たら、縦に並べるのは重なるか入らないかのどちらか。重ねるときは音源の行を除いた高さにする
+    const OsdRect vo = rowsOverlay > 0 ? placeOsdVertical(fbW, fbH, picX, picY, picW, picH, rowsOverlay) : v;
+    if (vo.w > 0) return vo;
     if (h.overlay && mode != OSD_MODE_FPS) return OsdRect();
     return h;
 }
@@ -532,10 +606,12 @@ inline void renderOsdRow(uint32_t* line, const char* text, int y, int scale, int
     int x = 0;
     for (int i = 0; i < chars; i++) {
         unsigned c = (unsigned char)text[i];
+        const uint32_t fg = (c & OSD_DIM_BIT) ? OSD_DIM : OSD_FG; // 鳴っていない音源の名前 (#310)
+        c &= ~OSD_DIM_BIT;
         if (c < (unsigned)MENU_FONT_FIRST || c > (unsigned)MENU_FONT_LAST) c = ' ';
         const uint8_t bits = kMenuFont[c - MENU_FONT_FIRST][gy];
         for (int b = 0; b < 8; b++) {
-            const uint32_t px = (bits & (0x80 >> b)) ? OSD_FG : OSD_BG;
+            const uint32_t px = (bits & (0x80 >> b)) ? fg : OSD_BG;
             for (int k = 0; k < scale; k++) line[x++] = px;
         }
     }
@@ -575,7 +651,11 @@ inline void renderOsd(uint32_t* image, const OsdRect& r, const OsdValue& packed)
     }
     // 幅で並びが分かる (OSD_V_COLS 文字か、狭い並びの OSD_V_ITEM 文字)
     const int cols = osdIsNarrow(r) ? OSD_V_ITEM : OSD_V_COLS;
-    formatOsdRows(text, packed, r.h / (16 * r.scale), cols);
+    // 場所の高さが音源の行 (#310) を入れた行数に足りないとき (X68000 の画面に重ねるので、音源の行を除いた高さにしたとき) は、
+    // 音源の行を出さない
+    const int rows = r.h / (16 * r.scale);
+    const bool sound = rows >= (cols == OSD_V_ITEM ? osdRowsNarrow(packed) : osdRows(packed));
+    formatOsdRows(text, packed, rows, cols, sound);
     const int rowH = 16 * r.scale;
     for (int y = 0; y < r.h; y++)
         renderOsdRow(image + (size_t)y * r.w, text + (y / rowH) * cols, y % rowH, r.scale, cols);

@@ -50,10 +50,15 @@
 //   --neptune-mac M  ボードの MAC アドレス (既定 02:68:6b:00:00:01)
 //   --rs232c SPEC    RS-232C (SCC のチャネル A) の相手 (設定ファイルの rs232c=)。tcp:PORT で 127.0.0.1 の PORT に待ち受け、
 //                    tcp:ADDR:PORT で ADDR に待ち受ける。off (既定) はつながない (host_serial.h)
+//   --fuk SPEC       FUK (USB でつなぐ実物の FDC と FDD) を、内蔵の FDC の代わりに使う (設定ファイルの fuk=)。
+//                    on で Linux のポートの名前から探し、PORT_A,PORT_B で 2 本のシリアルポートの名前を書く (host_fuk.h)。
+//                    使っている間は -0 / -1 のイメージを使わず、ステートは保存できない。見つからなければ内蔵の FDC のまま動かす
 //   --midi           MIDI ボード CZ-6BM1 (YM3802、$EAFA00、IRQ4) をつなぐ (--no-midi で外す)
 //   --midi-sf2 FILE  MIDI ボードが送った MIDI を、この SoundFont (SF2) で鳴らして音に混ぜる。--midi も付けたことになる
 //                    (指定しなければ、送った MIDI は捨てる)
 //   --midi-voices N  SoundFont の音源の同時に鳴らすボイスの数 (4-256、既定 48)
+//   --vol NAME=dB    音量。NAME は opm、adpcm、mercury (まーきゅりーゆにっとの PCM)、ymf288、midi、cd、master (全体)。
+//                    dB は -40 から 12 の整数か off (既定は 0)。何度でも書ける。設定ファイルでは vol_opm=-6 のように書く
 //   --midi-out OUT   MIDI の音源: sf2 (既定。--midi-sf2 の SoundFont)、mt32 (--midi-mt32-ctrl と --midi-mt32-pcm の
 //                    ROM で Munt を鳴らす)、sc55 (--midi-sc55 の ROM で Nuked-SC55 を鳴らす)、none (捨てる)。
 //                    uart (ベアメタル版で UART から実機の音源に送るバイト列を、--midi-dump のファイルに書く)
@@ -123,6 +128,7 @@
 #include <vector>
 
 #include "host_ether.h"
+#include "host_fuk.h"
 #include "host_serial.h"
 #include "real_floppy_dev.h"
 
@@ -142,6 +148,7 @@
 #include "platform/sf2_synth.h"
 #include "platform/uart_midi.h"
 #include "platform/time_arg.h"
+#include "platform/sound_info.h"
 #include "platform/wav_file.h"
 #include "platform/test_pattern.h"
 #include "x68k/machine.h"
@@ -654,7 +661,9 @@ private:
 };
 
 // ウィンドウのタイトル: キーボードの LED (点灯しているもの) とマウスの状態
-void makeTitle(uint8_t leds, bool captured, char* out, size_t size) {
+// sources は使える音源の 1 行 (platform::soundSourcesLine()。#310。ホスト版の画面の隅の数字は横 1 行で入らないので、
+// ウィンドウのタイトルに出す)。nullptr なら出さない
+void makeTitle(uint8_t leds, bool captured, char* out, size_t size, const char* sources = nullptr) {
     static const struct {
         uint8_t bit;
         const char* name;
@@ -665,6 +674,8 @@ void makeTitle(uint8_t leds, bool captured, char* out, size_t size) {
         {x68k::Keyboard::LED_ZENKAKU, "全角"},
     };
     int n = snprintf(out, size, "pix68k");
+    if (sources != nullptr && sources[0] != 0 && n >= 0 && (size_t)n < size)
+        n += snprintf(out + n, size - (size_t)n, " (%s)", sources);
     for (const auto& l : kLeds)
         if (!(leds & l.bit) && n >= 0 && (size_t)n < size) n += snprintf(out + n, size - (size_t)n, " [%s]", l.name);
     if (n >= 0 && (size_t)n < size)
@@ -873,9 +884,12 @@ struct Options {
     char neptuneMac[platform::Settings::PATH_SIZE] = {0};  // その MAC アドレス (空なら既定)
     char neptuneLink[platform::Settings::PATH_SIZE] = {0}; // フレームの送受信の先 (空なら echo)
     char rs232c[platform::Settings::PATH_SIZE] = {0};      // RS-232C の相手 (空ならつながない)
+    char fuk[platform::Settings::PATH_SIZE] = {0};         // FUK (空なら使わない)
+    int fukLead = 0;                                        // fuk_lead= (us。0 なら自動)
     bool midi = false;            // MIDI ボード
     char midiSf2[1024] = {0};     // その音源の SoundFont (空なら鳴らさない)
     int midiVoices = 48;
+    int volume[platform::Settings::VOLUMES] = {}; // --vol / vol_*= (音源ごとの音量と全体の音量。dB。x68k::Sound::Volume の順)
     int midiOut = 0;              // MIDI の音源 (platform::Settings::midiOut と同じ値。0 sf2、1 uart、2 none、3 mt32)
     char midiMt32Ctrl[1024] = {0}; // MT-32 の音源の ROM
     char midiMt32Pcm[1024] = {0};
@@ -1061,9 +1075,12 @@ void applySettings(const platform::Settings& s, Options& opt) {
     platform::copyString(opt.neptuneMac, sizeof opt.neptuneMac, s.neptuneMac);
     platform::copyString(opt.neptuneLink, sizeof opt.neptuneLink, s.neptuneLink);
     platform::copyString(opt.rs232c, sizeof opt.rs232c, s.rs232c);
+    platform::copyString(opt.fuk, sizeof opt.fuk, s.fuk);
+    opt.fukLead = s.fukLead;
     opt.midi = s.midi != 0;
     configPath(opt.config, s.midiSf2, opt.midiSf2, sizeof opt.midiSf2);
     opt.midiVoices = s.midiVoices;
+    for (int i = 0; i < platform::Settings::VOLUMES; i++) opt.volume[i] = s.volume[i];
     opt.midiOut = s.midiOut;
     configPath(opt.config, s.midiMt32Ctrl, opt.midiMt32Ctrl, sizeof opt.midiMt32Ctrl);
     configPath(opt.config, s.midiMt32Pcm, opt.midiMt32Pcm, sizeof opt.midiMt32Pcm);
@@ -1182,9 +1199,12 @@ platform::Settings runningSettings(const Options& opt) {
     platform::copyString(s.neptuneMac, sizeof s.neptuneMac, opt.neptuneMac);
     platform::copyString(s.neptuneLink, sizeof s.neptuneLink, opt.neptuneLink);
     platform::copyString(s.rs232c, sizeof s.rs232c, opt.rs232c);
+    platform::copyString(s.fuk, sizeof s.fuk, opt.fuk);
+    s.fukLead = opt.fukLead;
     s.midi = opt.midi;
     platform::copyString(s.midiSf2, sizeof s.midiSf2, opt.midiSf2);
     s.midiVoices = opt.midiVoices;
+    for (int i = 0; i < platform::Settings::VOLUMES; i++) s.volume[i] = opt.volume[i];
     s.midiOut = opt.midiOut;
     platform::copyString(s.midiMt32Ctrl, sizeof s.midiMt32Ctrl, opt.midiMt32Ctrl);
     platform::copyString(s.midiMt32Pcm, sizeof s.midiMt32Pcm, opt.midiMt32Pcm);
@@ -1609,6 +1629,39 @@ public:
     }
     const platform::Settings& restartSettings() const { return restart_; }
     void osdChanged(int osd) override { opt_.osd = osd; }
+    // 音のミキサー (#300)。音量はこの Machine の Sound にすぐ渡す。ミキサーの画面の最大は、X68000 が動いていた直近の
+    // 10 秒ほど (メニューを閉じている間、X68000 の 1 秒ごとに tickSound() で進める)
+    bool hasMixer() const override { return true; }
+    void volumeChanged(int group, int dB) override {
+        opt_.volume[group] = dB;
+        m_.sound().setVolume((x68k::Sound::Volume)group, dB);
+    }
+    // 音の大きさを取り、画面に出す直近 10 秒と、終わるときのログに出す分の両方に足す
+    void takeSound() {
+        const x68k::Sound::Levels lv = m_.sound().takeLevels();
+        soundWindow_.add(lv);
+        x68k::Sound::mergeLevels(levelsSeen, lv);
+    }
+    void tickSound() {
+        takeSound();
+        soundWindow_.tick();
+    }
+    // 使える音源 (ミキサーの画面と、ウィンドウのタイトル。#310)
+    platform::SoundSources sources() const {
+        platform::SoundSources src;
+        src.mercury = opt_.mercury;
+        src.cd = opt_.cd[0] != 0;
+        src.midi = opt_.midi;
+        src.midiOut = opt_.midiOut;
+        return src;
+    }
+    bool soundInfo(SoundInfo& info) override {
+        takeSound();
+        platform::fillSoundInfo(info, soundWindow_.recent(), sources());
+        return true;
+    }
+    x68k::Sound::Levels levelsSeen = {}; // takeSound() が取った分の合計 (終わるときのログに出す)
+    platform::SoundWindow soundWindow_;
     // ホスト版はどの組み合わせも選べる
     bool hasVideo() const override { return true; }
     void videoChanged(int scale, int filter) override {
@@ -1795,6 +1848,8 @@ int runMachine(Options& opt) {
     bool restart = false;
     std::unique_ptr<x68k::EtherLink> etherLink; // Neptune-X の送受信の口 (Machine を消したあとに閉じる)
     std::unique_ptr<x68k::SerialLink> serialLink; // RS-232C の相手 (同じく Machine を消したあとに閉じる)
+    std::unique_ptr<x68k::FukLink> fukLink;       // FUK のシリアルポート (同じく)
+    std::unique_ptr<x68k::Fuk> fuk;               // FUK (fukLink より先に消す)
     std::unique_ptr<x68k::MidiOut> midiSynth; // MIDI ボードの音源 (Machine を消したあとに消す)
     std::unique_ptr<x68k::MidiOut> midiTee;   // --midi-dump で音源に渡すバイトを書くとき (midiSynth より先に消す)
     static uint8_t ipl[x68k::Machine::IPL_SIZE], cg[x68k::Machine::CG_SIZE];
@@ -1909,6 +1964,25 @@ int runMachine(Options& opt) {
         }
         m->setSerialLink(serialLink.get());
     }
+    if (opt.fuk[0]) {
+        // FUK: 見つかって見分けられたら、内蔵の FDC の代わりに使う。だめなら内蔵の FDC のまま動かす
+        char err[256] = {0};
+        fukLink.reset(openHostFukLink(opt.fuk, err, sizeof err));
+        if (!fukLink) {
+            if (err[0]) fprintf(stderr, "fuk: %s; using the built-in FDC\n", err);
+        } else {
+            fuk.reset(new x68k::Fuk(*fukLink));
+            fuk->setLeadUs((uint32_t)opt.fukLead);
+            if (fuk->start(3000)) {
+                m->setFuk(fuk.get());
+                printf("FUK: connected (%s); the built-in FDC and -0 / -1 are not used\n", opt.fuk);
+            } else {
+                fprintf(stderr, "fuk: no answer from the device on %s; using the built-in FDC\n", opt.fuk);
+                fuk.reset();
+                fukLink.reset();
+            }
+        }
+    }
     // SCSI の装置: 外付け SCSI ボードがあればそちら、なければ内蔵 SCSI (X68030 と 060turbo)
     static ScsiUnit units[8];
     for (int id = 0; id < 8; id++) {
@@ -2003,6 +2077,11 @@ int runMachine(Options& opt) {
     m->setLineListener(&renderer);
     static platform::WavFile wav;
     static int16_t audioBuf[2 * 4096];
+    // 音量 (#300)。音を作るのはこの Machine の Sound
+    // 設定の音量 (Settings::volume) と Sound の音量は、同じ並び、同じ無音の値 (#300)
+    static_assert(platform::Settings::VOLUMES == x68k::Sound::VOL_COUNT, "volume groups differ");
+    static_assert(platform::Settings::VOLUME_OFF == x68k::Sound::VOLUME_OFF, "VOLUME_OFF differs");
+    for (int i = 0; i < platform::Settings::VOLUMES; i++) m->sound().setVolume((x68k::Sound::Volume)i, opt.volume[i]);
     SDL_AudioDeviceID audioDev = 0;
     if (opt.wav) {
         m->sound().setOutputRate(48000);
@@ -2036,6 +2115,7 @@ int runMachine(Options& opt) {
     const uint64_t freq = SDL_GetPerformanceFrequency();
     const double cpuHz = (double)m->cpuHz();
     uint64_t baseTicks = SDL_GetPerformanceCounter();
+    bool fukSpin = false; // FUK を使う間、眠らずに回って待つ (SDL_Delay が寝過ごしたあと)
     // サイクル数は totalCycles() で見る (runFrame() が時刻を戻しても、差が狂わない。Machine::rebaseTime())
     uint64_t baseCycles = m->totalCycles();
     const uint64_t startTicks = baseTicks, startCycles = baseCycles;
@@ -2076,9 +2156,12 @@ int runMachine(Options& opt) {
     });
     PressScript press(opt.press, opt.pressAfter);
     int shownLeds = -1;
+    char shownSources[48] = {};
     bool shownCapture = false;
     bool quit = false;
     bool menuWasOpen = false;
+    // ミキサーの画面の直近 10 秒 (menuHost.tickSound()) は、X68000 の時間 (CPU のサイクル数) の 1 秒ごとに進める。
+    platform::SoundRunTimer soundTimer;
     long frame = 0;
     x68k::MaxSpeed maxSpeed;
     // 画面の隅の数字 (osd=on / fps): 1 秒ごとに、その間に出したフレームの数と速さを数える。ホスト版は合成したフレームを
@@ -2091,11 +2174,15 @@ int runMachine(Options& opt) {
         const uint64_t frameTicks = SDL_GetPerformanceCounter(), frameCycles = m->totalCycles();
         quit = input.poll();
         press.step(frame, input);
-        if (m->keyboard().leds() != shownLeds || input.captured() != shownCapture) {
+        // 使える音源 (#310) はメニューで CD を入れ替えると変わるので、毎回作って比べる (短い文字列なので軽い)
+        char sources[48];
+        platform::soundSourcesLine(menuHost.sources(), sources, sizeof sources);
+        if (m->keyboard().leds() != shownLeds || input.captured() != shownCapture || strcmp(sources, shownSources) != 0) {
             shownLeds = m->keyboard().leds();
             shownCapture = input.captured();
+            memcpy(shownSources, sources, sizeof shownSources);
             char title[256];
-            makeTitle((uint8_t)shownLeds, shownCapture, title, sizeof title);
+            makeTitle((uint8_t)shownLeds, shownCapture, title, sizeof title, sources);
             video->setTitle(title);
         }
         // 効果は、メニューを開いている間も掛ける (メニューで変えると、すぐに見た目が変わる)
@@ -2131,7 +2218,10 @@ int runMachine(Options& opt) {
             while (*typing && m->keyboard().queued() < x68k::Keyboard::QUEUE_SIZE / 2) m->keyboard().typeAscii(*typing++);
             if (!*typing) typing = nullptr;
         }
+        const uint64_t cyclesBefore = m->totalCycles();
         m->runFrame();
+        // ミキサーの画面の直近 10 秒は、runFrame() で進んだサイクル数だけを数える (ステートを読んで飛んだ分は入らない)
+        if (soundTimer.add(platform::soundCyclesElapsed(cyclesBefore, m->totalCycles()), config.cpuHz)) menuHost.tickSound();
         if (opt.wav) {
             int n;
             while ((n = m->sound().ring().drain(audioBuf, 4096)) > 0) wav.write(audioBuf, n);
@@ -2170,7 +2260,25 @@ int runMachine(Options& opt) {
         if (opt.noWait) continue;
         double emu = (double)(m->totalCycles() - baseCycles) / cpuHz;
         double wall = (double)(SDL_GetPerformanceCounter() - baseTicks) / (double)freq;
-        if (emu > wall) {
+        if (emu > wall && fuk) {
+            // FUK を使う間は、待ちの最後の 2 ms を回って待つ。寝過ごすと X68000 が実時間より遅れ、そのあと速く動いて
+            // 追いつく間に、FUK から届いたバイトを渡す時刻に間に合わなくなる (docs/fuk.md の「Read のデータを渡す時刻」)。
+            // 一度でも 1 ms を超えて寝過ごしたら、そのあとは眠らずに回って待つ (Mac で 15 ms 眠ると 120 ms 後に戻ったことがある)
+            const double left = emu - wall;
+            if (!fukSpin && left > 0.002) {
+                const uint32_t ms = (uint32_t)((left - 0.002) * 1000.0);
+                const uint64_t t0 = SDL_GetPerformanceCounter();
+                SDL_Delay(ms);
+                const double slept = (double)(SDL_GetPerformanceCounter() - t0) / (double)freq;
+                if (slept > ms / 1000.0 + 0.001) {
+                    fukSpin = true;
+                    fprintf(stderr, "fuk: SDL_Delay(%u) took %.1f ms; waiting by spinning from now on\n", ms, slept * 1000.0);
+                }
+            }
+            const uint64_t until = baseTicks + (uint64_t)(emu * (double)freq);
+            while (SDL_GetPerformanceCounter() < until) {
+            }
+        } else if (emu > wall) {
             SDL_Delay((uint32_t)((emu - wall) * 1000.0));
         } else if (wall - emu > 0.25) {
             // 大きく遅れたら (ホストが重い、ウィンドウを動かしていたなど) 追いつこうとせずに基準を取り直す
@@ -2182,6 +2290,17 @@ int runMachine(Options& opt) {
     double wallSec = (double)(SDL_GetPerformanceCounter() - startTicks) / (double)freq;
     printf("%ld frames: emulated %.3f s, wall %.3f s (%.1f%% of real time), %.2f frames/s emulated\n", frame, emuSec,
            wallSec, wallSec > 0 ? emuSec / wallSec * 100.0 : 0.0, emuSec > 0 ? frame / emuSec : 0.0);
+    if (fuk) {
+        const x68k::Fuk::Stats& st = fuk->stats();
+        printf("fuk: %u reads (reply in %llu us on average, %u us at most), %u read frames, %u write frames; "
+               "waited %u times (%llu us, %u timed out), yielded %llu us; %u timeouts, %u links, %u stray bytes, %u cancelled writes\n",
+               st.reads, (unsigned long long)(st.replies ? st.replyUs / st.replies : 0), st.replyMaxUs, st.readFrames,
+               st.writeFrames, st.waits, (unsigned long long)st.waitUs, st.waitTimeouts, (unsigned long long)st.yieldUs,
+               st.timeouts, st.links, st.stray, st.cancelledWrites);
+        // DMA の Read を届いた時刻の間隔で渡したもの (#320)。late は、渡す時刻より 64 us を超えて遅れて届いたバイトのあった Read
+        printf("fuk: %u timed reads, lead %llu us in all, %u late (%u us at most), %u stamps dropped\n", st.timedReads,
+               (unsigned long long)st.leadUs, st.lateReads, st.lateMaxUs, fukLink ? fukLink->droppedStamps() : 0u);
+    }
     if (opt.maxSpeed) {
         // 060turbo の 100% は、命令のサイクル数が選んだクロックの実機の 68060 と同じという意味 (m68k/cpu060_cycles.inc)
         if (opt.cpu == 68060)
@@ -2198,7 +2317,8 @@ int runMachine(Options& opt) {
     }
     // 音の大きさ (x68k::Sound::takeLevels())。MIDI の音源が鳴ったか、足して 16 ビットを超えて止めたフレームがあるときだけ出す
     {
-        const x68k::Sound::Levels lv = m->sound().takeLevels();
+        menuHost.takeSound();
+        const x68k::Sound::Levels lv = menuHost.levelsSeen;
         if (lv.midi != 0 || lv.clipped != 0)
             printf("sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix\n",
                    (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);
@@ -2281,8 +2401,8 @@ void usage(const char* argv0) {
             "          [--speed060 percent] [--max-speed-limit percent] [--bus-sync-sprite]\n"
             "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--mercury-rhythm dir] [--config file] [--profile name] [--image-dir dir]\n"
             "          [--neptune] [--neptune-link echo|loopback|pcap:IF|tap:NAME] [--neptune-mac MAC]\n"
-            "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT]\n"
-            "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none]\n"
+            "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT] [--fuk off|on|PORT_A,PORT_B]\n"
+            "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none] [--vol name=dB]...\n"
             "          [--midi-mt32-ctrl control.rom] [--midi-mt32-pcm pcm.rom] [--midi-sc55 dir]\n"
             "          [--state-dir dir] [--press keys] [--press-after N]\n",
             argv0);
@@ -2316,7 +2436,7 @@ int main(int argc, char** argv) {
     static const char* const kTakesValue[] = {
         "--frames", "-r", "-0", "-1", "-h", "--sram", "--screenshot", "--type", "--type-after", "--wav", "--time",
         "--sram-memsize", "--cpu", "--ipl", "--high-mem", "--local-mem", "--ram", "--clock", "--scsi-ex-rom",
-        "--cd", "--cd-id", "--image-dir", "--state-dir", "--press", "--press-after", "--midi-sf2", "--midi-voices", "--midi-out",
+        "--cd", "--cd-id", "--image-dir", "--state-dir", "--press", "--press-after", "--midi-sf2", "--midi-voices", "--vol", "--midi-out",
         "--midi-mt32-ctrl", "--midi-mt32-pcm", "--midi-sc55", "--mercury-rhythm", "--midi-dump", "--midi-uart-family", "--speed060",
         "--max-speed-limit", "--message", "--message-sec", "--message-dump", "--profile"};
     for (int i = 1; i < argc; i++) {
@@ -2413,6 +2533,27 @@ int main(int argc, char** argv) {
                 return 2;
             }
             opt.midiUartFamily = tmp.midiUartFamily;
+        } else if (!strcmp(a, "--vol") && hasArg) {
+            // --vol opm=-6 のように書く。名前と値は設定ファイルの vol_opm=-6 と同じ
+            const char* eq = strchr(argv[++i], '=');
+            char key[32];
+            platform::Settings tmp;
+            const size_t n = eq ? (size_t)(eq - argv[i]) : 0;
+            bool ok = eq != nullptr && n > 0 && n + 5 <= sizeof key;
+            if (ok) {
+                snprintf(key, sizeof key, "vol_%.*s", (int)n, argv[i]);
+                const platform::SettingKey* k = platform::findSettingKey(key);
+                ok = k != nullptr && k->offset >= offsetof(platform::Settings, volume) &&
+                     platform::applySetting(tmp, key, eq + 1) == platform::SettingResult::OK;
+                if (ok) {
+                    const size_t idx = (k->offset - offsetof(platform::Settings, volume)) / sizeof(int);
+                    opt.volume[idx] = tmp.volume[idx];
+                }
+            }
+            if (!ok) {
+                fprintf(stderr, "--vol: want opm|adpcm|mercury|ymf288|midi|cd|master=dB (-40..12 or off): %s\n", argv[i]);
+                return 2;
+            }
         } else if (!strcmp(a, "--midi-voices") && hasArg) {
             if (!parseRange(argv[++i], 4, 256, opt.midiVoices)) {
                 fprintf(stderr, "--midi-voices: want 4..256: %s\n", argv[i]);
@@ -2420,6 +2561,8 @@ int main(int argc, char** argv) {
             }
         } else if (!strcmp(a, "--rs232c") && hasArg) {
             platform::copyString(opt.rs232c, sizeof opt.rs232c, argv[++i]);
+        } else if (!strcmp(a, "--fuk") && hasArg) {
+            platform::copyString(opt.fuk, sizeof opt.fuk, argv[++i]);
         } else if (!strcmp(a, "--neptune-mac") && hasArg) {
             platform::copyString(opt.neptuneMac, sizeof opt.neptuneMac, argv[++i]);
         } else if (!strcmp(a, "--scsi-ex-rom") && hasArg) {
@@ -2597,6 +2740,13 @@ int main(int argc, char** argv) {
         char addr[64];
         if (platform::parseRs232c(opt.rs232c, port, addr, sizeof addr) == platform::Rs232cLink::BAD) {
             fprintf(stderr, "rs232c: bad value '%s' (off, tcp:PORT or tcp:ADDR:PORT)\n", opt.rs232c);
+            return 2;
+        }
+    }
+    {
+        char a[platform::Settings::PATH_SIZE], b[platform::Settings::PATH_SIZE];
+        if (platform::parseFuk(opt.fuk, a, b, sizeof a) == platform::FukPorts::BAD) {
+            fprintf(stderr, "fuk: bad value '%s' (off, on or PORT_A,PORT_B)\n", opt.fuk);
             return 2;
         }
     }

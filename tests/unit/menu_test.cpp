@@ -1,6 +1,7 @@
 // src/platform/menu.h のテスト: メニューの操作 (項目の移動、値の変更、ディスクの入れ替え、保存、再起動)、
 // 開いている間と閉じたあとのキーの扱い (MenuKeyFilter)、小さな画面に描いても枠の外に書かないこと
 #include "platform/menu.h"
+#include "platform/sound_info.h"
 #include "test_check.h"
 
 #include <stdio.h>
@@ -950,6 +951,291 @@ void testOsdBars() {
     }
 }
 
+// 音のミキサー (#300): 「Sound mixer」のページで音源ごとの音量と全体の音量を 1dB ずつ変える。変えたらすぐに知らせ、
+// Save settings で vol_*= を保存する。再起動は要らない (「*」は付かない)
+void testMixer() {
+    printf("sound mixer\n");
+    {
+        FakeHost h; // 出さない環境 (hasMixer() が false) には、項目がない
+        Menu m(h);
+        Settings running, saved;
+        m.open(running, saved);
+        int found = 0;
+        for (int i = 0; i < 40; i++, m.key(mk::DOWN))
+            if (strcmp(m.currentLabel(), "Sound mixer") == 0) found++;
+        CHECK_EQ(found, 0);
+    }
+    struct MixHost : FakeHost {
+        int group = -1, dB = 0, calls = 0, asked = 0;
+        bool hasMixer() const override { return true; }
+        void volumeChanged(int g, int v) override {
+            group = g;
+            dB = v;
+            calls++;
+        }
+        bool soundInfo(SoundInfo& info) override {
+            asked++;
+            const int peak[Settings::VOLUMES] = {53, 7, -1, -1, 120, -1, 100};
+            for (int i = 0; i < Settings::VOLUMES; i++) info.peak[i] = peak[i];
+            info.clipped = 12;
+            platform::copyString(info.sources, sizeof info.sources, "OPM ADPCM MIDI:MT-32");
+            return true;
+        }
+    } mh;
+    Menu m(mh);
+    Settings running, saved;
+    m.open(running, saved);
+    char v[Menu::COLS + 1];
+    CHECK_EQ(moveTo(m, "Sound mixer"), 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "default"), 0);
+    m.key(mk::ENTER);
+    CHECK_EQ(mh.asked, 1);
+    // 7 つの行と Back。最初は OPM
+    CHECK_EQ(strcmp(m.currentLabel(), "OPM"), 0);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[##########...]   0 dB  53%"), 0);
+    m.key(mk::RIGHT);
+    CHECK_EQ(mh.group, 0);
+    CHECK_EQ(mh.dB, 1);
+    CHECK_EQ(m.pending().volume[0], 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[##########...]  +1 dB  53%"), 0);
+    for (int i = 0; i < 20; i++) m.key(mk::RIGHT); // +12 で止まる
+    CHECK_EQ(m.pending().volume[0], 12);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[#############] +12 dB  53%"), 0);
+    for (int i = 0; i < 52; i++) m.key(mk::LEFT); // -40 まで
+    CHECK_EQ(m.pending().volume[0], -40);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[.............] -40 dB  53%"), 0);
+    m.key(mk::LEFT); // その下は無音
+    CHECK_EQ(m.pending().volume[0], Settings::VOLUME_OFF);
+    CHECK_EQ(mh.dB, Settings::VOLUME_OFF);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[.............]    off  53%"), 0);
+    m.key(mk::LEFT); // それより下はない
+    CHECK_EQ(m.pending().volume[0], Settings::VOLUME_OFF);
+    m.key(mk::RIGHT); // 無音から上げると -40
+    CHECK_EQ(m.pending().volume[0], -40);
+    // ほかの行: つないでいない音源の最大は「-」、100% を超えたら「!」
+    CHECK_EQ(moveTo(m, "Mercury PCM"), 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[##########...]   0 dB    -"), 0);
+    CHECK_EQ(moveTo(m, "MIDI"), 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[##########...]   0 dB 120%!"), 0);
+    m.key(mk::LEFT);
+    CHECK_EQ(mh.group, 4);
+    CHECK_EQ(mh.dB, -1);
+    CHECK_EQ(moveTo(m, "Master"), 1);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "[##########...]   0 dB 100%"), 0);
+    // 行はメニューの幅に入る。見出しの下に音源、下に止めたフレームの数
+    {
+        char lines[40][Menu::LINE_BYTES];
+        int hl = -1;
+        const int n = m.linesForTest(lines, hl);
+        CHECK_EQ(n >= 12, 1);
+        for (int i = 0; i < n; i++) CHECK_EQ(strlen(lines[i]) <= (size_t)Menu::COLS, 1);
+        CHECK_EQ(strncmp(lines[0], "Sound mixer", 11), 0);
+        CHECK_EQ(strcmp(lines[1], "OPM ADPCM MIDI:MT-32"), 0);
+        CHECK_EQ(strstr(lines[n - 2], "clipped frames: 12") != nullptr, 1);
+        int stars = 0;
+        for (int i = 0; i < n; i++) stars += lines[i][0] == '*';
+        CHECK_EQ(stars, 0); // 再起動は要らないので「*」は付かない
+    }
+    // Esc で主のページに戻る。主のページの行には、変えた数が出る
+    m.key(mk::ESC);
+    CHECK_EQ(m.isOpen(), 1);
+    CHECK_EQ(strcmp(m.currentLabel(), "Sound mixer"), 0);
+    CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "2 changed"), 0);
+    CHECK_EQ(moveTo(m, "Save settings"), 1);
+    m.key(mk::ENTER);
+    CHECK_EQ(mh.settingsSaves, 1);
+    CHECK_EQ(mh.saved.volume[0], -40);
+    CHECK_EQ(mh.saved.volume[4], -1);
+    CHECK_EQ(mh.saved.volume[6], 0);
+    // 保存しないで閉じたあとに開き直すと、いま鳴っている音量 (running) を出し、そこから変える (Codex のレビュー)
+    {
+        Settings run2, saved2;
+        run2.volume[0] = -10;
+        m.close();
+        m.open(run2, saved2);
+        CHECK_EQ(moveTo(m, "Sound mixer"), 1);
+        CHECK_EQ(strcmp(m.currentValue(v, sizeof v), "1 changed"), 0);
+        m.key(mk::ENTER);
+        CHECK_EQ(strcmp(m.currentLabel(), "OPM"), 0);
+        CHECK_EQ(strstr(m.currentValue(v, sizeof v), "] -10 dB") != nullptr, 1);
+        m.key(mk::LEFT);
+        CHECK_EQ(mh.dB, -11);
+        CHECK_EQ(m.pending().volume[0], -11);
+    }
+}
+
+// 画面の隅の音源の行 (#310): osdSound() はつないでいる音源だけを出し、振れ幅 (Levels::swing) がしきい値 (64) を超えた音源を
+// 鳴ったとする。明るさは SoundWindow::takeUnread() (前に見てから閉じた区間) で決める
+void testOsdSound() {
+    printf("osd sound sources\n");
+    using S = x68k::Sound;
+    platform::SoundSources src;
+    S::Levels lv = {};
+    lv.swing[S::SWING_OPM] = 65;
+    lv.swing[S::SWING_ADPCM] = 64; // ちょうどしきい値は鳴っていない
+    lv.adpcm = 10000;              // 最大が大きくても、振れ幅がなければ (止まって最後の値のまま) 鳴っていない (Fable のレビュー)
+    lv.swing[S::SWING_PCM] = lv.swing[S::SWING_OPN] = lv.swing[S::SWING_MIDI] = lv.swing[S::SWING_CD] = 1000; // つないでいない
+    platform::OsdStats st;
+    platform::osdSound(st, src, lv);
+    CHECK_EQ(st.soundSources, (unsigned)(platform::OSD_SND_OPM | platform::OSD_SND_ADPCM));
+    CHECK_EQ(st.soundActive, (unsigned)platform::OSD_SND_OPM);
+    src.mercury = src.midi = src.cd = true;
+    src.midiOut = 4;
+    lv = {};
+    lv.swing[S::SWING_PCM] = 100;
+    lv.swing[S::SWING_MIDI] = 100;
+    platform::osdSound(st, src, lv);
+    CHECK_EQ(st.soundSources, (unsigned)platform::OSD_SND_ALL);
+    CHECK_EQ(st.soundActive, (unsigned)(platform::OSD_SND_PCM | platform::OSD_SND_MIDI));
+    CHECK_EQ(st.midiOut, 4);
+    lv = {};
+    lv.swing[S::SWING_OPN] = 100;
+    lv.swing[S::SWING_CD] = 100;
+    platform::osdSound(st, src, lv);
+    CHECK_EQ(st.soundActive, (unsigned)(platform::OSD_SND_OPN | platform::OSD_SND_CD));
+    // lastSecond(): tick() の前は前の区間 (最初は空)、tick() のあとは閉じたばかりの区間。10 回進めると一周して空
+    platform::SoundWindow w;
+    S::Levels a = {};
+    a.opm = 500;
+    w.add(a);
+    CHECK_EQ(w.lastSecond().opm, 0u);
+    w.tick();
+    CHECK_EQ(w.lastSecond().opm, 500u);
+    S::Levels b = {};
+    b.adpcm = 7;
+    w.add(b); // いまの区間に入り、lastSecond() には入らない
+    CHECK_EQ(w.lastSecond().adpcm, 0u);
+    w.tick();
+    CHECK_EQ(w.lastSecond().opm, 0u);
+    CHECK_EQ(w.lastSecond().adpcm, 7u);
+    // takeUnread(): 前に取ってから閉じた区間を全部合わせる (2 つ閉じていれば両方。画面の隅の 1 秒と別の時計なので取りこぼさない)。
+    // 1 つも閉じていなければ前の区間
+    S::Levels u = w.takeUnread();
+    CHECK_EQ(u.opm, 500u);
+    CHECK_EQ(u.adpcm, 7u);
+    u = w.takeUnread();
+    CHECK_EQ(u.opm, 0u);
+    CHECK_EQ(u.adpcm, 7u); // 閉じていないので lastSecond()
+    for (int i = 0; i < platform::SoundWindow::SECONDS; i++) w.tick();
+    CHECK_EQ(w.lastSecond().adpcm, 0u);
+    // 振れ幅も区間をまたいで合わさり、osdSound() の明るさになる: 1 つ目の区間で OPM、2 つ目で MIDI が鳴り、そのあと 1 回だけ
+    // 見ると両方とも白。次に見るときに新しい区間で何も鳴っていなければ灰色
+    platform::SoundWindow w2;
+    w2.takeUnread();
+    S::Levels c = {};
+    c.swing[S::SWING_OPM] = 500;
+    w2.add(c);
+    w2.tick();
+    S::Levels d = {};
+    d.swing[S::SWING_MIDI] = 300;
+    w2.add(d);
+    w2.tick();
+    platform::osdSound(st, src, w2.takeUnread());
+    CHECK_EQ(st.soundActive, (unsigned)(platform::OSD_SND_OPM | platform::OSD_SND_MIDI));
+    w2.tick();
+    platform::osdSound(st, src, w2.takeUnread());
+    CHECK_EQ(st.soundActive, 0u);
+    // 長く見なかったあと (画面の隅を消していた間) は、新しい 2 区間だけを合わせる (Fable のレビュー): 5 区間前に鳴った OPM は
+    // 白にしない
+    w2.takeUnread();
+    w2.add(c); // OPM
+    for (int i = 0; i < 5; i++) w2.tick();
+    platform::osdSound(st, src, w2.takeUnread());
+    CHECK_EQ(st.soundActive, 0u);
+    w2.add(c);
+    w2.tick();
+    w2.tick();
+    platform::osdSound(st, src, w2.takeUnread()); // 2 区間前の OPM は入る
+    CHECK_EQ(st.soundActive, (unsigned)platform::OSD_SND_OPM);
+    w2.add(c);
+    for (int i = 0; i < 3; i++) w2.tick();
+    platform::osdSound(st, src, w2.takeUnread()); // 3 区間前は入らない
+    CHECK_EQ(st.soundActive, 0u);
+    for (int i = 0; i < 15; i++) w2.tick(); // 10 区間より長く見なかったあとも、新しい 2 区間を見る
+    w2.add(c);
+    w2.tick();
+    platform::osdSound(st, src, w2.takeUnread());
+    CHECK_EQ(st.soundActive, (unsigned)platform::OSD_SND_OPM);
+}
+
+// 16 ビットを超えたら、切り捨てで 100% になっても 101% (「!」が付く) にする (Fable のレビュー)
+void testSoundPercent() {
+    printf("sound percent\n");
+    CHECK_EQ(platform::soundPercent(0), 0);
+    CHECK_EQ(platform::soundPercent(32767), 100);
+    CHECK_EQ(platform::soundPercent(32768), 101);
+    CHECK_EQ(platform::soundPercent(33094), 101);
+    CHECK_EQ(platform::soundPercent(40000), 122);
+}
+
+// ミキサーの画面の直近 10 秒 (platform::SoundWindow): 区間ごとの最大と止めた数を合わせ、10 区間より古いものは捨てる
+void testSoundWindow() {
+    printf("sound window\n");
+    platform::SoundWindow w;
+    x68k::Sound::Levels lv = {};
+    lv.opm = 30000;
+    lv.clipped = 5;
+    w.add(lv);
+    x68k::Sound::Levels r = w.recent();
+    CHECK_EQ(r.opm, 30000u);
+    CHECK_EQ(r.clipped, 5u);
+    // 同じ区間にもう 1 回: 最大は大きい方、止めた数は足す
+    lv.opm = 1000;
+    lv.clipped = 2;
+    w.add(lv);
+    r = w.recent();
+    CHECK_EQ(r.opm, 30000u);
+    CHECK_EQ(r.clipped, 7u);
+    // 9 回進めても残り、10 回目で消える
+    for (int i = 0; i < 9; i++) w.tick();
+    CHECK_EQ(w.recent().opm, 30000u);
+    lv = {};
+    lv.adpcm = 200;
+    w.add(lv);
+    w.tick();
+    r = w.recent();
+    CHECK_EQ(r.opm, 0u);
+    CHECK_EQ(r.clipped, 0u);
+    CHECK_EQ(r.adpcm, 200u);
+    // 進めなければ (メニューを開いて止めている間)、何度見ても同じ
+    CHECK_EQ(w.recent().adpcm, 200u);
+    CHECK_EQ(w.recent().adpcm, 200u);
+
+    // 進める時 (SoundRunTimer): 止めている間 (0 を渡す) は数えず、止める前後の端数はつながる (Codex のレビュー:
+    // 秒の切れ目のたびにメニューを開くと、前は 1 度も進まなかった)
+    platform::SoundRunTimer t;
+    int ticks = 0;
+    for (int i = 0; i < 16; i++) { // 0.6 秒動いて、長く止める、を 16 回 (動いたのは 9.6 秒)
+        ticks += t.add(600, 1000);
+        for (int k = 0; k < 5; k++) ticks += t.add(0, 1000);
+    }
+    CHECK_EQ(ticks, 9);
+    CHECK_EQ(t.run, 600u);
+    // 2 秒以上たまっていたら 1 回だけ進めて捨てる
+    CHECK_EQ(t.add(5000, 1000), true);
+    CHECK_EQ(t.run, 0u);
+    CHECK_EQ(t.add(999, 1000), false);
+    CHECK_EQ(t.add(1, 1000), true);
+    // ベアメタル版 (SoundRunClock): メニューを開いている間と、閉じた回 (ステートの読み込みに 3 秒かかった) は数えない
+    {
+        platform::SoundRunClock c(0);
+        int n = 0;
+        n += c.update(600, false, 1000);   // 0.6 秒動いた
+        n += c.update(700, true, 1000);    // 開いた (この回の 0.1 秒も数えない)
+        n += c.update(5000, true, 1000);   // 開いている
+        n += c.update(8000, false, 1000);  // 閉じた回: ステートの読み込みの 3 秒は数えない
+        CHECK_EQ(n, 0);
+        CHECK_EQ(c.timer.run, 600u);
+        n += c.update(8300, false, 1000);  // 0.3 秒動いた (合わせて 0.9 秒)
+        CHECK_EQ(n, 0);
+        n += c.update(8400, false, 1000);  // 1 秒になった
+        CHECK_EQ(n, 1);
+    }
+    // ホスト版の runFrame() の前後のサイクル数: 進んだ分を数え、戻っていたら 0
+    CHECK_EQ(platform::soundCyclesElapsed(1000000, 1290000), 290000u);
+    CHECK_EQ(platform::soundCyclesElapsed(1290000, 1000000), 0u);
+}
+
 // 画面の隅の数字 (osd=) の項目は、どちらの環境にも出し、開いたときはいまの値を出す。変えたらすぐに知らせる
 void testOsd() {
     printf("osd\n");
@@ -1621,6 +1907,10 @@ int main() {
     testFit();
     testFitPages();
     testScale();
+    testMixer();
+    testSoundWindow();
+    testOsdSound();
+    testSoundPercent();
     testOsd();
     testOsdBars();
     testDiscardConfirm();

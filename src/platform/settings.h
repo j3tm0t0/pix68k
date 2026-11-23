@@ -50,10 +50,16 @@ struct Settings {
     char neptuneMac[PATH_SIZE] = {};  // neptune_mac= (ボードの MAC アドレス。空なら x68k::Neptune::DEFAULT_MAC)
     char neptuneLink[PATH_SIZE] = {}; // neptune_link= (フレームの送受信の先。空なら環境の既定。parseNeptuneLink())
     char rs232c[PATH_SIZE] = {};      // rs232c= (RS-232C の相手。空か off ならつながない。parseRs232c())
+    char fuk[PATH_SIZE] = {};         // fuk= (FUK を内蔵の FDC の代わりに使う。空か off なら使わない。parseFuk())
+    int fukLead = 0;                  // fuk_lead= (FUK から届いた Read のデータを DMAC に渡すまでの遅れ (us)。0 なら自動 (1 フレーム + 1/8 を上限に決める)。遅れなしは指定できない (1 で代用)。x68k::Fuk::setLeadUs())
     int midi = 0;               // midi= (MIDI ボード CZ-6BM1)
     int midiOut = 0;            // midi_out= (MIDI の行き先: 0 sf2、1 uart (ベアメタル版だけ)、2 none、3 mt32、4 sc55)
     char midiSf2[PATH_SIZE] = {}; // midi_sf2= (SoundFont のファイル。空なら鳴らさない)
     int midiVoices = 48;        // midi_voices= (SoundFont の音源の同時に鳴らすボイスの数)
+    // vol_opm=、vol_adpcm=、vol_mercury=、vol_ymf288=、vol_midi=、vol_cd=、vol_master= (音源ごとの音量と全体の音量。dB で
+    // -40 から 12、VOLUME_OFF (off) で無音。既定は 0。並びは x68k::Sound::Volume と同じ。#300)
+    static constexpr int VOLUMES = 7, VOLUME_OFF = -128;
+    int volume[VOLUMES] = {};
     char midiMt32Ctrl[PATH_SIZE] = {}; // midi_mt32_ctrl= (MT-32 / CM-32L の CONTROL の ROM)
     char midiMt32Pcm[PATH_SIZE] = {};  // midi_mt32_pcm= (MT-32 / CM-32L の PCM の ROM)
     char midiSc55[PATH_SIZE] = {};     // midi_sc55= (SC-55mkII の ROM を置いたディレクトリ)
@@ -155,6 +161,9 @@ static const char* const kMidiOutChoices[] = {"sf2", "uart", "none", "mt32", "sc
 static const int kMidiOutValues[] = {0, 1, 2, 3, 4};
 // 使えるかは機種で違う (Pi 3 は 0、Pi 4 は 0 と 2-5、Pi 5 は 0-4 と 10。ベアメタル版の StartMidiUart() が確かめる)
 static const int kMidiUartValues[] = {0, 1, 2, 3, 4, 5, 10, -1};
+// vol_*= は dB の整数 (-40 から 12。+6 のように + を付けてもよい) か off。書くときは + を付けない
+static const char* const kVolumeChoices[] = {"off", "-40", "-39", "-38", "-37", "-36", "-35", "-34", "-33", "-32", "-31", "-30", "-29", "-28", "-27", "-26", "-25", "-24", "-23", "-22", "-21", "-20", "-19", "-18", "-17", "-16", "-15", "-14", "-13", "-12", "-11", "-10", "-9", "-8", "-7", "-6", "-5", "-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "+1", "+2", "+3", "+4", "+5", "+6", "+7", "+8", "+9", "+10", "+11", "+12", nullptr};
+static const int kVolumeValues[] = {-128, -40, -39, -38, -37, -36, -35, -34, -33, -32, -31, -30, -29, -28, -27, -26, -25, -24, -23, -22, -21, -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
 static const char* const kMidiUartFamilyChoices[] = {"gs", "mt32", nullptr};
 static const int kMidiUartFamilyValues[] = {0, 1};
 } // namespace settings_detail
@@ -199,10 +208,19 @@ static const SettingKey kSettingKeys[] = {
     {"neptune_mac",  SettingKey::PATH,   PIX68K_OFF(neptuneMac),      0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"neptune_link", SettingKey::PATH,   PIX68K_OFF(neptuneLink),     0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"rs232c",       SettingKey::PATH,   PIX68K_OFF(rs232c),          0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
+    {"fuk",          SettingKey::PATH,   PIX68K_OFF(fuk),             0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
+    {"fuk_lead",     SettingKey::INT,    PIX68K_OFF(fukLead),         0, 200000, nullptr, nullptr, nullptr,                                                       true,  true},
     {"midi",         SettingKey::ONOFF,  PIX68K_OFF(midi),            0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"midi_out",     SettingKey::CHOICE, PIX68K_OFF(midiOut),         0, 0,   nullptr, settings_detail::kMidiOutChoices, settings_detail::kMidiOutValues,         true,  true},
     {"midi_sf2",     SettingKey::PATH,   PIX68K_OFF(midiSf2),         0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"midi_voices",  SettingKey::INT,    PIX68K_OFF(midiVoices),      4, 256, nullptr, nullptr, nullptr,                                                          true,  true},
+    {"vol_opm", SettingKey::CHOICE, PIX68K_OFF(volume[0]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_adpcm", SettingKey::CHOICE, PIX68K_OFF(volume[1]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_mercury", SettingKey::CHOICE, PIX68K_OFF(volume[2]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_ymf288", SettingKey::CHOICE, PIX68K_OFF(volume[3]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_midi", SettingKey::CHOICE, PIX68K_OFF(volume[4]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_cd", SettingKey::CHOICE, PIX68K_OFF(volume[5]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
+    {"vol_master", SettingKey::CHOICE, PIX68K_OFF(volume[6]), 0, 0, nullptr, settings_detail::kVolumeChoices, settings_detail::kVolumeValues, false, true},
     {"midi_mt32_ctrl", SettingKey::PATH, PIX68K_OFF(midiMt32Ctrl),    0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"midi_mt32_pcm", SettingKey::PATH,  PIX68K_OFF(midiMt32Pcm),     0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"midi_sc55",    SettingKey::PATH,   PIX68K_OFF(midiSc55),        0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},
@@ -351,6 +369,26 @@ inline NeptuneLink parseNeptuneLink(const char* s, const char*& arg) {
         }
     }
     return NeptuneLink::BAD;
+}
+
+// fuk= の値 (FUK。USB でつなぐ実物の FDC と FDD を、内蔵の FDC の代わりに使う。x68k/fuk.h)
+//   空、off        使わない
+//   on             USB につないだ FUK を探して使う (ベアメタル版は VID:PID 04D8:E6B1、ホスト版は Linux のポートの名前)
+//   PORT_A,PORT_B  ホスト版で、FUK の 2 本のシリアルポートの名前を書く (ベアメタル版では on と同じ)
+// a と b には、PATHS のときにポートの名前を size バイトまで入れる
+enum class FukPorts { OFF, AUTO, PATHS, BAD };
+inline FukPorts parseFuk(const char* s, char* a, char* b, size_t size) {
+    if (size != 0) a[0] = b[0] = 0;
+    if (s == nullptr || *s == 0 || strcmp(s, "off") == 0) return FukPorts::OFF;
+    if (strcmp(s, "on") == 0) return FukPorts::AUTO;
+    const char* comma = strchr(s, ',');
+    if (comma == nullptr || comma == s || comma[1] == 0 || strchr(comma + 1, ',') != nullptr) return FukPorts::BAD;
+    const size_t na = (size_t)(comma - s), nb = strlen(comma + 1);
+    if (na + 1 > size || nb + 1 > size) return FukPorts::BAD;
+    memcpy(a, s, na);
+    a[na] = 0;
+    memcpy(b, comma + 1, nb + 1);
+    return FukPorts::PATHS;
 }
 
 // rs232c= の値 (RS-232C の相手)

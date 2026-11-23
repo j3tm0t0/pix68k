@@ -246,7 +246,11 @@ if [ -n "$TAG" ]; then WHERE="タグ ${TAG} (コミット ${COMMIT})"; else WHER
   echo
   echo "  pix68k のソース: ${SOURCE_URL} (${WHERE})"
   echo "  Circle: https://github.com/rsta2/circle のコミット ${CIRCLE_COMMIT} (pix68k のリポジトリの external/circle)"
-  echo "  ビルドのとき、tools/build_baremetal.sh は Circle を写した先の addon/fatfs/ffconf.h と include/circle/timer.h を書き換える"
+  echo "  ビルドのとき、tools/build_baremetal.sh は Circle を写した先の次のファイルを書き換える"
+  echo "    addon/fatfs/ffconf.h include/circle/timer.h lib/bcm54213.cpp lib/dmachannel.cpp lib/dma4channel.cpp"
+  echo "    lib/sound/dmasoundbuffers.cpp lib/usb/usbfloppydevice.cpp include/circle/usb/usbfloppydevice.h lib/usb/xhciendpoint.cpp"
+  echo "    lib/usb/usbserialhost.cpp include/circle/usb/usbserialhost.h lib/usb/xhcirootport.cpp lib/usb/usbstandardhub.cpp"
+  echo "    lib/usb/usbdevice.cpp lib/usb/xhcicommandmanager.cpp include/circle/usb/xhcicommandmanager.h lib/usb/xhciusbdevice.cpp"
   echo "  (Circle のリポジトリの中身は変えない。書き換えの中身は tools/build_baremetal.sh にある)。"
   echo
   echo "pix68k/bezel-cz-600de.bin と bezel-cz-600db.bin (モニタの枠の絵) は、ソースの tools/bezel_cz600d.py で描き、"

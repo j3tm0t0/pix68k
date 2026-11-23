@@ -400,6 +400,33 @@ void testSettings() {
     CHECK_EQ((int)applySetting(s, "midi_out", "usb"), (int)SettingResult::BAD_VALUE);
     CHECK_EQ((int)applySetting(s, "midi_sf2", "GeneralUser.sf2"), (int)SettingResult::OK);
     CHECK_EQ(strcmp(s.midiSf2, "GeneralUser.sf2"), 0);
+    // 音量 (vol_*=。#300): dB の整数 (-40 から 12。+ を付けてもよい) か off。書くときは + を付けない
+    for (int i = 0; i < platform::Settings::VOLUMES; i++) CHECK_EQ(s.volume[i], 0);
+    CHECK_EQ((int)applySetting(s, "vol_opm", "-6"), (int)SettingResult::OK);
+    CHECK_EQ(s.volume[0], -6);
+    CHECK_EQ((int)applySetting(s, "vol_master", "+12"), (int)SettingResult::OK);
+    CHECK_EQ(s.volume[6], 12);
+    CHECK_EQ((int)applySetting(s, "vol_midi", "off"), (int)SettingResult::OK);
+    CHECK_EQ(s.volume[4], platform::Settings::VOLUME_OFF);
+    CHECK_EQ((int)applySetting(s, "vol_cd", "-40"), (int)SettingResult::OK);
+    CHECK_EQ(s.volume[5], -40);
+    CHECK_EQ((int)applySetting(s, "vol_adpcm", "13"), (int)SettingResult::BAD_VALUE);
+    CHECK_EQ((int)applySetting(s, "vol_adpcm", "-41"), (int)SettingResult::BAD_VALUE);
+    CHECK_EQ((int)applySetting(s, "vol_adpcm", "loud"), (int)SettingResult::BAD_VALUE);
+    CHECK_EQ(s.volume[1], 0);
+    {
+        char text[16];
+        CHECK_EQ(platform::formatSetting(s, *platform::findSettingKey("vol_master"), text, sizeof text), true);
+        CHECK_EQ(strcmp(text, "12"), 0);
+        CHECK_EQ(platform::formatSetting(s, *platform::findSettingKey("vol_midi"), text, sizeof text), true);
+        CHECK_EQ(strcmp(text, "off"), 0);
+        CHECK_EQ(platform::formatSetting(s, *platform::findSettingKey("vol_opm"), text, sizeof text), true);
+        CHECK_EQ(strcmp(text, "-6"), 0);
+    }
+    // 並びは x68k::Sound::Volume と同じ (ホスト版とベアメタル版が、添字をそのまま Sound::setVolume() に渡す)
+    CHECK_EQ(platform::findSettingKey("vol_ymf288")->offset, offsetof(platform::Settings, volume) + 3 * sizeof(int));
+    CHECK_EQ(platform::findSettingKey("vol_master")->offset, offsetof(platform::Settings, volume) + 6 * sizeof(int));
+    for (int i = 0; i < platform::Settings::VOLUMES; i++) s.volume[i] = 0;
     CHECK_EQ((int)applySetting(s, "midi_voices", "3"), (int)SettingResult::BAD_VALUE);
     CHECK_EQ((int)applySetting(s, "midi_voices", "32"), (int)SettingResult::OK);
     CHECK_EQ(s.midiVoices, 32);
@@ -470,6 +497,23 @@ void testSettings() {
         Settings r;
         CHECK_EQ((int)applySetting(r, "rs232c", "tcp:2324"), (int)SettingResult::OK);
         CHECK_EQ(strcmp(r.rs232c, "tcp:2324"), 0);
+    }
+    // fuk= (FUK を内蔵の FDC の代わりに使う)
+    {
+        char a[32] = "x", b[32] = "y";
+        CHECK_EQ((int)platform::parseFuk("", a, b, sizeof a), (int)platform::FukPorts::OFF);
+        CHECK_EQ((int)platform::parseFuk("off", a, b, sizeof a), (int)platform::FukPorts::OFF);
+        CHECK_EQ((int)platform::parseFuk("on", a, b, sizeof a), (int)platform::FukPorts::AUTO);
+        CHECK_EQ(a[0], 0);
+        CHECK_EQ((int)platform::parseFuk("/dev/cu.usbmodem1,/dev/cu.usbmodem3", a, b, sizeof a), (int)platform::FukPorts::PATHS);
+        CHECK_EQ(strcmp(a, "/dev/cu.usbmodem1"), 0);
+        CHECK_EQ(strcmp(b, "/dev/cu.usbmodem3"), 0);
+        static const char* const kBad[] = {"yes", "/dev/ttyACM0", ",b", "a,", "a,b,c",
+                                           "0123456789012345678901234567890123456789,b"};
+        for (const char* v : kBad) CHECK_EQ((int)platform::parseFuk(v, a, b, sizeof a), (int)platform::FukPorts::BAD);
+        Settings r;
+        CHECK_EQ((int)applySetting(r, "fuk", "on"), (int)SettingResult::OK);
+        CHECK_EQ(strcmp(r.fuk, "on"), 0);
     }
     // 表のすべての項目で、既定の値を書いて読むと同じになる
     for (const platform::SettingKey& key : platform::kSettingKeys) {

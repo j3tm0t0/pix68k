@@ -622,6 +622,45 @@ void testNarrowBoundaries() {
 
 } // namespace
 
+// 右上の数字がいちばん多い行数 (音源の行 (#310) と IP アドレスを含む 13 行、狭い並びは 14 行) でも、Pi 2 の 960x540
+// (gpu_scale=2)、720p、1080p で、X68000 の画面のどのモードでも、バーは出て、右上の数字にぶつからない
+void testTallTop() {
+    printf("bars under the tallest top OSD (sound rows)\n");
+    OsdStats st;
+    st.pi = OSD_PI_2B;
+    st.armMHz = 900;
+    st.mpu = 68000;
+    st.mpuMHz = 10;
+    st.composedDeci = st.shownDeci = 555;
+    st.speedPct = 100;
+    st.heapMB = 213;
+    st.tempDeciC = 516;
+    st.fanLevel = 1;
+    st.fanRpm = 2300;
+    st.throttled = true;
+    st.ipv4 = 0xc0a864c8u;
+    st.soundSources = OSD_SND_ALL;
+    const OsdValue v = packOsd(st);
+    CHECK_EQ(osdRows(v), OSD_V_ROWS);
+    struct Size { int w, h; };
+    struct Screen { int w, h, g; }; // g: GPU が拡大する倍率 (Pi 2 の 960x540 は gpu_scale=2)
+    const Screen screens[] = {{960, 540, 2}, {1280, 720, 1}, {1920, 1080, 1}};
+    const Size modes[] = {{768, 512}, {512, 512}, {256, 256}, {512, 256}, {640, 480}};
+    for (const Screen& sc : screens) {
+        for (const Size& m : modes) {
+            const FrameScale fs = computeFrameScale(m.w, m.h, sc.w, sc.h, true, 4096, sc.g, sc.g);
+            const OsdRect top = chooseOsd(OSD_MODE_ON, sc.w, sc.h, fs.dstX, fs.dstY, fs.dstW, fs.dstH, osdChars(v),
+                                          osdRows(v), osdRowsNarrow(v), osdRows(v, false));
+            CHECK_EQ(top.w > 0 && top.vertical, true);
+            const OsdRect b = placeOsdBars(OSD_MODE_ON, sc.w, sc.h, fs.dstX, fs.dstY, fs.dstW, fs.dstH, top);
+            if (b.w == 0) printf("  no bars: %dx%d, picture %dx%d\n", sc.w, sc.h, m.w, m.h);
+            CHECK_EQ(b.w > 0, true);
+            CHECK_EQ(b.y >= top.y + top.h, true);
+            CHECK_EQ(b.y + b.h <= sc.h, true);
+        }
+    }
+}
+
 int main() {
     testNarrow();
     testNarrowBoundaries();
@@ -637,5 +676,6 @@ int main() {
     testState();
     testThreeOverlaysScaled();
     testThreeOverlaysCrt();
+    testTallTop();
     return finish();
 }

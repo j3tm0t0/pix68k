@@ -7,31 +7,32 @@ name: Release
 # リリースの説明は docs/releases/<タグ>.md に、ソースの場所の文を足したもの。タグを push するときにこのファイルがない (か空白だけ) なら、
 # Release を作らずに失敗する (公開リポジトリは immutable releases なので、公開したあとは添付を変えられないため)。
 #
-# GitHub のホストの runner だけで動かす (self-hosted は使わない)。作る job は読むだけの権限で動かし、書く権限 (contents: write)
-# は Release を作る job にだけ渡す。
+# GitHub のホストの runner だけで動かす (self-hosted は使わない)。作る job (release-build.yml を呼ぶ build) は読むだけの権限で動かし、
+# 書く権限 (contents: write) は Release を作る job にだけ渡す。
 #
 # workflow_dispatch: タグを打たずに、作るところまでを試す (どのリポジトリでも、どのブランチでも動く)。Release は作らず、
 # 載せるはずのファイルとリリースの説明を artifact (release-files) に置く。版の名前は dryrun-<コミットの短い SHA>。
 # 公開リポジトリ以外で動かすと、make_release.sh が SOURCE.txt に「試しに作ったもの」と書く。
 # 入力 notes_tag (例: v0.2.0。v で始まる名前だけ) を渡すと、説明の本文を docs/releases/<notes_tag>.md で作る (タグを打つ前に、出す説明をそのまま確かめるため)。
 # 説明のファイルがない (か空) のと、同じタグの公開済みのリリースがあるのは、最初の version の job で調べて、zip のビルドの前に止める。
+#
+# beta (人に試してもらう版): タグを v<次の版>-beta.<N> (例: v0.2.3-beta.1) にすると、pre-release で、Latest にせずに出す。
+# docs/releases/<タグ>.md はなくてよい。なければ説明の本文を自動で作る: 試験用の版であること、タグのメッセージ (注釈付きのタグなら。
+# 元にした開発用のリポジトリのコミットなどを書く)、前のタグからのコミットの一覧。ファイルがあればそちらを使う。
+# -beta を含むのに形が違うタグ (v0.2.3-beta、v0.2.3-beta1 など) は止める。正式な版 (-beta のないタグ) の流れは変わらない。
+# workflow_dispatch の notes_tag に beta の名前を渡すと、その説明を今のコミットまでの一覧で作って試せる。
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       notes_tag:
-        description: '説明の本文に使う docs/releases/<この名前>.md (v で始まる名前。空なら本文なしで試す)'
+        description: '説明の本文に使う docs/releases/<この名前>.md (v で始まる名前。空なら本文なしで試す。v0.2.3-beta.1 のような beta の名前でファイルがなければ、自動の説明で試す)'
         required: false
         default: ''
 
 permissions:
   contents: read
-
-env:
-  # pix68kcli のビルドに使う Go の版。上げるときは 2 か所を変える: ここと、公開リポジトリの .github/workflows/ci.yml の pix68kcli の job
-  # (公開用の ci.yml はこのリポジトリにはなく、公開に書き出すときに export.sh が差し替える。開発用の ci.yml は Mac の Homebrew の go を使う)
-  GO_VERSION: '1.27.4'
 
 jobs:
   version:
@@ -43,26 +44,34 @@ jobs:
     outputs:
       name: ${{ steps.v.outputs.name }}
       notes: ${{ steps.v.outputs.notes }}
+      notes_text: ${{ steps.v.outputs.notes_text }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     env:
       NOTES_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.notes_tag || '' }}
     steps:
+      # beta の説明にコミットの一覧とタグのメッセージを使うので、履歴とタグを全部取る (作業ツリーは docs/releases だけ)
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           sparse-checkout: docs/releases
+          fetch-depth: 0
       - id: v
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          # shell を書かない run は bash -e で、pipefail がない。タグのメッセージを読む gh api | sed の誤りで止めるために足す
+          set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             NAME=$GITHUB_REF_NAME
             NOTES_NAME=$GITHUB_REF_NAME
+            REV=refs/tags/$GITHUB_REF_NAME
           else
             NAME=dryrun-${GITHUB_SHA:0:7}
             NOTES_NAME=$NOTES_TAG
+            REV=HEAD
           fi
           NOTES=
+          BETA=false
           if [ -n "$NOTES_NAME" ]; then
             # 使える字を先に確かめる。確かめる前の値はログに出さない (改行などで workflow command を書けないように)
             case $NOTES_NAME in
@@ -70,12 +79,69 @@ jobs:
               v*) ;;
               *) echo "::error::タグ / notes_tag は v で始まる名前にする: $NOTES_NAME"; exit 1 ;;
             esac
+            case $NOTES_NAME in
+              *-beta*)
+                if ! [[ $NOTES_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+                  echo "::error::beta のタグは v<版>-beta.<番号> の形にする (例: v0.2.3-beta.1): $NOTES_NAME"
+                  exit 1
+                fi
+                BETA=true ;;
+            esac
             NOTES=docs/releases/$NOTES_NAME.md
-            # ない・空・空白だけのファイルでは、足す文だけの説明で公開されてしまうので止める
             if [ ! -f "$NOTES" ] || ! grep -q '[^[:space:]]' "$NOTES"; then
-              echo "::error::$NOTES がない (か空)。タグを付ける前に、リリースの説明をこのファイルに書いてコミットする"
-              exit 1
+              if [ "$BETA" = true ]; then
+                NOTES=   # beta は説明を自動で作る (下)
+              else
+                # ない・空・空白だけのファイルでは、足す文だけの説明で公開されてしまうので止める
+                echo "::error::$NOTES がない (か空)。タグを付ける前に、リリースの説明をこのファイルに書いてコミットする"
+                exit 1
+              fi
             fi
+          fi
+          # beta の説明の本文を作る: 試験用の版であること、タグのメッセージ (注釈付きのタグのとき)、前のタグからのコミットの一覧
+          TEXT=
+          if [ "$BETA" = true ] && [ -z "$NOTES" ]; then
+            TAG_MSG=
+            if [ "$GITHUB_EVENT_NAME" = push ]; then
+              # actions/checkout は注釈付きのタグを軽量のタグとして作り直すので、タグのメッセージは API で読む。
+              # 署名付きのタグの署名の部分は入れない
+              OBJ=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$NAME" --jq '.object.type + " " + .object.sha')
+              case $OBJ in
+                "tag "*)
+                  TAG_MSG=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/${OBJ#tag }" --jq .message |
+                    sed '/^-----BEGIN [A-Z ]*SIGNATURE-----$/,$d') ;;
+              esac
+            fi
+            # 前のタグは v で始まり数字が続くものだけ (nightly などを拾わない)。v0.2.3-beta1 のように止められて残ったタグは
+            # この条件でも拾うので、止まったタグは消す決まり (docs/releases/README.md)。
+            # 見つからないときは全履歴の一覧にするが、そのことをログに出す
+            if ! PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$REV^" 2>/dev/null); then
+              PREV=
+              echo "::notice::前のタグが見つからない。コミットの一覧は履歴の初めから (最大 100 件)"
+            fi
+            if [ -n "$PREV" ]; then RANGE=$PREV..$REV; else RANGE=$REV; fi
+            TEXT=$(
+              echo "試験用の版 (beta)。正式な版の前に試してもらうためのもの。不具合があれば issue で知らせてほしい。"
+              echo
+              echo "This is a beta for testing before the next release. Please report problems in the issues."
+              if [ -n "$TAG_MSG" ]; then
+                echo
+                printf '%s\n' "$TAG_MSG"
+              fi
+              echo
+              if [ -n "$PREV" ]; then echo "## $PREV からの変更 (Changes since $PREV)"; else echo "## 変更 (Changes)"; fi
+              echo
+              # 件名の & と < と ` は、HTML やコードの始まりとして読まれないように文字参照にする。@ はメンションにならないように
+              # 後ろにゼロ幅スペース (&#8203;) を入れる (GitHub は文字参照を戻してからメンションを探すので、&#64; では止まらない)。
+              # 行の残りの「- 」と短い SHA にはこれらの字はない
+              git log --no-merges --format='- %s (%h)' -n 100 "$RANGE" |
+                sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/`/\&#96;/g' -e 's/@/@\&#8203;/g'
+            )
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$BETA" = false ] && [[ $NAME == *-* ]]; then
+            # -beta 以外の付け足し (v0.2.3-rc1 など) は今は扱わない。正式な版として出してしまわないように止める
+            echo "::error::タグ $NAME は正式な版 (v<版>) でも beta (v<版>-beta.<番号>) でもない"
+            exit 1
           fi
           # 公開済みの同じタグのリリースがあれば、ビルドの前に止める (下書きはこの権限では見えないので、release の job でも調べる)。
           # リリースの一覧を API で読む。読めなければ (認証や API の誤り)「ない」とは見なさず止める
@@ -89,150 +155,34 @@ jobs:
           fi
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "notes=$NOTES" >> "$GITHUB_OUTPUT"
-
-  zip:
-    needs: version
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      PREFIX64: aarch64-linux-gnu-
-      PIX68K_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
-      VERSION: ${{ needs.version.outputs.name }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: submodule を取得
-        run: git submodule update --init --depth 1
-      - name: ツールを入れる
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu rsync xz-utils zip unzip curl python3-numpy python3-pil
-      # Raspberry Pi 2 版 (32 ビット) のコンパイラは Arm GNU Toolchain 15.2.Rel1。Ubuntu のパッケージの arm-none-eabi-gcc 14.2.1 は、
-      # Cortex-A7 で未定義命令の例外になる ldrd を出し、できたカーネルが実機で止まった (tools/baremetal_arm32_check.sh)。
-      # SHA-256 は Arm が配っている .sha256asc の値
-      - name: arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1) を入れる
-        env:
-          ARM_GCC_URL: https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
-          ARM_GCC_SHA256: 597893282ac8c6ab1a4073977f2362990184599643b4c5ee34870a8215783a16
-        run: |
-          set -eu
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/arm-gcc.tar.xz" "$ARM_GCC_URL"
-          echo "$ARM_GCC_SHA256  $RUNNER_TEMP/arm-gcc.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/arm-gcc"
-          tar -xJf "$RUNNER_TEMP/arm-gcc.tar.xz" -C "$RUNNER_TEMP/arm-gcc" --strip-components=1
-          echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/arm-gcc/bin/arm-none-eabi-gcc" --version | head -1
-      - name: zip を作る
-        run: tools/make_release.sh "$VERSION"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-zip
-          path: build/release/pix68k-${{ needs.version.outputs.name }}.zip
-          if-no-files-found: error
-          retention-days: 7
-
-  cli:
-    needs: version
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: tools/pix68kcli
-    env:
-      GOTOOLCHAIN: local
-      CGO_ENABLED: '0'
-      PIX68KCLI_VERSION: ${{ needs.version.outputs.name }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-      - name: go vet と go test
-        run: |
-          go version
-          go vet ./...
-          go test -count=1 ./...
-      - name: 7 つをクロスビルド
-        run: |
-          ./build.sh
-          ls -l dist
-          test "$(ls dist | wc -l)" = 7
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-cli
-          path: tools/pix68kcli/dist/
-          if-no-files-found: error
-          retention-days: 7
-
-  # 載せるファイルをそろえ、SHA256SUMS とリリースの説明を作る (読むだけの権限)。workflow_dispatch ではここまで
-  assemble:
-    needs: [version, zip, cli]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    env:
-      VERSION: ${{ needs.version.outputs.name }}
-      NOTES: ${{ needs.version.outputs.notes }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-          sparse-checkout: docs/releases
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-zip
-          path: dist
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-cli
-          path: dist
-      - name: SHA256SUMS とリリースの説明を作る
-        run: |
-          set -eu
-          cd dist
-          test -f "pix68k-$VERSION.zip"
-          test "$(ls pix68kcli-* | wc -l)" = 7
-          sha256sum "pix68k-$VERSION.zip" pix68kcli-* > SHA256SUMS
-          cat SHA256SUMS
-          cd ..
-          # 説明のファイルは version の job で決めて、あることを確かめてある (空なら notes_tag なしの試し)
-          if [ -n "$NOTES" ]; then
-            test -s "$NOTES"
-            cp "$NOTES" notes.md
-          elif [ "$GITHUB_EVENT_NAME" = push ]; then
-            echo "::error::説明のファイルが決まっていない"; exit 1
-          else
-            echo "(試し: notes_tag を渡していないので、説明の本文は空)" > notes.md
+          echo "prerelease=$BETA" >> "$GITHUB_OUTPUT"
+          # 複数行の出力。区切りの文字列は本文に出てこない乱数にする
+          EOF_MARK=EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+          { echo "notes_text<<$EOF_MARK"; [ -z "$TEXT" ] || printf '%s\n' "$TEXT"; echo "$EOF_MARK"; } >> "$GITHUB_OUTPUT"
+          if [ -n "$TEXT" ]; then
+            # 本文にはタグのメッセージやコミットの件名が入る。ログに出すときに workflow command (::add-mask:: など) として
+            # 読まれないように、stop-commands で囲む (区切りは乱数)
+            STOP=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+            echo "--- 自動で作った説明 ---"
+            echo "::stop-commands::$STOP"
+            printf '%s\n' "$TEXT"
+            echo "::$STOP::"
           fi
-          cat >> notes.md <<'EOF'
 
-          ---
-
-          ソースの場所は zip の中の SOURCE.txt と、このタグのソースを参照。Circle は submodule (external/circle) なので、GitHub が自動で付けるソースの zip と tar.gz には入らない。Circle は https://github.com/rsta2/circle の、SOURCE.txt に書いたコミットを使う。添付のファイルの SHA-256 は SHA256SUMS にある。
-
-          See SOURCE.txt in the zip and the source at this tag. Circle is a submodule (external/circle), so it is not included in the source zip and tar.gz that GitHub generates; use the commit of https://github.com/rsta2/circle written in SOURCE.txt. SHA-256 checksums of the attached files are in SHA256SUMS.
-          EOF
-          mv notes.md dist/notes.md
-          ls -l dist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-files
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
+  # zip、pix68kcli、SHA256SUMS、リリースの説明を作り、artifact (release-files) に置く (release-build.yml)。workflow_dispatch ではここまで
+  build:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      version: ${{ needs.version.outputs.name }}
+      notes: ${{ needs.version.outputs.notes }}
+      notes_text: ${{ needs.version.outputs.notes_text }}
+      require_notes: ${{ github.event_name == 'push' }}
 
   release:
-    needs: [version, assemble]
+    needs: [version, build]
     if: github.event_name == 'push' && github.repository == 'j3tm0t0/pix68k'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -240,6 +190,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.name }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -269,5 +220,10 @@ jobs:
               exit 1 ;;
           esac
           gh --version
+          # beta は pre-release で、Latest にしない (正式な版の Latest を動かさない)
+          set --
+          if [ "$PRERELEASE" = true ]; then set -- --prerelease --latest=false; fi
+          # 念のため: beta の名前なのに pre-release でなければ、正式な版として出してしまわないよう止める
+          case $VERSION in *-beta*) [ "$PRERELEASE" = true ] || { echo "::error::$VERSION は beta なのに prerelease が true でない"; exit 1; } ;; esac
           gh release create "$VERSION" ./* --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "pix68k $VERSION" --notes-file ../notes.md
+            --title "pix68k $VERSION" --notes-file ../notes.md "$@"

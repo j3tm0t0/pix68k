@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -54,6 +55,30 @@ void error(const char* message, const char* detail = "") {
 const char* option(const char* name, const char* fallback) {
     retro_variable var = {name, nullptr};
     return environment && environment(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value ? var.value : fallback;
+}
+
+// 音量のコアのオプション (#340)。libretro 版にあるのは本体の OPM と ADPCM だけなので、拡張の音源の音量は出さない。
+// 値は dB (-40〜+12) か off。選択肢の先頭が既定値になるので、0 から始めて 12 の次に off と -40〜-1 を並べる
+struct VolumeOption { const char* key; const char* label; x68k::Sound::Volume group; };
+constexpr VolumeOption volumeOptions[] = {
+    {"pix68k_vol_opm", "OPM volume (dB)", x68k::Sound::VOL_OPM},
+    {"pix68k_vol_adpcm", "ADPCM volume (dB)", x68k::Sound::VOL_ADPCM},
+    {"pix68k_vol_master", "Master volume (dB)", x68k::Sound::VOL_MASTER},
+};
+std::string volumeChoice(const char* label) {
+    std::string text = std::string(label) + "; 0";
+    for (int dB = 1; dB <= x68k::Sound::VOLUME_MAX; dB++) text += "|" + std::to_string(dB);
+    text += "|off";
+    for (int dB = x68k::Sound::VOLUME_MIN; dB < 0; dB++) text += "|" + std::to_string(dB);
+    return text;
+}
+// 選択肢にない値は 0 dB にする
+int volumeValue(const char* text) {
+    if (!std::strcmp(text, "off")) return x68k::Sound::VOLUME_OFF;
+    char* end = nullptr;
+    const long dB = std::strtol(text, &end, 10);
+    if (end == text || *end || dB < x68k::Sound::VOLUME_MIN || dB > x68k::Sound::VOLUME_MAX) return 0;
+    return (int)dB;
 }
 
 uint64_t micros() {
@@ -151,6 +176,15 @@ struct Session : x68k::LineListener {
     std::unique_ptr<pix68k_retro::RenderWorker> renderWorker;
     std::unique_ptr<pix68k_retro::AudioWorker> audioWorker;
     x68k::Sound& outputSound() { return audioWorker ? audioWorker->sound() : machine->sound(); }
+    // 音量を設定する。音を作るのは audioWorker があればその Sound、なければ本体の Sound。本体の Sound は音を作らない
+    // ときは音量を使わないので、どちらの場合も両方に設定してよい
+    void applyVolumes() {
+        for (const auto& v : volumeOptions) {
+            const int dB = volumeValue(option(v.key, "0"));
+            machine->sound().setVolume(v.group, dB);
+            if (audioWorker) audioWorker->sound().setVolume(v.group, dB);
+        }
+    }
     int16_t audio[2 * x68k::AudioRing::SIZE] = {};
     size_t pendingAudio = 0;
     bool keys[256] = {};
@@ -436,6 +470,9 @@ void retro_set_environment(retro_environment_t cb) {
     static const std::string clockChoice = std::string("CPU clock (restart content); ") + clockChoices;
     static const std::string renderThreadChoice = std::string("Render on another CPU core (restart content); ") + renderThreadChoices;
     static const std::string audioThreadChoice = std::string("Synthesize audio on another CPU core (restart content); ") + audioThreadChoices;
+    static const std::string volumeChoices[] = {volumeChoice(volumeOptions[0].label), volumeChoice(volumeOptions[1].label),
+                                                volumeChoice(volumeOptions[2].label)};
+    static_assert(sizeof volumeChoices / sizeof volumeChoices[0] == sizeof volumeOptions / sizeof volumeOptions[0], "");
     static const retro_variable variables[] = {
         {"pix68k_memory", "Memory (restart content); 2MB|12MB"},
         {"pix68k_clock", clockChoice.c_str()},
@@ -448,6 +485,9 @@ void retro_set_environment(retro_environment_t cb) {
         {"pix68k_performance_log", "Performance timing log; disabled|enabled"},
         {"pix68k_render_thread", renderThreadChoice.c_str()},
         {"pix68k_audio_thread", audioThreadChoice.c_str()},
+        {volumeOptions[0].key, volumeChoices[0].c_str()},
+        {volumeOptions[1].key, volumeChoices[1].c_str()},
+        {volumeOptions[2].key, volumeChoices[2].c_str()},
 #if defined(__vita__) && defined(PIX68K_VITA_GPU_LAYERS)
         {"pix68k_gpu_layers", "Vita GPU palette/layer composition (restart content); enabled|disabled"},
 #endif
@@ -499,6 +539,8 @@ void retro_run() {
     // RetroArch は load_game のあとで SAVE_RAM を復元する。容量補正をそのあとに行う。
     if (session->firstRun) session->reset();
     session->pollInput();
+    bool updated = false;
+    if (environment && environment(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) session->applyVolumes();
     const char* skipOption = option("pix68k_frameskip", "0");
     unsigned skip = skipOption[0] >= '0' && skipOption[0] <= '3' && !skipOption[1] ? skipOption[0] - '0' : 0;
 #if defined(__vita__) && defined(PIX68K_VITA_GPU_LAYERS)
@@ -637,6 +679,7 @@ bool retro_load_game(const retro_game_info* game) {
         next->audioWorker = pix68k_retro::AudioWorker::create(*next->machine, message);
         if (!next->audioWorker && logger) logger(RETRO_LOG_WARN, "pix68k: synthesizing audio on execution thread: %s\n", message.c_str());
     }
+    next->applyVolumes();
     if (logger) logger(RETRO_LOG_INFO, "pix68k config: 68000, RAM=%u, clock=%uHz, frameskip=%s, timing=%s, render_thread=%s audio_thread=%s\n",
                        config.ramSize, config.cpuHz, option("pix68k_frameskip", "0"), option("pix68k_performance_log", "disabled"), next->renderWorker ? "enabled" : "disabled", next->audioWorker ? "enabled" : "disabled");
     next->stateCapacity = pix68k_retro::serializeCapacity(next->stateContext());

@@ -56,10 +56,11 @@ grep -q '^fd1=GAME.XDF$' images/pix68k.cfg || { echo "NG: fd1 path"; cat images/
 "$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --no-sram --no-wait --frames 3 > out.txt 2>&1 || { cat out.txt; echo "NG: second run"; exit 1; }
 grep -qi 'cannot' out.txt && { cat out.txt; echo "NG: cannot load"; exit 1; }
 
-# 拡張ボード: 主のページの Boards (下から Close Restart Save-settings Reset Load-state Save-state State-slot OSD Display Boards) で
+# 拡張ボード: 主のページの Boards (下から Close Restart Save-settings Reset Load-state Save-state State-slot OSD Sound-mixer
+# Display Boards) で
 # Enter。そのページは FPU-board Mercury-Unit Neptune-X MIDI-board (MIDI-out) Back。FPU board と Mercury Unit を on、
 # MIDI board を on、MIDI out を mt32 (ホスト版は uart を飛ばすので、sf2 から右に 2 回) にし、Esc で戻って保存し、Restart で作り直す
-run 200 menu,end,up,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,down,right,right,esc,end,up,up,enter,end,up,enter
+run 200 menu,end,up,up,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,down,right,right,esc,end,up,up,enter,end,up,enter
 want 'menu: settings saved to images/pix68k.cfg'
 for line in fpu_board=on mercury=on midi=on midi_out=mt32; do
   grep -q "^$line\$" images/pix68k.cfg || { echo "NG: $line not written"; cat images/pix68k.cfg; exit 1; }
@@ -76,10 +77,20 @@ sed '/restarting with the new settings/,$d' out.txt | grep -qF 'FPU board' && { 
 want 'FPU board (CZ-6BP1, MC68881) at $E9E000'
 want 'Mercury Unit at $ECC080'
 
-# 画面の出し方: 主のページの Display (下から 9 つ目) で Enter。そのページは Scale Scanlines Curve Mask Back。
+# 音のミキサー: 主のページの Sound mixer (下から 9 つ目) で Enter。OPM を 3dB 下げ (左 3 回)、Master (下に 6 つ) を 2dB 上げ、
+# Esc で戻って保存する。再起動は要らない
+run 200 menu,end,up,up,up,up,up,up,up,up,enter,left,left,left,down,down,down,down,down,down,right,right,esc,end,up,up,enter,esc
+want 'menu: settings saved to images/pix68k.cfg'
+grep -q '^vol_opm=-3$' images/pix68k.cfg || { echo "NG: vol_opm=-3 not written"; cat images/pix68k.cfg; exit 1; }
+grep -q '^vol_master=2$' images/pix68k.cfg || { echo "NG: vol_master=2 not written"; cat images/pix68k.cfg; exit 1; }
+grep -q '^vol_adpcm=' images/pix68k.cfg && { echo "NG: vol_adpcm written though not changed"; exit 1; }
+"$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --no-sram --no-wait --frames 3 > out.txt 2>&1 || { cat out.txt; echo "NG: run with vol_ settings"; exit 1; }
+grep -qi 'bad value\|unknown key: vol' out.txt && { cat out.txt; echo "NG: vol_ settings not read"; exit 1; }
+
+# 画面の出し方: 主のページの Display (下から 10 個目。OSD の上に Sound mixer がある) で Enter。そのページは Scale Scanlines Curve Mask Back。
 # Scale を full に (ホスト版の既定の aspect の次)、Scanlines と Mask を on にし、Esc で戻って保存する。
 # 次の起動でも設定ファイルから読む (読めない値なら bad value と出る)
-run 200 menu,end,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,esc,end,up,up,enter,esc
+run 200 menu,end,up,up,up,up,up,up,up,up,up,enter,right,down,right,down,down,right,esc,end,up,up,enter,esc
 want 'menu: settings saved to images/pix68k.cfg'
 grep -q '^video_scale=full$' images/pix68k.cfg || { echo "NG: video_scale=full not written"; cat images/pix68k.cfg; exit 1; }
 grep -q '^video_filter=scanline,mask$' images/pix68k.cfg || { echo "NG: video_filter not written"; cat images/pix68k.cfg; exit 1; }

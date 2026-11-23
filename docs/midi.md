@@ -227,7 +227,7 @@ PCM の LSI の出力は 66207Hz (24MHz / 725 × 2)。窓をかけた sinc の F
 | Raspberry Pi 5 (Linux) | 1.49 倍 | 1.70 倍 | 59% | 1.68 倍 |
 | Raspberry Pi 3 Model B+ (Linux) | 0.40 倍 | 0.45 倍 | 224% | 0.44 倍 |
 
-Nuked-SC55 のファイルは `-O3` でビルドする。Raspberry Pi 3 Model B+ では実時間の半分ほどしか出ないので、Pi 3 のビルドでは `midi_out=sc55` を
+Nuked-SC55 のファイルは `-O3` でビルドする。Raspberry Pi 3 Model B+ では実時間の半分ほどしか出ないので、Pi 2 / Pi 3 のビルドでは `midi_out=sc55` を
 使わず、ログに書いて MIDI は鳴らさない。Raspberry Pi 4 は測っていない (使えるようにしてあるが、間に合わずに途切れるかもしれない)。
 
 ベアメタル版では、SC-55 の音はコア 3 が OPM と ADPCM の記録を処理し終えた合間に作る (`Sc55Synth::pump()`、
@@ -284,6 +284,7 @@ Pi 5 では、コア 3 が OPM と ADPCM と SC-55 (1 つのコアの 59%) を�
 | | 1 / 2 / 3 / 4 | GPIO 0 (27 番ピン) / GPIO 4 (7 番ピン) / GPIO 8 (24 番ピン) / GPIO 12 (32 番ピン) | 同上 |
 | | 10 | UART の端子 | ログと同じ UART なので、ログは UART に出さなくなる |
 
+- Pi 2 は、Pi 3 と同じく `midi_uart=` は 0 だけで、TXD は GPIO 14 (8 番ピン) のはず。実機では確かめていない
 - Pi 3 は、Circle に PL011 のドライバしかなく、mini UART も TXD は GPIO 14 なので、ログと分けられない。ログは `syslog=` か
   ネットワークの口の `/log` で読む (Pico によるログの中継も止まる)
 - Pi 4 の 2〜5 と Pi 5 の 0〜4 は、RXD のピン (TXD の次の番号の GPIO) も UART に切り替える

@@ -40,9 +40,11 @@ rsync -a --delete --exclude .git \
   --exclude '*.lst' --exclude Config.mk --exclude .pix68k-config --exclude /addon/fatfs/ffconf.h \
   --exclude /include/circle/timer.h --exclude /lib/usb/dwhcidevice.cpp --exclude /lib/net/udpconnection.cpp \
   --exclude /lib/usb/usbfloppydevice.cpp --exclude /include/circle/usb/usbfloppydevice.h --exclude /lib/usb/xhciendpoint.cpp \
+  --exclude /lib/usb/usbserialhost.cpp --exclude /include/circle/usb/usbserialhost.h \
   --exclude /lib/dmachannel.cpp --exclude /lib/dma4channel.cpp --exclude /lib/sound/dmasoundbuffers.cpp \
   --exclude /lib/usb/xhcirootport.cpp --exclude /lib/usb/usbstandardhub.cpp --exclude /lib/usb/xhcicommandmanager.cpp \
   --exclude /include/circle/usb/xhcicommandmanager.h --exclude /lib/usb/xhciusbdevice.cpp --exclude /lib/usb/usbdevice.cpp \
+  --exclude /lib/bcm54213.cpp \
   "$ROOT/external/circle/" "$OUT/circle/"
 cd "$OUT/circle"
 # FatFs の設定は tools/ffconf_patch.sh で書き換える (fast seek、UTF-8 のファイル名など。理由はそちらに書いた)。
@@ -142,11 +144,30 @@ done
 XHCICMD=lib/usb/xhcicommandmanager.cpp
 XHCICMDH=include/circle/usb/xhcicommandmanager.h
 XHCIDEV=lib/usb/xhciusbdevice.cpp
+# xhciusbdevice.cpp は下の FUK の書き換えも重ねるので、ここでは中間のファイル ($XHCIDEV.308) に書き出す
 sh "$ROOT/tools/circle_xhci_cmd_patch.sh" "$ROOT/external/circle/$XHCICMD" "$XHCICMD.tmp" "$ROOT/external/circle/$XHCICMDH" "$XHCICMDH.tmp" \
-  "$ROOT/external/circle/$XHCIDEV" "$XHCIDEV.tmp"
-for f in "$XHCICMD" "$XHCICMDH" "$XHCIDEV"; do
+  "$ROOT/external/circle/$XHCIDEV" "$XHCIDEV.308"
+for f in "$XHCICMD" "$XHCICMDH"; do
   if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
 done
+# USB シリアルのドライバ (CUSBSerialHostDevice。CDC もこれを継ぐ) に、待たずに送る関数と、受信の転送を出したままにする
+# 関数を足す。FUK (USB でつなぐ実物の FDC と FDD) とのやり取りに使う (#295。理由は tools/circle_fuk_patch.sh に書いた)
+USHCPP=lib/usb/usbserialhost.cpp
+USHH=include/circle/usb/usbserialhost.h
+# xHCI のドライバ (Pi 4 / Pi 5) には、USB の装置を破棄する最初に pix68k へ知らせる呼び出しを足す。xhciusbdevice.cpp は
+# 上の #308 の書き換えの結果 ($XHCIDEV.308) に重ねる。中身が変わったときだけ置き換える (毎回置き換えると、更新時刻が
+# 変わって xhciusbdevice.o と libusb.a を毎回作り直す)
+sh "$ROOT/tools/circle_fuk_patch.sh" "$ROOT/external/circle/$USHCPP" "$USHCPP.tmp" "$ROOT/external/circle/$USHH" "$USHH.tmp" \
+  "$XHCIDEV.308" "$XHCIDEV.tmp"
+rm "$XHCIDEV.308"
+for f in "$USHCPP" "$USHH" "$XHCIDEV"; do
+  if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
+done
+# Pi 4 / Pi 400 の Ethernet: 送信クロックを MAC で遅らせる (#356。Pi 400 で送信の 2〜6 割が失われた。理由は
+# tools/circle_genet_patch.sh に書いた)
+GENET=lib/bcm54213.cpp
+sh "$ROOT/tools/circle_genet_patch.sh" "$ROOT/external/circle/$GENET" "$GENET.tmp"
+if cmp -s "$GENET.tmp" "$GENET"; then rm "$GENET.tmp"; else mv "$GENET.tmp" "$GENET"; fi
 
 # カーネルの大きさの上限 (Circle の KERNEL_MAX_SIZE。MB の単位。既定は 2MB)。.bss を含めた終わり (_end) が
 # 読み込む番地 (64 ビットは 0x80000、32 ビットの Pi 2 は 0x8000) + この値を超えると、Circle の sysinit() が何も表示せずに止まる。Pi 3 / Pi 4 / Pi 5 は 68030 / 68060 の命令表
@@ -175,7 +196,7 @@ if [ "$N" = 2 ] && [ -n "$LINUX_GCC" ]; then
   exit 1
 fi
 # 設定 (shim の場所を含む) が変わったときだけ作り直す
-CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1 ufd1024=1 dmaresync=3 hotplug308=2${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
+CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1 ufd1024=1 dmaresync=3 hotplug308=2 fuk295=1${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
 if [ ! -f .pix68k-config ] || [ "$(cat .pix68k-config)" != "$CONFIG" ]; then
   # 設定をやり直している間は .pix68k-config を置かない。途中で失敗したとき、次のビルドが前の設定のまま
   # configure を飛ばさないようにする (書くのは、この if の最後まで成功したとき)

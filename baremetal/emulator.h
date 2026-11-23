@@ -262,6 +262,12 @@ public:
         soundLatency_ = latencyFrames;
     }
     platform::AudioSource* audioSource() { return &audioProxy_; }
+    // 音量 (x68k::Sound::setVolume()。#300)。音を作るのが Machine の Sound でもコア 3 の Sound でもよいように、両方に渡す
+    // (音を作らない方は使わない)。コア 1 やコア 3 が動いている間に呼んでよい
+    void setVolume(x68k::Sound::Volume which, int dB) {
+        machine_->sound().setVolume(which, dB);
+        if (synth_ != nullptr) synth_->setVolume(which, dB);
+    }
     // MIDI ボードの音源 (SoundFont、UART)。コア 1 が動いている間に呼んでよい。音をコア 3 で作るならコア 3 の
     // SoundReplayer が、そうでなければ Machine が使う (どちらで作るかはコア 1 が run() で決めるので、両方に渡す。
     // 使わない方は音源を呼ばない: コア 3 で作るときの Machine の Sound は記録するだけで音を作らない)。out は消さないこと

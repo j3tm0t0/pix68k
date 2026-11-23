@@ -25,6 +25,8 @@ std::string systemDirectory, memory = "2MB", clockOption = "16MHz", diskDrive = 
 std::string padInputs = "enabled";
 std::string frameskip = "0";
 std::string renderThread = "enabled", audioThread = "enabled";
+std::string volOpm = "0", volAdpcm = "0", volMaster = "0"; // pix68k_vol_* (#340)
+bool variablesUpdated = false;
 bool deliveredFrame = false;
 unsigned duplicateFrames = 0;
 bool canDupe = true, performanceLog = false;
@@ -69,9 +71,13 @@ bool RETRO_CALLCONV environment(unsigned cmd, void* data) {
         else if (!std::strcmp(v.key, "pix68k_render_thread")) v.value = renderThread.c_str();
         else if (!std::strcmp(v.key, "pix68k_audio_thread")) v.value = audioThread.c_str();
         else if (!std::strcmp(v.key, "pix68k_performance_log")) v.value = performanceLog ? "enabled" : "disabled";
+        else if (!std::strcmp(v.key, "pix68k_vol_opm")) v.value = volOpm.c_str();
+        else if (!std::strcmp(v.key, "pix68k_vol_adpcm")) v.value = volAdpcm.c_str();
+        else if (!std::strcmp(v.key, "pix68k_vol_master")) v.value = volMaster.c_str();
         else return false;
         return true;
     }
+    if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE) { *static_cast<bool*>(data) = variablesUpdated; variablesUpdated = false; return true; }
     if (cmd == RETRO_ENVIRONMENT_GET_CAN_DUPE) { *static_cast<bool*>(data) = canDupe; return true; }
     if (cmd == RETRO_ENVIRONMENT_GET_LOG_INTERFACE) { static_cast<retro_log_callback*>(data)->log = logMessage; return true; }
     if (cmd == RETRO_ENVIRONMENT_SET_PIXEL_FORMAT) {
@@ -192,9 +198,12 @@ size_t program(uint8_t* ram, uint32_t at, bool mode15) {
         move(0x10, 0xe8000c); move(0x100, 0xe8000e);
     }
     move(0x1234, 0x1000);
+    move(0x02, 0xe92001, true); // ADPCM の再生を始める (pix68k_vol_adpcm の試験に ADPCM の音も要る)
     size_t loop = at + code.size() * 2;
     // MOVE.B $E9A001,$1002 / MOVE.B $E9A003,$1003: 両ポートの入力を RAM に読み続ける。
-    code.insert(code.end(), {0x13f9, 0x00e9, 0xa001, 0, 0x1002, 0x13f9, 0x00e9, 0xa003, 0, 0x1003, 0x60ea});
+    // ADDI.B #$35,D0 / MOVE.B D0,$E92003: ADPCM のデータを書き続ける (使われるのは要求のときに最後に書いた値)。
+    code.insert(code.end(), {0x13f9, 0x00e9, 0xa001, 0, 0x1002, 0x13f9, 0x00e9, 0xa003, 0, 0x1003,
+                             0x0600, 0x0035, 0x13c0, 0x00e9, 0x2003, 0x60e0});
     for (uint16_t word : code) { *ram++ = word >> 8; *ram++ = word; }
     return loop;
 }
@@ -260,6 +269,13 @@ int main(int argc, char** argv) {
         duplicateFrames = 0;
         timingLogs = 0;
         performanceLog = pass != 0;
+        // 2 回目 (本体の Sound で音を作る) と 3 回目 (別のコアで音を作る) は、音量のオプションを変えて読み、途中でも変える
+        // (同じ音量にした直接の Machine と音を比べる)
+        const bool volumes = !real && pass >= 1;
+        volOpm = volumes ? "-6" : "0";
+        volAdpcm = volumes ? "2" : "0";
+        volMaster = volumes ? "3" : "0";
+        size_t silentFrom = 0, silentTo = 0, loudFrom = 0;
         CHECK_EQ(api.retro_load_game(&game), true);
         auto* ram = static_cast<uint8_t*>(api.retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM));
         if (!ram) return 1;
@@ -283,6 +299,11 @@ int main(int argc, char** argv) {
         CHECK_EQ(floppy.load(diskCopy.data(), diskCopy.size(), true, "disk.xdf"), true);
         reference->insertDisk(0, &floppy);
         reference->setTime(1700000000); reference->sound().setOutputRate(48000); reference->powerOn();
+        if (volumes) {
+            reference->sound().setVolume(x68k::Sound::VOL_OPM, -6);
+            reference->sound().setVolume(x68k::Sound::VOL_ADPCM, 2);
+            reference->sound().setVolume(x68k::Sound::VOL_MASTER, 3);
+        }
         std::vector<uint32_t> target(1024 * 1024);
         x68k::Renderer renderer(reference->video());
         renderer.setTarget(target.data(), 1024, 1024, 1024); reference->setLineListener(&renderer);
@@ -345,6 +366,17 @@ int main(int argc, char** argv) {
             if (shortcuts && frame == 94) mouseButtons |= platform::InputSink::MOUSE_RIGHT;
             reference->input().onMouse(frame % 3 - 1 + (shortcuts && frame == 91 ? 8 : 0),
                 frame % 5 - 2 - (shortcuts && frame == 91 ? 8 : 0), mouseButtons);
+            if (volumes && frame == 50) {
+                volMaster = "off"; variablesUpdated = true;
+                reference->sound().setVolume(x68k::Sound::VOL_MASTER, x68k::Sound::VOLUME_OFF);
+                silentFrom = expected.size();
+            }
+            if (volumes && frame == 60) {
+                volMaster = "bogus"; volOpm = "4dB"; variablesUpdated = true; // 選択肢にない値は 0 dB
+                reference->sound().setVolume(x68k::Sound::VOL_MASTER, 0);
+                reference->sound().setVolume(x68k::Sound::VOL_OPM, 0);
+                silentTo = loudFrom = expected.size();
+            }
             reference->runFrame();
             int16_t buffer[2 * 4096]; int n;
             while ((n = reference->sound().ring().drain(buffer, 4096)) > 0) expected.insert(expected.end(), buffer, buffer + n * 2);
@@ -440,6 +472,15 @@ int main(int argc, char** argv) {
             }
             CHECK_EQ(prompt, true);
             CHECK_EQ(command, true);
+        }
+        if (volumes) {
+            // 読み込み時の音量の間と、全体の音量を戻したあとは音が出ていて、off の間は 0 (どれもコアの出力と一致することは
+            // 上で調べた)
+            CHECK_EQ(silentFrom > 0 && silentTo > silentFrom && expected.size() > loudFrom, true);
+            CHECK_EQ(std::any_of(expected.begin(), expected.begin() + silentFrom, [](int16_t v) { return v != 0; }), true);
+            CHECK_EQ(std::all_of(expected.begin() + silentFrom, expected.begin() + silentTo, [](int16_t v) { return v == 0; }), true);
+            CHECK_EQ(std::any_of(expected.begin() + loudFrom, expected.end(), [](int16_t v) { return v != 0; }), true);
+            CHECK_EQ(sound.size() >= silentTo, true);
         }
         api.retro_reset(); run(api);
         api.retro_unload_game();

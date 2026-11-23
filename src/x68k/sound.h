@@ -141,6 +141,19 @@ public:
     static void buildResampleTable(int16_t (*table)[RESAMPLE_TAPS], int centerHz);
 
     Sound() { setOutputRate(0); }
+    // ---- 音量 (ミキサー。#300) ----
+    // 音源のグループごとの音量と、全体 (MASTER) の音量。dB で -40 から +12 (1dB 刻み)、VOLUME_OFF で無音。既定は全部 0dB で、
+    // 0dB のときの比は sound.cpp の Sound::advanceLocal() と Sound::output() にある (OPM 1/2、ADPCM 8 倍、まーきゅりー
+    // ゆにっとの PCM 1/2、YMF288 1/3、CD-ROM 装置のオーディオ 1/2、MIDI の音源 1 倍)。0dB なら、掛けても値は変わらない。
+    // 音を作る側の Sound だけが使う (X68000 を動かす側の Sound は音を作らないので、音量を変えても、記録と再生の一致には
+    // 関係しない)。ステートにも入れない。ほかのコアやスレッドから、音を作っている間に変えてよい (次のサンプルから使う)
+    enum Volume { VOL_OPM, VOL_ADPCM, VOL_MERCURY, VOL_YMF288, VOL_MIDI, VOL_CD, VOL_MASTER, VOL_COUNT };
+    static constexpr int VOLUME_MIN = -40, VOLUME_MAX = 12, VOLUME_OFF = -128;
+    // 範囲の外の dB は端に寄せる (VOLUME_OFF は無音)
+    void setVolume(Volume which, int dB);
+    int volume(Volume which) const { return (int)(int8_t)__atomic_load_n(&volumeDb_[which], __ATOMIC_RELAXED); }
+    // dB を倍率 (2^12 倍。0dB が 4096、VOLUME_OFF が 0) にする
+    static uint32_t volumeGain(int dB);
     void reset();
     // 出力のサンプリング周波数。0 なら音を作らない
     void setOutputRate(int hz);
@@ -171,7 +184,7 @@ public:
     //            (62.5kHz のサンプル。32767 を超えていれば、ほかに足すものがなくても止めている)
     //   mixClipped: その音だけ (CD-ROM 装置のオーディオと MIDI の音源を足す前) で 16 ビットを超えた出力のフレームの数。
     //            どの音源で超えたのかを見分けるためのもの (これが 0 で clipped があれば、足したもので超えている)
-    //   midiFull: MIDI の音源が足した量が 16 ビットの上限か下限に届いた (か超えた) フレームの数。音源の中で止めた
+    //   midiFull: MIDI の音源の出力 (音量を掛ける前) が 16 ビットの上限か下限に届いたフレームの数。音源の中で止めた
     //            (platform/mt32_synth.cpp、sc55_synth.cpp の clamp16()) ときに増える
     //   dropped: リングバッファが満杯で捨てたフレームの数
     // 音が割れるという報告のときに、振り切れているのか、どの音源が大きいのかを実機で見分けるためのもの。
@@ -181,7 +194,13 @@ public:
     struct Levels {
         uint32_t base, midi, clipped;
         uint32_t opm, adpcm, mercury, opn, mix, mixClipped, midiFull, dropped;
+        uint32_t cd, out; // CD-ROM 装置のオーディオの最大 (CD の音量を掛けたあと、全体の音量の前) と、全部を足した値の最大 (16 ビットに止める前)
+        uint32_t midiSrc; // MIDI の音源の最大 (MIDI の音量を掛けたあと、全体の音量の前。ミキサーの画面用。midi は全体の音量のあと)
+        // 音源ごとの振れ幅 (区間の中の最大 - 最小を左右で見た大きい方。音量を掛けたあと。SWING_* の順)。画面の隅で鳴っているかを見るのに使う (#310)。
+        // 最大の絶対値では、止まったあとに最後の値を出し続ける ADPCM や、直流を出す音源が鳴っていることになるので、振れ幅で見る
+        uint32_t swing[6];
     };
+    enum Swing { SWING_OPM, SWING_ADPCM, SWING_PCM, SWING_OPN, SWING_MIDI, SWING_CD, SWING_COUNT };
     Levels takeLevels() {
         const auto take = [](uint32_t& v) { return __atomic_exchange_n(&v, 0u, __ATOMIC_RELAXED); };
         Levels lv;
@@ -196,7 +215,38 @@ public:
         lv.mixClipped = take(levelMixClipped_);
         lv.midiFull = take(levelMidiFull_);
         lv.dropped = take(levelDropped_);
+        lv.cd = take(levelCd_);
+        lv.out = take(levelOut_);
+        lv.midiSrc = take(levelMidiSrc_);
+        for (int i = 0; i < SWING_COUNT; i++) {
+            lv.swing[i] = 0;
+            for (int c = 0; c < 2; c++) { // 左右は別々に見る (左だけに出して止まった ADPCM の、左右の差を振れ幅にしない)
+                const int32_t hi = __atomic_exchange_n(&swingHi_[i][c], INT32_MIN, __ATOMIC_RELAXED);
+                const int32_t lo = __atomic_exchange_n(&swingLo_[i][c], INT32_MAX, __ATOMIC_RELAXED);
+                const uint32_t w = hi >= lo ? (uint32_t)((int64_t)hi - lo) : 0;
+                if (w > lv.swing[i]) lv.swing[i] = w;
+            }
+        }
         return lv;
+    }
+    // 2 つの区間の値を 1 つにまとめる (最大は大きい方、数は足す)。ログ用とメニュー用のように、取った値を使い回すとき
+    static void mergeLevels(Levels& into, const Levels& add) {
+        const auto mx = [](uint32_t& a, uint32_t b) { if (b > a) a = b; };
+        mx(into.base, add.base);
+        mx(into.midi, add.midi);
+        mx(into.opm, add.opm);
+        mx(into.adpcm, add.adpcm);
+        mx(into.mercury, add.mercury);
+        mx(into.opn, add.opn);
+        mx(into.mix, add.mix);
+        mx(into.cd, add.cd);
+        mx(into.out, add.out);
+        mx(into.midiSrc, add.midiSrc);
+        for (int i = 0; i < SWING_COUNT; i++) mx(into.swing[i], add.swing[i]);
+        into.clipped += add.clipped;
+        into.mixClipped += add.mixClipped;
+        into.midiFull += add.midiFull;
+        into.dropped += add.dropped;
     }
     // 補間の刻みを、出力の周波数から決まる値よりどれだけ小さくしているか (千分率。大きくしているときは 0)。
     // 5 までは速さのずれの調整、それより大きければ間に合わない間の調整 (stretchIfLow())。音を作る側が読む (試験用)
@@ -351,8 +401,15 @@ private:
         if (midi > __atomic_load_n(&levelMidi_, __ATOMIC_RELAXED)) __atomic_store_n(&levelMidi_, midi, __ATOMIC_RELAXED);
         if (l > 32767 || l < -32768 || r > 32767 || r < -32768)
             __atomic_fetch_add(&levelClipped_, 1u, __ATOMIC_RELAXED); // 読んで足して書くと、取るのと重なったときに前の区間の数が残る
-        const int32_t ml = l - bl, mr = r - br;
-        if (ml >= 32767 || ml <= -32768 || mr >= 32767 || mr <= -32768) __atomic_fetch_add(&levelMidiFull_, 1u, __ATOMIC_RELAXED);
+        // MIDI の音源の出力が上限に届いた数 (levelMidiFull_) は、音量を掛ける前の値で output() が数える
+    }
+    // 振れ幅 (Levels::swing) の最大と最小を、左 (l) と右 (r) の値でそれぞれ広げる
+    void noteSwing(int which, int32_t l, int32_t r) {
+        const int32_t v[2] = {l, r};
+        for (int c = 0; c < 2; c++) {
+            if (v[c] < __atomic_load_n(&swingLo_[which][c], __ATOMIC_RELAXED)) __atomic_store_n(&swingLo_[which][c], v[c], __ATOMIC_RELAXED);
+            if (v[c] > __atomic_load_n(&swingHi_[which][c], __ATOMIC_RELAXED)) __atomic_store_n(&swingHi_[which][c], v[c], __ATOMIC_RELAXED);
+        }
     }
     // 左右の絶対値の大きい方が、覚えている最大より大きければ書く
     static void notePeak(uint32_t& peak, int32_t a, int32_t b) {
@@ -376,6 +433,16 @@ private:
     int32_t lp1_[2] = {}, lp2_[2] = {}; // フィルタ
     int64_t hpOut_[2] = {};             // 直流を切るフィルタの出力 (2^20 倍)
     int32_t hpIn_[2] = {};              // 直流を切るフィルタの前の入力
+    static constexpr int32_t MIX_LIMIT = (1 << 20) - 1; // フィルタに入れる和の絶対値の上限 (advanceLocal())
+    // 音量 (setVolume())。gain_ は倍率 (2^12 倍)、volumeDb_ は設定した dB (読み返す用)
+    uint32_t gain_[VOL_COUNT] = {4096, 4096, 4096, 4096, 4096, 4096, 4096};
+    uint8_t volumeDb_[VOL_COUNT] = {};
+    uint8_t volumePad_ = 0;
+    // n に倍率 g (2^12 倍) を掛ける (g が 4096 なら n のまま)
+    static int32_t scaled(int32_t n, uint32_t g) { return (int32_t)(((int64_t)n * (int64_t)g) >> 12); }
+    // ほぼ n / 3 (21845 / 65536 を掛けて丸める。|n| が大きいと 1〜2 小さくなる。YMF288 を足すときの比)
+    static int32_t third(int32_t n) { return (int32_t)(((int64_t)n * 21845 + 32768) >> 16); }
+    uint32_t gain(Volume which) const { return __atomic_load_n(&gain_[which], __ATOMIC_RELAXED); }
     int32_t prev_[2] = {};       // 線形補間で直していたときの、前のサンプル (今は使わない。ステートの並びのために残す)
     // 出力の周波数に直すフィルタの履歴 (低域通過フィルタの出力。16 ビットに止める前)。同じ値を j と j + RESAMPLE_TAPS に
     // 書くので、hist_[c] + histPos_ からの RESAMPLE_TAPS 個が、古いものから順に並ぶ
@@ -391,7 +458,12 @@ private:
     // たまり具合 (AudioRing::SIZE 以下) なので 16 ビットで足りる
     uint32_t levelBase_ = 0, levelMidi_ = 0, levelClipped_ = 0; // takeLevels() の説明を参照 (ステートには入れない)
     uint32_t levelOpm_ = 0, levelAdpcm_ = 0, levelMercury_ = 0, levelMix_ = 0; // 同上
-    uint32_t levelMixClipped_ = 0, levelMidiFull_ = 0, levelDropped_ = 0, levelOpn_ = 0;       // 同上
+    uint32_t levelMixClipped_ = 0, levelMidiFull_ = 0, levelDropped_ = 0, levelOpn_ = 0;
+    uint32_t levelCd_ = 0, levelOut_ = 0, levelMidiSrc_ = 0;
+    int32_t swingLo_[SWING_COUNT][2] = {{INT32_MAX, INT32_MAX}, {INT32_MAX, INT32_MAX}, {INT32_MAX, INT32_MAX},
+                                        {INT32_MAX, INT32_MAX}, {INT32_MAX, INT32_MAX}, {INT32_MAX, INT32_MAX}};
+    int32_t swingHi_[SWING_COUNT][2] = {{INT32_MIN, INT32_MIN}, {INT32_MIN, INT32_MIN}, {INT32_MIN, INT32_MIN},
+                                        {INT32_MIN, INT32_MIN}, {INT32_MIN, INT32_MIN}, {INT32_MIN, INT32_MIN}};                                                     // 同上
     uint16_t minFill_ = UINT16_MAX;  // 今の区間 (0.25 秒) のたまり具合の最小値
     uint16_t shortMin_ = UINT16_MAX; // この 1/32 秒のたまり具合の最小値 (stretchIfLow())
     unsigned extra_ = 0;         // 目標に足している量 (フレーム。読むときは extra()、書くときは setExtra())

@@ -73,6 +73,11 @@ public:
     // (ソフトウェアアボートなど) を Host に知らせる
     void notify(Host& host);
     bool active(int ch) const { return (reg_[ch][CSR] & CSR_ACT) != 0; }
+    // チャネル ch の転送バイト数 (MTC) の今の値 (FUK に、書き込むバイト数を先に知らせるために読む。x68k/fuk.h)
+    uint32_t count(int ch) const { return get16(ch, MTC); }
+    // チャネル ch が、MTC のバイト数で終わる 1 ブロックだけの転送をしているか (動いていて、アレイチェーンでも
+    // リンクチェーンでもなく、コンティニューでもない)。そうでなければ、MTC は転送全体のバイト数ではない
+    bool singleBlock(int ch) const { return active(ch) && (reg_[ch][OCR] & 0x0c) == 0 && !(reg_[ch][CCR] & CCR_CNT); }
     // オートリクエストの最大速度 (OCR の REQG = 01) で動いているチャネルがあるか。このチャネルは、転送が終わるまで
     // バスを CPU に返さない (Inside X68000 の PDF の 36、38、53 ページ)
     bool holdsBus(int ch) const { return active(ch) && (reg_[ch][OCR] & 3) == 1 && !(reg_[ch][CCR] & CCR_HLT); }

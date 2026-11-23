@@ -597,6 +597,7 @@ void Machine::resetDevices() {
     sysPort_.reset();
     ioc_.reset();
     fdc_.reset();
+    if (fuk_) fuk_->reset();
     sound_.reset();
     if (sound_.cdOn()) cdDrive_->mixer().reset(); // 記録の読み手は J_RESET で同じことをする
     dmac_.reset();
@@ -745,6 +746,8 @@ void Machine::startLine() {
     if (neptune_) neptune_->poll((uint32_t)((uint64_t)lineCycles_ * 1000000000u / config_.cpuHz)); // 終わったラスタの長さ (ns)
     // MIDI ボードのタイマと送信をラスタごとに進める (レジスタを読み書きしたときも進める)
     if (midi_) syncMidi(lineStart_);
+    // FUK から届いた通知とデータをラスタごとに取り込む (割り込みは advanceDevices() の最後で伝える)
+    if (fuk_) fuk_->poll();
     int total = video_->verticalTotal();
     if (++line_ >= total) {
         line_ = 0;
@@ -989,7 +992,7 @@ bool Machine::dmaWrite8(uint32_t addr, uint8_t v, int fc) {
 
 bool Machine::dmaReady(int ch) {
     switch (ch) {
-    case 0: return fdc_.dataReady();
+    case 0: return fuk_ ? fuk_->dataReady() : fdc_.dataReady();
     case 1: return sasi_.dataReady() || (scsiRom_ != nullptr && spc_.dataReady()); // SASI と内蔵 SCSI
     case 2: return mercury_ && mercury_->drq(); // 拡張スロット (まーきゅりーゆにっと)
     case 3: return sound_.adpcm().drq();
@@ -999,11 +1002,15 @@ bool Machine::dmaReady(int ch) {
 
 // チャネル 1 (SASI と内蔵 SCSI) は TC で何もしない。転送の終わりはコントローラがフェーズを変えて決める
 void Machine::dmaDone(int ch) {
-    if (ch == 0) fdc_.terminalCount();
+    if (ch != 0) return;
+    if (fuk_) fuk_->terminalCount();
+    else fdc_.terminalCount();
 }
 
 void Machine::dmaError(int ch) {
-    if (ch == 0) fdc_.abortTransfer();
+    if (ch != 0) return;
+    if (fuk_) fuk_->abortTransfer();
+    else fdc_.abortTransfer();
 }
 
 // FDC のデータのレジスタ ($E94003)、SASI のデータのレジスタ ($E96001)、内蔵 SCSI の SPC の DREG ($E96035) から RAM への
@@ -1051,7 +1058,7 @@ int Machine::dmaBlockCopy(int ch, bool external, uint32_t dar, int dfc, uint32_t
     if (ch == 0) {
         // FDC は外部要求の転送だけ (IOCS の使い方。オートリクエストで Fdc::readData() が 1 バイトずつと同じになるかは確かめていない)
         if (!external || dar < 0xe94000 || dar >= 0xe96000 || (dar & 7) != 3) return 0;
-        return fdc_.readData(dst, n);
+        return fuk_ ? fuk_->readData(dst, n) : fdc_.readData(dst, n);
     }
     // ioRead() の $E96000-$E97FFF と同じ分け方: $E96000-$E9601F が SASI、$E96020-$E9603F の奇数番地が SPC
     if (dar < 0xe96000 || dar >= 0xe96040) return 0;
@@ -1066,6 +1073,14 @@ int Machine::dmaBlockCopy(int ch, bool external, uint32_t dar, int dfc, uint32_t
     // 1 バイトずつに任せる
     if (external && sasi_.dataReady()) return 0;
     return spc_.readData(dst, n, external);
+}
+
+void Machine::setFuk(Fuk* fuk) {
+    if (fuk_) fuk_->setHost(nullptr);
+    fuk_ = fuk;
+    if (fuk_) fuk_->setHost(this);
+    else ioc_.setRequest(Ioc::SRC_FDD, false);
+    updateIrq();
 }
 
 void Machine::insertDisk(int drive, FloppyImage* image) { fdc_.insert(drive, image); }
@@ -1252,6 +1267,7 @@ void Machine::runFrame() {
 void Machine::updateSoundLines() {
     Opm& opm = sound_.opm();
     fdc_.setForceReady(opm.ct1());
+    if (fuk_) fuk_->setForceReady(opm.ct1());
     sound_.setAdpcmLines(opm.ct2(), ppi_.adpcmPan(), ppi_.adpcmRate());
     mfp_.setGpip(Mfp::GPIP_OPMIRQ, !opm.irq());
 }
@@ -1259,7 +1275,13 @@ void Machine::updateSoundLines() {
 // ---------------------------------------------------------------- 割り込み
 
 void Machine::updateIrq() {
-    ioc_.setRequest(Ioc::SRC_FDC, fdc_.irq());
+    if (fuk_) {
+        // FUK (x68k/fuk.h) を使っている間は、FDC と FDD の割り込みも FUK から来る
+        ioc_.setRequest(Ioc::SRC_FDC, fuk_->irq());
+        ioc_.setRequest(Ioc::SRC_FDD, fuk_->fddIrq());
+    } else {
+        ioc_.setRequest(Ioc::SRC_FDC, fdc_.irq());
+    }
     const bool sasiWants = sasi_.irq(); // SASI の割り込みは、IOC のハードディスクの要因として入る
     ioc_.setRequest(Ioc::SRC_HDD, sasiWants);
     int level = 0;
@@ -1411,7 +1433,7 @@ int Machine::ioRead(uint32_t addr) {
         syncDevices();
         return sound_.adpcm().read(off);
     case 10: {
-        uint8_t v = fdc_.read(off);
+        uint8_t v = fuk_ ? fuk_->read(off) : fdc_.read(off);
         updateIrq();
         return v;
     }
@@ -1612,7 +1634,8 @@ bool Machine::ioWrite(uint32_t addr, uint8_t v) {
         sound_.adpcmWrite(off, v);
         return true;
     case 10:
-        fdc_.write(off, v);
+        if (fuk_) fuk_->write(off, v);
+        else fdc_.write(off, v);
         updateIrq();
         return true;
     case 11: // SASI と内蔵 SCSI (番地の割り当ては読み出しと同じ)
@@ -1633,6 +1656,7 @@ bool Machine::ioWrite(uint32_t addr, uint8_t v) {
         return true;
     case 14:
         ioc_.write(off, v);
+        if (fuk_) fuk_->writeIoc(off, v);
         updateIrq();
         return true;
     case 16: // 外付け SCSI ボード。ROM ($EA0020-) への書き込みはバスエラー

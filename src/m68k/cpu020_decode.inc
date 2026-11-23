@@ -134,7 +134,9 @@ template <int OP> H2 imm2(int sz, uint16_t op) {
     SIZED3E(EC, E_DALT, opImm, , OP)
 }
 template <int OP> H2 unary2(int sz, uint16_t op) { SIZED3E(EC, E_DALT, opUnary, , OP) }
-template <bool SUB> H2 addqSubq2(int sz, uint16_t op) { SIZED3E(EC, E_ALT, opAddqSubq, , SUB) }
+// ADDQ と SUBQ は bool のテンプレート引数で分けない (#351。cpu020_ops.inc の opAddq())
+H2 addq2(int sz, uint16_t op) { SIZED3E(EC, E_ALT, opAddq) }
+H2 subq2(int sz, uint16_t op) { SIZED3E(EC, E_ALT, opSubq) }
 H2 tst2(int sz, uint16_t op) { SIZED3E(EN, E_ALL, opTst) }
 H2 cmpm2(int sz) { SIZED3(TN, opCmpm) }
 template <int TYPE, bool LEFT> H2 shiftReg2(int sz) { SIZED3(TN, opShiftReg, , TYPE, LEFT) }
@@ -433,7 +435,7 @@ H2 decodeLine5_2(uint16_t op) {
     int set = E_ALT;
     if (sz == 0) set &= ~E_AN;
     if (!eOk(op, set)) return nullptr;
-    return (op & 0x100) ? addqSubq2<true>(sz, op) : addqSubq2<false>(sz, op);
+    return (op & 0x100) ? subq2(sz, op) : addq2(sz, op);
 }
 
 H2 decodeLine8_2(uint16_t op) {

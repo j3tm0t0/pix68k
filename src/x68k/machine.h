@@ -45,6 +45,7 @@
 #include "x68k/devices.h"
 #include "x68k/dmac.h"
 #include "x68k/fdc.h"
+#include "x68k/fuk.h"
 #include "x68k/fpu_board.h"
 #include "x68k/mercury.h"
 #include "x68k/midi_out.h"
@@ -357,7 +358,7 @@ struct Config {
     }
 };
 
-class Machine : public m68k::Bus, private Dmac::Host {
+class Machine : public m68k::Bus, private Dmac::Host, private Fuk::Host {
 public:
     void state(StateIO& s); // 状態の保存と復元 (x68k/state.h、state.cpp)
     static constexpr uint32_t IPL_SIZE = 0x20000;
@@ -404,6 +405,12 @@ public:
     void insertDisk(int drive, FloppyImage* image);
     void ejectDisk(int drive);
     Fdc& fdc() { return fdc_; }
+    // FUK (x68k/fuk.h。USB でつなぐ実物の FDC と FDD) を、内蔵の FDC の代わりに使う (#295)。fuk は環境が持つ。
+    // 渡している間は、$E94001-$E94007、DMAC のチャネル 0、FDC と FDD の割り込み、強制レディがすべて FUK に向き、
+    // 内蔵の FDC (insertDisk() のイメージ) は使わない。nullptr で内蔵の FDC に戻す。
+    // FUK の状態はステートに入らない (USB の先の装置の状態は保存できない)。渡している間は、環境がステートの保存を断ること
+    void setFuk(Fuk* fuk);
+    Fuk* fuk() { return fuk_; }
     // SASI のハードディスク。イメージ (HDF、1 レコード 256 バイト) は環境が持ち、Machine はポインタだけを持つ。
     // unit は ID x 2 + 論理ユニット番号 (0..15)。disk を nullptr にすると外れる
     void attachSasi(int unit, HardDiskImage* image);
@@ -753,6 +760,18 @@ private:
     // 数値演算プロセッサボードとまーきゅりーゆにっと (つないだときだけ。上と同じ理由で最後に置く)
     FpuBoard* fpuBoards_[FpuBoard::MAX_BOARDS] = {}; // [0] が $E9E000、[1] が $E9E080
     Mercury* mercury_ = nullptr;
+    Fuk* fuk_ = nullptr; // FUK を使っているとき (setFuk())
+    uint32_t fukDmaCount() override { return dmac_.active(0) ? dmac_.count(0) : 0; }
+    bool fukDmaSingleBlock() override { return dmac_.singleBlock(0); }
+    // X68000 の時間 (ns)。周辺の時刻 (synced_) に、shiftTime() で戻した分を足す (渡している途中で戻しても続くように)
+    uint64_t fukEmuNs() override {
+        const uint64_t c = synced_ + timeShifted_, hz = config_.cpuHz;
+        return c / hz * 1000000000u + c % hz * 1000000000u / hz + 1; // 0 は「分からない」なので避ける
+    }
+    uint64_t fukFrameNs() override {
+        const double rate = frameRate();
+        return rate > 1 ? (uint64_t)(1e9 / rate) : 0;
+    }
     Ts6bga* ts6bga_ = nullptr;
     Neptune* neptune_ = nullptr; // ネットワークボード (つないだときだけ。上と同じ理由で最後に置く)
     Ym3802* midi_ = nullptr;      // MIDI ボード (つないだときだけ。上と同じ理由で最後に置く)

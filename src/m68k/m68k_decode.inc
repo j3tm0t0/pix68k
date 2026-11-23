@@ -77,11 +77,19 @@ template <int OP> H unary(int sz) {
     }
     return nullptr;
 }
-template <bool SUB> H addqSubq(int sz) {
+H addq(int sz) {
     switch (sz) {
-    case 0: return &Cpu::thunk<&Cpu::opAddqSubq<1, SUB>>;
-    case 1: return &Cpu::thunk<&Cpu::opAddqSubq<2, SUB>>;
-    case 2: return &Cpu::thunk<&Cpu::opAddqSubq<4, SUB>>;
+    case 0: return &Cpu::thunk<&Cpu::opAddq<1>>;
+    case 1: return &Cpu::thunk<&Cpu::opAddq<2>>;
+    case 2: return &Cpu::thunk<&Cpu::opAddq<4>>;
+    }
+    return nullptr;
+}
+H subq(int sz) {
+    switch (sz) {
+    case 0: return &Cpu::thunk<&Cpu::opSubq<1>>;
+    case 1: return &Cpu::thunk<&Cpu::opSubq<2>>;
+    case 2: return &Cpu::thunk<&Cpu::opSubq<4>>;
     }
     return nullptr;
 }
@@ -267,7 +275,7 @@ H decodeLine5(uint16_t op) {
     int set = EA_ALT;
     if (sz == 0) set &= ~EA_AN;
     if (!eaOk(op, set)) return nullptr;
-    return (op & 0x100) ? addqSubq<true>(sz) : addqSubq<false>(sz);
+    return (op & 0x100) ? subq(sz) : addq(sz);
 }
 
 H decodeLine8(uint16_t op) {

@@ -1142,9 +1142,10 @@ void Sound::state(StateIO& s) {
     s.range(sub_, 0u, (uint32_t)Opm::CLOCKS_PER_SAMPLE - 1); // 大きな値だと、そのぶんサンプルを作る繰り返しが終わらない
     // フィルタの値は、取りうる範囲になければ読まない (大きな値だと、Sound::output() の引き算と掛け算があふれる)。
     // フィルタに入る値は、OPM (8 チャネル x 4 オペレータ x 8191 の 1/2 = 131056)、ADPCM (12 ビットの値 x 8 = 16384)、
-    // まーきゅりーゆにっと (16384) の和で、
-    // 絶対値は 2^20 より小さい。直流を切るフィルタの出力はその 2 倍まで、低域通過フィルタの値はそれを超えない。
-    // 範囲はそれぞれ 2 倍の余裕を取る: 前の入力 ±2^20、直流を切るフィルタの出力 (2^20 倍の値) ±2^41、
+    // まーきゅりーゆにっと (16384) と YMF288 (FM の 12 音をアルゴリズム 7 で最大にして約 13 万。SSG とリズムが加わる) の和で (0dB では全部で多くて約 52 万)、
+    // 絶対値は 2^20 より小さい (この範囲は、Sound::advanceLocal() がフィルタの前で 2^20 - 1 に止めることで守る)。直流を切るフィルタの出力はその 2 倍まで、低域通過フィルタの値はそれを超えない。
+    // 範囲は、止める前の和にそれぞれ 2 倍の余裕を取ったもの (止める値 2^20 - 1 には、前の入力と直流を切るフィルタの出力では
+    // ほぼ余裕がない): 前の入力 ±2^20、直流を切るフィルタの出力 (2^20 倍の値) ±2^41、
     // 低域通過フィルタ ±2^22、補間の前のサンプルは 16 ビット。この範囲なら、出力の式の 64 ビットの掛け算は 2^62 を超えない
     for (int32_t& v : lp1_) s.range(v, -(1 << 22), 1 << 22);
     for (int32_t& v : lp2_) s.range(v, -(1 << 22), 1 << 22);
@@ -1403,6 +1404,7 @@ static uint32_t boardBits(Machine& m) {
 bool saveState(Machine& m, uint8_t* out, size_t cap, size_t& written, uint32_t version) {
     written = 0;
     if (!m.ok() || cap < STATE_HEADER_SIZE || version < 2 || version > STATE_VERSION) return false;
+    if (m.fuk()) return false; // FUK (USB の先の FDC) の状態は保存できない
     if (version < 17 && m.ts6bga()) return false;
     if (version < 18 && m.ts6bga() && m.ts6bga()->bltBusy()) return false;
     if (version < STATE_FPU_BOARD2 && m.fpuBoard(1)) return false; // 版 15 までの並びには 2 枚目のボードがない
@@ -1429,6 +1431,10 @@ bool loadState(Machine& m, const uint8_t* data, size_t size, const char*& error)
     error = nullptr;
     if (!m.ok()) {
         error = "machine is not ready";
+        return false;
+    }
+    if (m.fuk()) {
+        error = "states cannot be used with FUK";
         return false;
     }
     if (size < STATE_HEADER_SIZE || memcmp(data, kMagic, sizeof kMagic) != 0) {

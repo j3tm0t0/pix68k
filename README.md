@@ -1,9 +1,10 @@
 # pix68k
 Bare Metal X68000 emulator for Raspberry Pi
 
-pix68k emulates the Sharp X68000 on Raspberry Pi 3 / 4 / 5 without an OS
+pix68k emulates the Sharp X68000 on Raspberry Pi 2 / 3 / 4 / 5 without an OS
 (bare metal, built on Circle). Besides the 68000 models, it runs X68030
-(68030 + 68882) and 060turbo (68060) configurations. A host build (SDL2)
+(68030 + 68882) and 060turbo (68060) configurations (Pi 2 runs the
+68000 models only). A host build (SDL2)
 for macOS and Linux is used for development and testing.
 IPL ROM, CGROM and disk images are not included; use your own.
 The documentation is in Japanese. License: GPLv3.
@@ -16,7 +17,7 @@ The documentation is in Japanese. License: GPLv3.
   - Raspberry Pi 2 Model B (BCM2836 の版を実機で確かめている。32 ビットのカーネルで、X68000 の 68000 の機種だけ。X68030、060turbo、数値演算プロセッサボードは使えない。[baremetal.md](docs/baremetal.md) の「Raspberry Pi 2」)
   - Raspberry Pi 3 Model B+ (実機で確かめている)。Raspberry Pi 3 Model B も同じカーネルで動かすが、実機では確かめていない
   - Raspberry Pi 4 Model B (実機で確かめている)
-  - Raspberry Pi 400 (Raspberry Pi 4 Model B と同じカーネルで動かすが、実機では確かめていない)
+  - Raspberry Pi 400 (Raspberry Pi 4 Model B と同じカーネルで動かす。実機では、起動、HDMI の画面、Ethernet を確かめた)
   - Raspberry Pi 5 (実機で確かめている)
   - QEMU の raspi3b でも動く (試験用)
 - 機種: X68000 (68000、10MHz / 16MHz)、X68030 (68030 25MHz と 68882)、060turbo (X68030 に 68060 50MHz / 75MHz を載せた構成)
@@ -33,8 +34,8 @@ The documentation is in Japanese. License: GPLv3.
 3. SD カードの `pix68k/` フォルダに、IPL ROM、CGROM、ディスクのイメージを置く (下の「用意するもの」)
 4. SD カードを Raspberry Pi に挿し、HDMI のモニタと USB のキーボードをつないで電源を入れる。HDMI に X68000 の画面が出る
 
-zip には、Raspberry Pi 3 / 4 / 400 / 5 用のカーネル、Raspberry Pi のファームウェア、`config.txt`、`cmdline.txt` が入っている。
-3 つのカーネルを同じ SD カードに入れてあり、`config.txt` の `[pi3]` `[pi3+]` `[pi4]` `[pi5]` の節で、機種に合うものをファームウェアが選ぶ。
+zip には、Raspberry Pi 2 / 3 / 4 / 400 / 5 用のカーネル、Raspberry Pi のファームウェア、`config.txt`、`cmdline.txt` が入っている。
+4 つのカーネルを同じ SD カードに入れてあり、`config.txt` の `[pi2]` `[pi3]` `[pi3+]` `[pi4]` `[pi5]` の節で、機種に合うものをファームウェアが選ぶ。
 FD0 から起動するには、`pix68k/fd0.xdf` を置くか、`pix68k/pix68k.cfg` にイメージの名前を書く。
 
 ```
@@ -71,7 +72,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 
 - 音は HDMI に出す (`cmdline.txt` で 3.5mm のジャックや I2S の DAC にも変えられる)
 - USB のキーボード、マウス、ゲームパッド (2 台まで) が使える。操作は下の「操作」
-- ログは UART (115200bps) に出る。Raspberry Pi 3 / 4 / 400 は GPIO 14/15、Raspberry Pi 5 は HDMI 端子の間の 3 ピンの UART 端子
+- ログは UART (115200bps) に出る。Raspberry Pi 3 / 4 / 400 は GPIO 14/15 (Pi 2 も同じはずだが、確かめていない)、Raspberry Pi 5 は HDMI 端子の間の 3 ピンの UART 端子
 - SD カードがないか `/pix68k` がないときは、USB メモリの最初の FAT のパーティションの `/pix68k/` を使う
   (Linux を入れた USB メモリなら `/boot/firmware/pix68k/`)。カーネルを LAN から起動して、SD カードを挿さずに使うこともできる
 - Raspberry Pi 5 では、ファンのコネクタのファンを温度に合わせて回す
@@ -117,10 +118,13 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `neptune_mac` | MAC アドレス、`pi` (ベアメタル版だけ) | `02:68:6b:00:00:01` | Neptune-X の MAC アドレス。`pi` は Raspberry Pi の MAC アドレスを使う。ホスト版で `pi` を書くと、`neptune=on` のときは正しくない MAC アドレスとして終了する | ○ |
 | `neptune_link` | `eth`、`echo` など | ベアメタル版は `eth`、ホスト版は `echo` | Neptune-X のフレームの送受信先 | ○ |
 | `rs232c` | `off`、`tcp:PORT` | `off` | RS-232C を TCP につなぐ。ベアメタル版は `net=on` が要る | ○ |
+| `fuk` | `off`、`on`、ホスト版は `PORT_A,PORT_B` も | `off` | USB につないだ FUK (ふろっぴU君。実物の FDC と FDD) を、内蔵の FDC の代わりに使う。ベアメタル版は Pi 4 と Pi 5 だけ。使っている間は `fd0`、`fd1` を使わず、ステートは保存できない ([fuk.md](docs/fuk.md)) | ○ |
+| `fuk_lead` | `0`〜`200000` | `0` | FUK の DMA の Read のデータを渡し始めるまでの遅れ (マイクロ秒)。`0` は 1 フレーム + その 1/8 を上限に自動で決める ([fuk.md](docs/fuk.md) の「Read のデータを渡す時刻」) | ○ |
 | `midi` | `on`、`off` | `off` | MIDI ボード CZ-6BM1。動作を保証しない試験的な機能 ([midi.md](docs/midi.md)) | ○ |
-| `midi_out` | `sf2`、`mt32`、`sc55`、`uart`、`none` | `sf2` | MIDI の行き先。UART への実際の出力はベアメタル版だけで、ホスト版の `uart` は `--midi-dump` のファイルに送るバイト列を書く。Raspberry Pi 3 では `sc55` は使えない | ○ |
+| `midi_out` | `sf2`、`mt32`、`sc55`、`uart`、`none` | `sf2` | MIDI の行き先。UART への実際の出力はベアメタル版だけで、ホスト版の `uart` は `--midi-dump` のファイルに送るバイト列を書く。Raspberry Pi 2 / 3 では `sc55` は使えない | ○ |
 | `midi_sf2` | ファイル名 | なし | SoundFont (SF2) のファイル | ○ |
 | `midi_voices` | `4`〜`256` | `48` | SoundFont の音源の同時に鳴らすボイスの数 | ○ |
+| `vol_opm`、`vol_adpcm`、`vol_mercury`、`vol_ymf288`、`vol_midi`、`vol_cd`、`vol_master` | `-40`〜`12`、`off` | `0` | 音量 (dB)。OPM、ADPCM、まーきゅりーゆにっとの PCM、YMF288、MIDI の音源、CD-ROM 装置のオーディオと、全体。`off` は無音。ホスト版は `--vol opm=-6` のようにも書ける。上げると、足した音が 16 ビットを超えて止まり、歪むことがある。`vol_midi` は音を作る行き先 (SoundFont、MT-32、SC-55) だけで、`midi_out=uart` には掛からない。YMF288 は v0.2.2 までより 3.5dB 小さい (前に近づけるなら `vol_ymf288=4`。[expansion.md](docs/expansion.md)) | ○ |
 | `midi_mt32_ctrl`、`midi_mt32_pcm` | ファイル名 | なし | MT-32 / CM-32L の CONTROL と PCM の ROM | ○ |
 | `midi_sc55` | ディレクトリ名 | なし | SC-55mkII の ROM を置いたディレクトリ | ○ |
 | `midi_uart` | `0`〜`5`、`10` | `0` | `midi_out=uart` で使う UART の番号 (使える番号は機種で違う) | - |
@@ -146,7 +150,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 
 #### 画面の出し方 (`video_scale=`、`video_filter=`)
 
-`video_scale=` で X68000 の画面の拡大の仕方を、`video_filter=` でブラウン管のモニタのように見せる効果を決める。2 つは自由に組み合わせられる (Raspberry Pi 3 は下の制限がある)。
+`video_scale=` で X68000 の画面の拡大の仕方を、`video_filter=` でブラウン管のモニタのように見せる効果を決める。2 つは自由に組み合わせられる (Raspberry Pi 2 / 3 は下の制限がある)。
 
 | `video_scale=` | 拡大の仕方 |
 |---|---|
@@ -172,7 +176,7 @@ X68000 の画面の中身は変えないので、`/screen.ppm`、`--screenshot`�
 ホスト版も同じ枠でウィンドウの中に出す。既定は `aspect` で、ウィンドウに入る最大の 4:3 にする (既定の 768x512 のウィンドウなら 682x512)。`aspect` と `full` は、ウィンドウが X68000 の画面より小さくても縮めて出し、切らない (`integer` と `off` は、ベアメタル版と同じく真ん中を切り出す)。前の版のホスト版は、ウィンドウに入る最大の 3:2 に引き伸ばしていた (768x512 のウィンドウなら 768x512)。ウィンドウいっぱいに出すなら `full` にする。
 
 設定メニューでは Display のページ (Scale、Scanlines、Curve、Mask) で切り替え、すぐに見た目が変わる。主のページには `aspect + scanline,curve` のようにまとめて出す。
-Raspberry Pi 3 (Zero 2 W、3A+ も同じ) では、`curve` と、`full` と `mask` の組は選べない (CPU で作るので、1 フレームの時間に収まらない)。`pix68k.cfg` に書いてあれば、`curve`、`mask` の順に外して選べる組み合わせにし、ログに出す。Raspberry Pi 4 / 5 ではどれも選べる。
+Raspberry Pi 2 と Raspberry Pi 3 (Zero 2 W、3A+ は Pi 3 と同じ) では、`curve` と、`full` と `mask` の組は選べない (CPU で作るので、1 フレームの時間に収まらない)。`pix68k.cfg` に書いてあれば、`curve`、`mask` の順に外して選べる組み合わせにし、ログに出す。Raspberry Pi 4 / 5 ではどれも選べる。
 作り方と、かかる時間は [baremetal.md](docs/baremetal.md) の「画面の出し方」を参照。
 
 ##### モニタの枠 (`cz-600de`、`cz-600db`)
@@ -331,6 +335,9 @@ QEMU での試験、カーネルの大きさの上限などは [baremetal.md](do
 ### ビルドとテスト (ホスト)
 
 ホスト版には SDL2 が要る (macOS は `brew install sdl2`)。
+macOS では Xcode 16 以降 (Apple clang 16 以降) を使う。Xcode 15 の Apple clang 15.0.x は 68030 / 68060 のコアを誤ってコンパイルし
+(ADDQ が SUBQ として動く)、ctest の CPU と FPU の試験が失敗するので、CMake がエラーで止める。
+どうしても試すときは `-DPIX68K_ALLOW_APPLE_CLANG_15=ON` を付けると、警告だけ出してビルドする。
 
 ```sh
 cmake -S . -B build
@@ -363,6 +370,11 @@ SDL2 は不要。出力は macOS では `pix68k_libretro.dylib`、Linux では `
 一緒にできる `pix68k_libretro.info` を RetroArch の「コア情報」のディレクトリに置くと、名前と必要な ROM が表示される。
 Core Options で 2MB / 12MB、16MHz / 10MHz、RTC の開始時刻を選ぶ。変更はコンテンツの再ロードで反映する。
 RTC の `fixed` は地方時 2023-11-14 22:13:20 (1700000000 秒) から始める。既定の `host` は現在の地方時。
+音量は Core Options の `OPM volume (dB)`、`ADPCM volume (dB)`、`Master volume (dB)` (`pix68k_vol_opm`、`pix68k_vol_adpcm`、
+`pix68k_vol_master`) で、-40〜+12 dB と off から選ぶ。既定は 0 dB で、変えるとすぐに反映する。設定ファイルの `vol_*` と同じ値。
+libretro 版には拡張の音源 (まーきゅりーゆにっと、YMF288、MIDI、CD-ROM) がないので、その音量はない。
+OPM と ADPCM の音量はフィルタの前に掛けるので、ステートに入るフィルタの値が音量で変わる。netplay では、相手と
+OPM と ADPCM の音量を揃える (揃えないと、ステートの照合が合わないことがある)。
 
 キーボードは PC のキーに相当する USB HID に変換する。F11 / F12 は XF1 / XF2、Alt は XF1 / XF5、
 Windows / Command は OPT.1 / OPT.2。ゲームパッドの十字キーと B / A は ATARI の方向とトリガ A / B になり、
@@ -419,7 +431,7 @@ RetroPie 用の独立モジュールと導入手順は [retropie/README.md](retr
 ### ゲームとソフトの動作の記録
 
 市販のゲーム (グラディウス、悪魔城ドラキュラなど)、同人ゲーム、ベンチマーク、ドライバを動かした結果は
-[docs/compat.md](docs/compat.md) にまとめている。機種 / CPU、ホスト版か Raspberry Pi 3 / 4 / 5 か、確かめた PR、結果を 1 行ずつ書く。
+[docs/compat.md](docs/compat.md) にまとめている。機種 / CPU、ホスト版か Raspberry Pi 2 / 3 / 4 / 5 か、確かめた PR、結果を 1 行ずつ書く。
 確かめたら、そこに行を足す。
 
 ## ほかのエミュレータとの関係

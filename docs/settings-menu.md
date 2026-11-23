@@ -27,7 +27,7 @@ PC につながずに、ディスクの入れ替えや設定の変更ができ�
   - Boards: Enter で拡張ボードのページに入る (Esc か Back で戻る)。主のページには、つなぐボードの名前を出す
     - FPU board、Mercury Unit、Neptune-X、MIDI board: 拡張ボード (`fpu_board`、`mercury`、`neptune`、`midi`) の on / off (FPU board は off、on、2)。次の起動から。どの CPU でも出す
     - MIDI out (MIDI board が on のとき): MIDI の行き先 (`midi_out`、SoundFont / UART / none / MT-32 / SC-55)。次の起動から。その環境で使えないもの
-      (Raspberry Pi 3 のビルドの SC-55、`--midi-dump` を付けていないホスト版の UART) は選べない。SoundFont や ROM のファイル名 (`midi_sf2` など)、
+      (Raspberry Pi 2 / 3 のビルドの SC-55、`--midi-dump` を付けていないホスト版の UART) は選べない。SoundFont や ROM のファイル名 (`midi_sf2` など)、
       Neptune-X の MAC アドレスと送受信の先はメニューでは変えられないので、pix68k.cfg に書く (ファイル名を書いていない行き先を選ぶと、要るキーを出す)
   - Display: Enter で画面の出し方のページに入る (Esc か Back で戻る)。主のページには「aspect + scanline,curve」のようにまとめて出す。
     どの項目も変えるとすぐに反映する (保存するには Save settings)
@@ -38,6 +38,16 @@ PC につながずに、ディスクの入れ替えや設定の変更ができ�
     - Bezel: モニタの枠 (`video_filter` の `cz-600de` / `cz-600db`)。off、cz-600de (グレー)、cz-600db (黒) の順に替える。ベアメタル版だけに出す。
       初めて選んだときに起動したドライブの `/pix68k/bezel-cz-600de.bin` などを読み、読めなければ選ばない。枠があるときは、主のページの Display は
       「cz-600de + scanline,curve,mask」のように、拡大の代わりに枠の名前を出す (枠はガラスの部分に写し、Scale を使わない)
+  - Sound mixer: Enter で音のミキサーのページに入る (Esc か Back で戻る。#300)。この項目で、主のページは 68000 のベアメタル版で 31 行になり、
+    960x540 (Raspberry Pi 2 の既定) で出せる 31 行ちょうど、768x512 では 1 行あふれて、選んでいる行に合わせて動かして出す。主のページにまた項目を足すと、960x540 でもあふれる。主のページには、0 dB から変えた音量の数を出す (「default」か「2 changed」)。
+    ページの見出しの下に、いまの設定で使える音源を 1 行で出す (「OPM ADPCM MERC(PCM+OPN3) MIDI:MT-32 CD」。#310)
+    - OPM、ADPCM、Mercury PCM、YMF288、MIDI、CD、Master: 音源ごとの音量と全体の音量 (`vol_opm`、`vol_adpcm`、`vol_mercury`、`vol_ymf288`、
+      `vol_midi`、`vol_cd`、`vol_master`)。←→ で 1 dB ずつ、-40 dB から +12 dB まで変え、-40 の下は無音 (off)。変えるとすぐに反映する
+      (保存するには Save settings。再起動は要らない)。
+      行の値は「[##########...]   0 dB  53%」の形で、棒は音量 (1 文字 4 dB)、最後はメニューを開く前の 10 秒ほど (X68000 が動いていた時間。メニューを開いていた間や、deploy の再起動待ちで止めていた間は数えない) の、その音源の最大
+      (その音源の音量を掛けたあと、Master を掛ける前。16 ビットいっぱいを 100%)。16 ビットを超えると「!」を付ける。つないでいない音源 (と、音を作らない MIDI の行き先 UART / none) は「-」。
+      Master の行の % は、全部を足して Master を掛けたあと、16 ビットに止める前の最大。ページの下には、同じ期間に足して 16 ビットを超えて止めたフレームの数を出す
+      (フェーダーを決める目安。メニューを開いている間は音が止まっているので、変えた結果を見るには、メニューを閉じて 10 秒ほど鳴らしてから開き直す)
   - OSD: 画面の右上の数字 (`osd`、off / on / fps)。ベアメタル版は余白が足りなければ on でも X68000 の画面に重ねる (ホスト版は fps のときだけ重ねる)。メニューを開いている間は出さず、on か fps にしてメニューを閉じると 1〜2 秒で出る (数え直すため)。保存するには Save settings を選ぶ
   - State slot、Save state、Load state: ステートの保存と読み込み (下を参照)
   - Reset: X68000 をリセットする (電源を入れ直したときと同じ)

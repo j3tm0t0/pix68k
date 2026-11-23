@@ -363,6 +363,27 @@ public:
         (void)scale;
         (void)filter;
     }
+    // 音のミキサー (Sound mixer。#300) をメニューに出すか
+    virtual bool hasMixer() const { return false; }
+    // メニューで音量 (vol_*=) を変えた (すぐに反映する。group は Settings::volume の添字、dB は -40 から 12 か
+    // Settings::VOLUME_OFF)
+    virtual void volumeChanged(int group, int dB) {
+        (void)group;
+        (void)dB;
+    }
+    // ミキサーの画面に出す、音の様子。メニューを開く前の 10 秒ほどの値 (メニューを開いている間、X68000 は止まっていて
+    // 音は進まない)。分からなければ false
+    struct SoundInfo {
+        // 音源ごとの最大 (16 ビットいっぱいを 100 とした %。音量を掛けたあと。つないでいない音源は -1)。
+        // 並びは Settings::volume と同じ。最後 (全体) は、全部を足して止める前の最大
+        int peak[Settings::VOLUMES];
+        unsigned clipped; // 全部を足して 16 ビットを超え、止めたフレームの数
+        char sources[48]; // 使える音源 (「OPM ADPCM MERC(PCM+OPN3) MIDI:MT-32」のような 1 行)
+    };
+    virtual bool soundInfo(SoundInfo& info) {
+        (void)info;
+        return false;
+    }
     // メニューで画面の隅の数字 (osd=) を変えた (すぐに反映する。呼ぶ時機は videoChanged() と同じ)
     virtual void osdChanged(int osd) { (void)osd; }
     // 画面の右下の使用率のバー (osd_bars=。platform/osd_bars.h) をメニューで切り替えられるか (ベアメタル版だけ)
@@ -413,6 +434,8 @@ public:
         pending_.videoFilter = running.videoFilter;
         pending_.osd = running.osd;
         pending_.osdBars = running.osdBars;
+        // 音量もすぐに反映する (保存しないで閉じたあとに開き直したら、いま鳴っている音量を出す)
+        for (int i = 0; i < Settings::VOLUMES; i++) pending_.volume[i] = running.volume[i];
         open_ = true;
         page_ = MAIN;
         cursor_ = 0;
@@ -502,7 +525,7 @@ public:
         if (fit < 1) fit = height / (16 * scale);
         if (fit < 1) return;
         // 高さが足りなければ、最後の FOOTER 行は残し、その上の行は、選んでいる行が入るように出す範囲を動かす
-        // (主のページは 68000 のベアメタル版で 30 行あり、640x480 や 720x480 では 28 行しか出せない)
+        // (主のページは 68000 のベアメタル版で 31 行あり、768x512 では 30 行、640x480 や 720x480 では 28 行しか出せない)
         const int footer = rows > fit && fit > FOOTER ? FOOTER : 0;
         const int body = rows - footer, bodyFit = fit - footer;
         int first = 0, shownBody = body;
@@ -561,18 +584,22 @@ public:
         return t.str();
     }
     bool inFileList() const { return page_ == FILES; }
+    // いまのページの行 (試験用。MAX_ROWS 行まで)。hl はカーソルの行
+    int linesForTest(char (*lines)[LINE_BYTES], int& hl) const { return buildLines(lines, hl); }
     int stateSlot() const { return slot_; }
 
 private:
-    enum Page { MAIN, FILES, BOARDS, DISPLAY };
+    enum Page { MAIN, FILES, BOARDS, DISPLAY, MIXER };
     enum Item {
         I_FD0, I_FD1, I_FD0_DUMP, I_FD1_DUMP, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
-        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_OSD, I_OSD_BARS,
+        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_MIXER, I_OSD, I_OSD_BARS,
         I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_RESTART, I_CLOSE,
         // ここから拡張ボードのページの項目
         I_FPU_BOARD, I_MERCURY, I_NEPTUNE, I_MIDI, I_MIDI_OUT, I_BACK,
         // ここから画面の出し方のページの項目
-        I_SCALE, I_SCANLINE, I_CURVE, I_MASK, I_BEZEL, I_DISPLAY_BACK, I_COUNT
+        I_SCALE, I_SCANLINE, I_CURVE, I_MASK, I_BEZEL, I_DISPLAY_BACK,
+        // ここから音のミキサーのページの項目 (I_VOL_OPM からの並びは Settings::volume と同じ)
+        I_VOL_OPM, I_VOL_ADPCM, I_VOL_MERCURY, I_VOL_YMF288, I_VOL_MIDI, I_VOL_CD, I_VOL_MASTER, I_MIXER_BACK, I_COUNT
     };
     static constexpr int MAX_ROWS = 40;
     static constexpr int FOOTER = 2; // どのページも、最後の 2 行は「*」の説明 (か空行) と状態の行
@@ -605,12 +632,13 @@ private:
         case I_MASK: return host_.hasVideo();
         case I_BEZEL: return host_.hasVideo() && host_.hasBezel();
         case I_OSD_BARS: return host_.hasOsdBars();
+        case I_MIXER: return host_.hasMixer();
         default: return true;
         }
     }
     // 項目を出すページ
     static Page pageOf(Item it) {
-        return it >= I_SCALE ? DISPLAY : it >= I_FPU_BOARD ? BOARDS : MAIN;
+        return it >= I_VOL_OPM ? MIXER : it >= I_SCALE ? DISPLAY : it >= I_FPU_BOARD ? BOARDS : MAIN;
     }
     // いま開いているページに出す項目か
     bool shown(Item it) const { return usable(it) && pageOf(it) == page_; }
@@ -624,15 +652,16 @@ private:
             if (!shown((Item)i)) continue;
             if (index-- == 0) return (Item)i;
         }
-        return page_ == BOARDS ? I_BACK : page_ == DISPLAY ? I_DISPLAY_BACK : I_CLOSE;
+        return page_ == BOARDS ? I_BACK : page_ == DISPLAY ? I_DISPLAY_BACK : page_ == MIXER ? I_MIXER_BACK : I_CLOSE;
     }
     const char* label(Item it) const {
         static const char* const kLabels[I_COUNT] = {
             "FD0", "FD1", "Save FD0 image", "Save FD1 image", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
-            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "OSD", "OSD bars",
+            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "Sound mixer", "OSD", "OSD bars",
             "State slot", "Save state", "Load state", "Reset", "Save settings", "Restart", "Close",
             "FPU board", "Mercury Unit", "Neptune-X", "MIDI board", "MIDI out", "Back",
             "Scale", "Scanlines", "Curve", "Mask", "Bezel", "Back",
+            "OPM", "ADPCM", "Mercury PCM", "YMF288", "MIDI", "CD", "Master", "Back",
         };
         return kLabels[it];
     }
@@ -666,6 +695,13 @@ private:
         case I_MASK:
         case I_BEZEL: return "video_filter";
         case I_OSD: return "osd";
+        case I_VOL_OPM: return "vol_opm";
+        case I_VOL_ADPCM: return "vol_adpcm";
+        case I_VOL_MERCURY: return "vol_mercury";
+        case I_VOL_YMF288: return "vol_ymf288";
+        case I_VOL_MIDI: return "vol_midi";
+        case I_VOL_CD: return "vol_cd";
+        case I_VOL_MASTER: return "vol_master";
         case I_OSD_BARS: return "osd_bars";
         default: return nullptr;
         }
@@ -794,6 +830,23 @@ private:
             t.add(b != nullptr ? b : "off");
             break;
         }
+        case I_MIXER: {
+            // 0dB でない音量の数を出す (「default」か「3 changed」)
+            int n = 0;
+            for (int v : pending_.volume) n += v != 0;
+            if (n == 0) t.add("default");
+            else t.add((long)n).add(" changed");
+            break;
+        }
+        case I_VOL_OPM:
+        case I_VOL_ADPCM:
+        case I_VOL_MERCURY:
+        case I_VOL_YMF288:
+        case I_VOL_MIDI:
+        case I_VOL_CD:
+        case I_VOL_MASTER:
+            volumeText(it - I_VOL_OPM, t);
+            break;
         case I_OSD:
             // on: 余白に出す。ベアメタル版は余白が足りなければ X68000 の画面に重ねる (IP アドレスをいつも出すため)。
             // ホスト版は重ねない。fps: どちらも重ねる (platform/osd.h の chooseOsd())
@@ -820,8 +873,10 @@ private:
         if (page_ != FILES) {
             line(page_ == BOARDS    ? "Expansion boards  (Esc: back)"
                  : page_ == DISPLAY ? "Display  (Esc: back)"
+                 : page_ == MIXER   ? "Sound mixer  (Left / Right: 1 dB, Esc: back)"
                                     : "pix68k menu  (X68000 is paused)");
-            line("");
+            // ミキサーのページは、見出しの下に使える音源を 1 行出す (なければ空行)
+            line(page_ == MIXER && mixerKnown_ ? mixer_.sources : "");
             const int count = itemCount();
             for (int i = 0; i < count; i++) {
                 const Item it = item(i);
@@ -837,9 +892,17 @@ private:
                 if (i == cursor_) hl = n;
                 line(t.str());
             }
-            // 項目のすぐ下に「*」の説明 (なければ空行)、その下に状態。主のページは 68000 のベアメタル版で 26 項目あり、
-            // 768x512 に出せる 30 行 (draw() の fit) に入れるため、ここに空行をもう 1 つは置かない
-            line(anyChanged() ? "* = applied after Restart" : "");
+            // 項目のすぐ下に「*」の説明 (なければ空行)、その下に状態。主のページは 68000 のベアメタル版で 27 項目あり
+            // (Sound mixer を足して、768x512 に出せる 30 行 (draw() の fit) を 1 行超え、1 行ずれて出る)。行を増やさないよう、
+            // ここに空行をもう 1 つは置かない
+            if (page_ == MIXER) {
+                // 音量はすぐに反映するので「*」は付かない。ここには、メニューを開く前に止めたフレームの数を出す
+                t.clear();
+                if (mixerKnown_) t.add("%: peak in the last 10 s; clipped frames: ").add((long)mixer_.clipped);
+                line(t.str());
+            } else {
+                line(anyChanged() ? "* = applied after Restart" : "");
+            }
             line(page_ != MAIN && strcmp(status_.str(), HELP) == 0 ? HELP_BOARDS : status_.str());
         } else {
             t.clear();
@@ -996,6 +1059,21 @@ private:
             pending_.osdBars = !pending_.osdBars;
             host_.osdBarsChanged(pending_.osdBars);
             break;
+        case I_VOL_OPM:
+        case I_VOL_ADPCM:
+        case I_VOL_MERCURY:
+        case I_VOL_YMF288:
+        case I_VOL_MIDI:
+        case I_VOL_CD:
+        case I_VOL_MASTER: {
+            // 1dB ずつ。-40 の下は無音 (off)、その下へは行かない。+12 より上へも行かない
+            int& v = pending_.volume[it - I_VOL_OPM];
+            if (v == Settings::VOLUME_OFF) v = dir > 0 ? VOLUME_MIN_DB : Settings::VOLUME_OFF;
+            else if (v + dir < VOLUME_MIN_DB) v = Settings::VOLUME_OFF;
+            else v = clamp(v + dir, VOLUME_MIN_DB, VOLUME_MAX_DB);
+            host_.volumeChanged(it - I_VOL_OPM, v);
+            break;
+        }
         case I_SLOT:
             slot_ = (slot_ + dir + 10) % 10;
             break;
@@ -1038,10 +1116,42 @@ private:
         cursor_ = mainCursor_;
     }
     static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+    static constexpr int VOLUME_MIN_DB = -40, VOLUME_MAX_DB = 12;
+    // ミキサーの 1 行の値: 「[##########...]   0 dB  53%」。棒は -40 から +12 を 13 文字で (4dB で 1 文字。0dB は 10 文字)。
+    // 最後は、ページを開く前の 10 秒ほどのその音源の最大 (16 ビットいっぱいを 100%)。100% を超えていれば「!」を付ける。
+    // つないでいない音源は「-」。メニューの幅 (COLS) に入るよう、1 行は見出しと合わせて 44 文字まで
+    void volumeText(int group, MenuText& t) const {
+        const int v = pending_.volume[group];
+        const int cells = v == Settings::VOLUME_OFF ? 0 : (v - VOLUME_MIN_DB) / 4;
+        t.add("[");
+        for (int i = 0; i < 13; i++) t.add(i < cells ? "#" : ".");
+        t.add("] ");
+        if (v == Settings::VOLUME_OFF) {
+            t.add("   off");
+        } else {
+            char num[8];
+            MenuText n(num, sizeof num);
+            if (v > 0) n.add("+");
+            n.add((long)v);
+            for (size_t i = strlen(num); i < 3; i++) t.add(" ");
+            t.add(num).add(" dB");
+        }
+        if (!mixerKnown_) return;
+        const int peak = mixer_.peak[group];
+        t.add(" ");
+        if (peak < 0) {
+            t.add("   -");
+        } else {
+            if (peak < 100) t.add(" ");
+            if (peak < 10) t.add(" ");
+            t.add((long)(peak > 999 ? 999 : peak)).add(peak > 100 ? "%!" : "%");
+        }
+    }
 
     void activate(Item it) {
         // ページを移るだけなら状態の行は残す (拡張ボードのページで出した案内を、戻ったあとも読めるように)
-        if (it != I_BOARDS && it != I_BACK && it != I_DISPLAY && it != I_DISPLAY_BACK) status_.clear();
+        if (it != I_BOARDS && it != I_BACK && it != I_DISPLAY && it != I_DISPLAY_BACK && it != I_MIXER && it != I_MIXER_BACK)
+            status_.clear();
         // ファイルの一覧を開くのは操作に数えない (FD の取り出しは一覧の中で選ぶ)。値を変える項目は change() が呼ぶ
         if (it == I_SAVE_STATE || it == I_LOAD_STATE || it == I_RESET || it == I_SAVE_SETTINGS || it == I_CLOSE ||
             it == I_FD0_DUMP || it == I_FD1_DUMP)
@@ -1078,8 +1188,13 @@ private:
         case I_DISPLAY:
             enterPage(DISPLAY);
             break;
+        case I_MIXER:
+            mixerKnown_ = host_.soundInfo(mixer_);
+            enterPage(MIXER);
+            break;
         case I_BACK:
         case I_DISPLAY_BACK:
+        case I_MIXER_BACK:
             leavePage();
             break;
         case I_SAVE_STATE:
@@ -1219,6 +1334,8 @@ private:
     bool open_ = false;
     bool restartPending_ = false;
     Page page_ = MAIN;
+    MenuHost::SoundInfo mixer_ = {}; // ミキサーのページを開いたときの音の様子
+    bool mixerKnown_ = false;
     int cursor_ = 0;
     int mainCursor_ = 0;               // 拡張ボードか画面の出し方のページに入る前のカーソル
     const char* midiHint_ = nullptr;   // 状態の行に出した midiHint() の案内 (出していなければ nullptr)

@@ -455,8 +455,9 @@ void testIp() {
     ones.a = ones.b = ones.c = ~0ull;
     CHECK_EQ(osdRows(ones), OSD_V_ROWS);
     formatOsdRows(rows, ones, OSD_V_ROWS);
-    CHECK_EQ(strcmp(rows + 7 * OSD_V_COLS, "      THROTTLED"
-                                           "255.255.255.255"), 0);
+    // (ビットがすべて 1 なら音源の行 (#310) も全部出る。IP アドレスはその下)
+    CHECK_EQ(strncmp(rows + 7 * OSD_V_COLS, "      THROTTLED", OSD_V_COLS), 0);
+    CHECK_EQ(strcmp(rows + (OSD_V_ROWS - 1) * OSD_V_COLS, "255.255.255.255"), 0);
 }
 
 // IP アドレスが出たり消えたり変わったりしたとき: 行数 (場所) が変われば前の場所を消して描き、アドレスだけ変われば
@@ -598,7 +599,7 @@ void testOverlayVertical() {
         CHECK_EQ(r.vertical && r.overlay, true);
         CHECK_EQ(r.x < s.dstX + s.dstW && r.x + r.w > s.dstX + s.dstW, true); // 右端をまたぐ
         CHECK_EQ(r.y < s.dstY && r.y + r.h > s.dstY, true);                 // 上端をまたぐ
-        CHECK_EQ(r.h, OSD_V_ROWS * 16);
+        CHECK_EQ(r.h, osdRows(full) * 16);
         ShowSim plain(768, 512, 960, 540, s); // OSD なしで写したもの
         presentScaled<CheckingStore>(plain.src.data(), 768, (uint8_t*)plain.fb.data(), plain.pitch, s, plain.line.data());
         long wrongInside = 0, diffOutside = 0;
@@ -678,13 +679,13 @@ void testOsdBounds() {
     r = chooseOsd(OSD_MODE_ON, 768, 700, 0, 19, 768, 512, osdChars(v), osdRows(v));
     CHECK_EQ(r.vertical, true); // 横 1 行も重なるので、縦に並べて重ねる
     CHECK_EQ(r.overlay, true);
-    // 縦 9 行の高さ
+    // 縦 9 行の高さ (音源の行 (#310) はなし)
     st.throttled = true;
     st.fanLevel = 1;
     const OsdValue nine = packOsd(st);
-    CHECK_EQ(osdRows(nine), OSD_V_ROWS);
-    CHECK_EQ(placeOsdVertical(768, 148, 0, 0, 768, 148, OSD_V_ROWS).w > 0, true);
-    CHECK_EQ(placeOsdVertical(768, 147, 0, 0, 768, 147, OSD_V_ROWS).w, 0);
+    CHECK_EQ(osdRows(nine), OSD_V_ITEMS + 1);
+    CHECK_EQ(placeOsdVertical(768, 148, 0, 0, 768, 148, OSD_V_ITEMS + 1).w > 0, true);
+    CHECK_EQ(placeOsdVertical(768, 147, 0, 0, 768, 147, OSD_V_ITEMS + 1).w, 0);
     r = chooseOsd(OSD_MODE_ON, 768, 148, 0, 0, 768, 148, osdChars(nine), osdRows(nine));
     CHECK_EQ(r.vertical && r.overlay, true);
     CHECK_EQ(r.y + r.h, 148);
@@ -1326,6 +1327,9 @@ void testCoverage() {
     st.fanRpm = 2300;
     st.throttled = true;
     st.ipv4 = 0xc0a864c8u; // 192.168.100.200
+    st.soundSources = OSD_SND_ALL; // 音源の行もいちばん多く (#310)
+    st.soundActive = OSD_SND_OPM | OSD_SND_MIDI;
+    st.midiOut = 3;
     const OsdValue v = packOsd(st);
     CHECK_EQ(osdRows(v), OSD_V_ROWS);
     struct Size { int w, h, gx, gy; const char* note; };
@@ -1384,16 +1388,16 @@ void testCoverage() {
             const bool overlap =
                 r.x < fs.dstX + fs.dstW && fs.dstX < r.x + r.w && r.y < fs.dstY + fs.dstH && fs.dstY < r.y + r.h;
             CHECK_EQ(overlap, r.overlay);
-            // IP アドレスが入る (縦なら 9 行目、横 1 行ならいちばん右)
+            // IP アドレスが入る (縦なら音源の行 (#310) の下の 13 行目、横 1 行ならいちばん右)
             if (narrow) {
                 // 狭い並び: IP アドレスは最後の 2 行に分かれる
                 CHECK_EQ(r.h, OSD_V_ROWS_NARROW * 16);
                 formatOsdRows(text, v, r.h / 16, OSD_V_ITEM);
-                CHECK_EQ(strcmp(text + 8 * OSD_V_ITEM, "   192.168.    100.200"), 0);
+                CHECK_EQ(strcmp(text + (8 + OSD_V_SOUND_ROWS) * OSD_V_ITEM, "   192.168.    100.200"), 0);
             } else if (r.vertical) {
                 CHECK_EQ(r.h, OSD_V_ROWS * 16);
                 formatOsdRows(text, v, r.h / 16);
-                CHECK_EQ(strncmp(text + 8 * OSD_V_COLS, "192.168.100.200", OSD_V_COLS), 0);
+                CHECK_EQ(strncmp(text + (8 + OSD_V_SOUND_ROWS) * OSD_V_COLS, "192.168.100.200", OSD_V_COLS), 0);
             } else {
                 formatOsd(text, v, r.w / 8);
                 CHECK_EQ(strcmp(text + r.w / 8 - 15, "192.168.100.200"), 0);
@@ -1478,6 +1482,8 @@ void testNarrow() {
     s.throttled = true;
     s.fanLevel = 1;
     s.fanRpm = 2200;
+    s.soundSources = OSD_SND_ALL;
+    s.midiOut = 4;
     const OsdValue v3 = packOsd(s);
     CHECK_EQ(osdRowsNarrow(v3), OSD_V_ROWS_NARROW);
     CHECK_EQ(OSD_V_ITEM * OSD_V_ROWS_NARROW <= OSD_TEXT_MAX, true);
@@ -1489,17 +1495,100 @@ void testNarrow() {
     CHECK_EQ(rn.h, OSD_V_ROWS_NARROW * 16);
     std::vector<uint32_t> img((size_t)rn.w * rn.h, 0x12345678u);
     renderOsd(img.data(), rn, v3);
-    int badPx = 0, fg = 0;
+    int badPx = 0, fg = 0, dim = 0;
     for (uint32_t px : img) {
-        if (px != OSD_FG && px != OSD_BG) badPx++;
+        if (px != OSD_FG && px != OSD_BG && px != OSD_DIM) badPx++;
         if (px == OSD_FG) fg++;
+        if (px == OSD_DIM) dim++; // 鳴っていない音源 (#310)
     }
     CHECK_EQ(badPx, 0);
     CHECK_EQ(fg > 0, true);
+    CHECK_EQ(dim > 0, true);
+}
+
+// 音源の行 (#310): 数字の最後の行のすぐ下に、つないでいる音源を 1 行 1 組で出し、鳴っていない音源の文字は OSD_DIM_BIT を
+// 立てる (灰色)。IP アドレスはその下。つないでいなければ (soundSources が 0) 行を出さない
+void testSoundRows() {
+    printf("sound rows\n");
+    OsdStats s;
+    s.composedDeci = s.shownDeci = 555;
+    s.speedPct = 100;
+    s.ipv4 = 0x0a000205u; // 10.0.2.5
+    const OsdValue none = packOsd(s);
+    CHECK_EQ(osdRows(none), 5); // 4 行 + IP アドレス
+    s.soundSources = OSD_SND_ALL;
+    s.soundActive = OSD_SND_OPM | OSD_SND_OPN;
+    s.midiOut = 3;
+    const OsdValue v = packOsd(s);
+    const OsdStats u = unpackOsd(v);
+    CHECK_EQ(u.soundSources, s.soundSources);
+    CHECK_EQ(u.soundActive, s.soundActive);
+    CHECK_EQ(u.midiOut, 3);
+    CHECK_EQ(u.ipv4, s.ipv4);
+    CHECK_EQ(v != none, true);
+    OsdStats s2 = s;
+    s2.soundActive = OSD_SND_OPM;
+    CHECK_EQ(packOsd(s2) != v, true); // 鳴った音源が変われば描き直す
+    CHECK_EQ(osdRows(v), 9);
+    char text[OSD_TEXT_MAX + 1], plain[OSD_TEXT_MAX + 1];
+    const auto toPlain = [&]() { // 灰色の文字を「_」にして見る
+        size_t i = 0;
+        for (; text[i]; i++) plain[i] = ((unsigned char)text[i] & OSD_DIM_BIT) ? '_' : text[i];
+        plain[i] = 0;
+    };
+    formatOsdRows(text, v, osdRows(v));
+    toPlain();
+    CHECK_EQ(strncmp(plain + 4 * OSD_V_COLS, "      OPM _____", OSD_V_COLS), 0);
+    CHECK_EQ(strncmp(plain + 5 * OSD_V_COLS, "  MERC ___+OPN3", OSD_V_COLS), 0);
+    CHECK_EQ(strncmp(plain + 6 * OSD_V_COLS, "     __________", OSD_V_COLS), 0); // MIDI:MT-32 (鳴っていない)
+    CHECK_EQ(strncmp(plain + 7 * OSD_V_COLS, "             __", OSD_V_COLS), 0); // CD
+    CHECK_EQ(strncmp(plain + 8 * OSD_V_COLS, "       10.0.2.5", OSD_V_COLS), 0);
+    char name[OSD_V_COLS + 1]; // 灰色の文字も、bit 7 を落とせば名前
+    for (int i = 0; i < OSD_V_COLS; i++) name[i] = (char)((unsigned char)text[6 * OSD_V_COLS + i] & ~OSD_DIM_BIT);
+    name[OSD_V_COLS] = 0;
+    CHECK_EQ(strcmp(name, "     MIDI:MT-32"), 0);
+    // 狭い並び (11 文字) では「MERC」を出さない
+    formatOsdRows(text, v, osdRowsNarrow(v), OSD_V_ITEM);
+    toPlain();
+    CHECK_EQ(strncmp(plain + 5 * OSD_V_ITEM, "   ___+OPN3", OSD_V_ITEM), 0);
+    // まーきゅりーゆにっとも MIDI も CD もなければ 1 行だけ
+    OsdStats s3 = s;
+    s3.soundSources = OSD_SND_OPM | OSD_SND_ADPCM;
+    CHECK_EQ(osdRows(packOsd(s3)), 6);
+    // MIDI の行き先が UART なら、鳴ったか分からないので明るく出す
+    s.midiOut = 1;
+    formatOsdRows(text, packOsd(s), 9);
+    CHECK_EQ(strncmp(text + 6 * OSD_V_COLS, "      MIDI:UART", OSD_V_COLS), 0);
+    // 横 1 行には出さない
+    char line[OSD_CHARS_MAX + 1], line0[OSD_CHARS_MAX + 1];
+    formatOsd(line, v, OSD_CHARS);
+    formatOsd(line0, none, OSD_CHARS);
+    CHECK_EQ(strcmp(line, line0), 0);
+    CHECK_EQ(osdChars(v), osdChars(none));
+    // X68000 の画面に重ねるときは音源の行を出さない (隠す範囲を広げない。Fable のレビュー): 高さは音源の行を除いた行数で、
+    // IP アドレスは数字のすぐ下。灰色の文字もない
+    const OsdRect ov = chooseOsd(OSD_MODE_ON, 768, 512, 0, 0, 768, 512, osdChars(v), osdRows(v), osdRowsNarrow(v),
+                                 osdRows(v, false));
+    CHECK_EQ(ov.vertical && ov.overlay, true);
+    CHECK_EQ(ov.h, osdRows(v, false) * 16);
+    CHECK_EQ(osdRows(v, false), osdRows(none));
+    std::vector<uint32_t> img((size_t)ov.w * ov.h, 0);
+    renderOsd(img.data(), ov, v);
+    int dim = 0;
+    for (uint32_t px : img) dim += px == OSD_DIM;
+    CHECK_EQ(dim, 0);
+    formatOsdRows(text, v, osdRows(v, false), OSD_V_COLS, false);
+    CHECK_EQ(strncmp(text + 4 * OSD_V_COLS, "       10.0.2.5", OSD_V_COLS), 0);
+    // 重ならないときは音源の行を出す (高さに音源の行が入る)
+    const OsdRect side = chooseOsd(OSD_MODE_ON, 1920, 1080, 240, 0, 1440, 1080, osdChars(v), osdRows(v), osdRowsNarrow(v),
+                                   osdRows(v, false));
+    CHECK_EQ(side.vertical && !side.overlay, true);
+    CHECK_EQ(side.h, osdRows(v) * 16);
 }
 
 int main() {
     testNarrow();
+    testSoundRows();
     testFormat();
     testFps();
     testCoverage();

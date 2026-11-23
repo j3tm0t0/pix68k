@@ -223,7 +223,8 @@ public: // 命令実装・デコーダ・テストから使う
     template <int S> void opCmpm(uint16_t op);
     template <int S, int OP> void opImm(uint16_t op);
     template <int OP> void opImmSr(uint16_t op);
-    template <int S, bool SUB> void opAddqSubq(uint16_t op);
+    template <int S> void opAddq(uint16_t op);
+    template <int S> void opSubq(uint16_t op);
     template <int S> void opMove(uint16_t op);
     template <int S> void opMovea(uint16_t op);
     void opMoveq(uint16_t op);

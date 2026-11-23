@@ -1,0 +1,220 @@
+name: Release build
+
+# 配るもの (zip、pix68kcli の 7 つ、SHA256SUMS) を作り、artifact (release-files) に置く。ほかの workflow から呼ぶ
+# (workflow_call) だけで、単独では動かない。呼ぶのは release.yml (タグの Release と workflow_dispatch の予行) と、
+# 開発用リポジトリの nightly.yml (main の最新を pre-release に置く)。
+#   - release-zip: pix68k-<version>.zip (tools/make_release.sh)
+#   - release-cli: pix68kcli-* (tools/pix68kcli/build.sh)
+#   - release-files: 上の 8 つと SHA256SUMS と、リリースの説明 (notes.md)
+# 既定は GitHub のホストの runner (入力 runner で変えられる。release.yml は既定のまま)。権限は読むだけ。Release を作る、置き直すのは呼んだ側の job。
+# github.event_name などの github コンテキストは呼んだ側のもの (チェックアウトするのも呼んだ側のコミット)。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: '版の名前 (zip の名前、pix68kcli の版、SOURCE.txt に入る)'
+        required: true
+        type: string
+      notes:
+        description: 'リリースの説明の本文にするファイル (docs/releases/<タグ>.md)。空なら本文なし'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'runs-on に渡す値の JSON (既定は GitHub のホストの runner。開発用の nightly.yml が自前の runner のラベルを渡す)'
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      notes_text:
+        description: 'notes が空のときに説明の本文にする文 (beta の自動の説明)。空なら使わない'
+        required: false
+        type: string
+        default: ''
+      retention_days:
+        description: 'artifact を残す日数 (nightly は Release に置いたあとは要らないので 1)'
+        required: false
+        type: number
+        default: 7
+      require_notes:
+        description: 'true なら notes が空のときに止める (タグの Release)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # pix68kcli のビルドに使う Go の版。上げるときは 2 か所を変える: ここと、公開リポジトリの .github/workflows/ci.yml の pix68kcli の job
+  # (公開用の ci.yml はこのリポジトリにはなく、公開に書き出すときに export.sh が差し替える。開発用の ci.yml は runner の機械の go を使う)
+  GO_VERSION: '1.27.4'
+
+jobs:
+  zip:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PREFIX64: aarch64-none-elf-
+      PIX68K_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: submodule を取得
+        run: git submodule update --init --depth 1
+      - name: ツールを入れる (GitHub のホストの runner)
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync xz-utils zip unzip curl python3-numpy python3-pil
+      # self-hosted の runner の機械には、上と同じものを入れておく (job の中では入れない)
+      - name: ツールがあるか確かめる (自前の runner)
+        if: runner.environment != 'github-hosted'
+        run: |
+          set -eu
+          for c in rsync xz zip unzip curl python3 make; do
+            command -v "$c" >/dev/null || { echo "::error::$c がない。runner の機械に入れる"; exit 1; }
+          done
+          python3 -c 'import numpy, PIL' || { echo "::error::python3 の numpy か Pillow がない (python3-numpy python3-pil)"; exit 1; }
+      # コンパイラは Arm GNU Toolchain 15.2.Rel1 の 2 つ。どの runner でも同じ版を取ってきて SHA-256 を照合する
+      # (self-hosted の runner では ~/.cache/pix68k/toolchains に置いて使い回す。tools/fetch_arm_toolchain.sh)。
+      #   aarch64-none-elf: Raspberry Pi 3 / 4 / 5 版 (64 ビット)。開発用の CI の baremetal の job と同じコンパイラ
+      #   arm-none-eabi: Raspberry Pi 2 版 (32 ビット)。Ubuntu のパッケージの arm-none-eabi-gcc 14.2.1 は、Cortex-A7 で
+      #   未定義命令の例外になる ldrd を出し、できたカーネルが実機で止まった (tools/baremetal_arm32_check.sh)
+      # SHA-256 は Arm が配っている .sha256asc の値。版を上げるときは URL と SHA-256 を 4 つとも変える
+      - name: コンパイラ (Arm GNU Toolchain 15.2.Rel1) を入れる
+        env:
+          ARM_GCC_BASE: https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel
+          ARM_GCC_A64: arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          ARM_GCC_A64_SHA256: 66f7ce7c1bf662f589a4caf440812375f3cd8000a033ccf0971127a0726d6921
+          ARM_GCC_A32: arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
+          ARM_GCC_A32_SHA256: 597893282ac8c6ab1a4073977f2362990184599643b4c5ee34870a8215783a16
+        run: |
+          set -eu
+          A64=$(tools/fetch_arm_toolchain.sh "$ARM_GCC_BASE/$ARM_GCC_A64" "$ARM_GCC_A64_SHA256")
+          A32=$(tools/fetch_arm_toolchain.sh "$ARM_GCC_BASE/$ARM_GCC_A32" "$ARM_GCC_A32_SHA256")
+          "$A64/aarch64-none-elf-gcc" --version | head -1
+          "$A32/arm-none-eabi-gcc" --version | head -1
+          echo "$A64" >> "$GITHUB_PATH"
+          echo "$A32" >> "$GITHUB_PATH"
+      # self-hosted の runner では、開発用の CI と同じく、コンパイラを ccache を通して呼ぶ (/usr/local/lib/pix68k-ccache に
+      # コンパイラと同じ名前の ccache へのリンクがある。ディレクトリがなければ何もしない)。PATH は後に足したものが先に来るので、
+      # 上のコンパイラより後に足す。ccache は同じ入力に同じ出力を返すので、できるものは変わらない
+      - name: ccache を使う
+        if: runner.environment != 'github-hosted'
+        run: |
+          d=/usr/local/lib/pix68k-ccache
+          if [ -d "$d" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+      - name: zip を作る
+        run: tools/make_release.sh "$VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-zip
+          path: build/release/pix68k-${{ inputs.version }}.zip
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+
+  cli:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: tools/pix68kcli
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '0'
+      PIX68KCLI_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: go vet と go test
+        run: |
+          go version
+          go vet ./...
+          go test -count=1 ./...
+      - name: 7 つをクロスビルド
+        run: |
+          ./build.sh
+          ls -l dist
+          test "$(ls dist | wc -l)" = 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-cli
+          path: tools/pix68kcli/dist/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+
+  # 載せるファイルをそろえ、SHA256SUMS とリリースの説明を作る (読むだけの権限)
+  assemble:
+    needs: [zip, cli]
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+      NOTES: ${{ inputs.notes }}
+      NOTES_TEXT: ${{ inputs.notes_text }}
+      REQUIRE_NOTES: ${{ inputs.require_notes }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: docs/releases
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-zip
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-cli
+          path: dist
+      - name: SHA256SUMS とリリースの説明を作る
+        run: |
+          set -eu
+          cd dist
+          test -f "pix68k-$VERSION.zip"
+          test "$(ls pix68kcli-* | wc -l)" = 7
+          sha256sum "pix68k-$VERSION.zip" pix68kcli-* > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          # 説明のファイルは呼んだ側 (release.yml の version の job) で決めて、あることを確かめてある。
+          # ファイルがなく NOTES_TEXT があればそれを本文にする (beta の自動の説明)。どちらもなければ本文なし
+          if [ -n "$NOTES" ]; then
+            test -s "$NOTES"
+            cp "$NOTES" notes.md
+          elif [ -n "$NOTES_TEXT" ]; then
+            printf '%s\n' "$NOTES_TEXT" > notes.md
+          elif [ "$REQUIRE_NOTES" = true ]; then
+            echo "::error::説明のファイルが決まっていない"; exit 1
+          else
+            echo "(説明の本文なし)" > notes.md
+          fi
+          cat >> notes.md <<'EOF'
+
+          ---
+
+          ソースの場所は zip の中の SOURCE.txt と、このタグのソースを参照。Circle は submodule (external/circle) なので、GitHub が自動で付けるソースの zip と tar.gz には入らない。Circle は https://github.com/rsta2/circle の、SOURCE.txt に書いたコミットを使う。添付のファイルの SHA-256 は SHA256SUMS にある。
+
+          See SOURCE.txt in the zip and the source at this tag. Circle is a submodule (external/circle), so it is not included in the source zip and tar.gz that GitHub generates; use the commit of https://github.com/rsta2/circle written in SOURCE.txt. SHA-256 checksums of the attached files are in SHA256SUMS.
+          EOF
+          mv notes.md dist/notes.md
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+

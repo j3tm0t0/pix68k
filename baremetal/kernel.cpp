@@ -1,4 +1,7 @@
 #include "kernel.h"
+
+#include "fuk_usb.h"
+#include "platform/display_select.h"
 #include "platform/dma_refill.h"
 #include "platform/net_files.h"
 
@@ -65,7 +68,8 @@ CKernel* CKernel::s_pThis = nullptr;
 
 
 CKernel::CKernel()
-    : m_Screen(m_Options.GetWidth(), m_Options.GetHeight()),
+    : m_Screen(m_Options.GetWidth(), m_Options.GetHeight(), DEFAULT_FONT, CCharGenerator::FontFlagsNone,
+               ChooseDisplay(m_Options)),
       m_Tee(&m_Serial, &m_Screen, &m_LogRing),
       m_Timer(&m_Interrupt),
       m_Logger(m_Options.GetLogLevel(), &m_Timer),
@@ -293,6 +297,105 @@ boolean CKernel::InitScreen() {
     m_GpuScaleY = (int)gy;
     m_GpuScaleNote = GpuScaleOn;
     return TRUE;
+}
+
+// 画面を出す口を選ぶ (#329。選び方は platform/display_select.h)。m_Screen を作る前 (CKernel のコンストラクタの
+// 初期化の並び) に呼ぶので、ログはまだ使えない。結果は s_Display に置き、LogDisplay() がログに出す。
+// Circle の画面の番号を返し、ファームウェアの「いまの画面」もその番号にしておく (InitScreen() などが、番号を
+// 指定しないメールボックスの要求 (表示の大きさ、オーバースキャン、画素の並び) を送るため)
+CKernel::DisplayChoice CKernel::s_Display;
+
+#if RASPPI >= 4
+// メールボックスのタグを 1 つ送り、ファームウェアが応答したか (長さの語の最上位ビット) まで見る。Circle の
+// CBcmPropertyTags::GetTag() はこのビットを消して長さが 0 でないことだけを見るので、ファームウェアが知らない
+// タグでも、送った値がそのまま返って成功になる (Get display ID なら「ID = 番号」に見える)
+static bool GetAnsweredTag(CBcmPropertyTags& tags, u32 tagId, void* tag, unsigned tagSize, unsigned requestSize,
+                           unsigned minResponse) {
+    TPropertyTag* h = (TPropertyTag*)tag;
+    h->nTagId = tagId;
+    h->nValueBufSize = tagSize - sizeof(TPropertyTag);
+    h->nValueLength = requestSize & ~VALUE_LENGTH_RESPONSE;
+    if (!tags.GetTags(tag, tagSize)) return false;
+    return (h->nValueLength & VALUE_LENGTH_RESPONSE) != 0 && (h->nValueLength & ~VALUE_LENGTH_RESPONSE) >= minResponse;
+}
+#endif
+
+unsigned CKernel::ChooseDisplay(CKernelOptions& options) {
+    DisplayChoice& c = s_Display;
+    c.optText = options.GetAppOptionString("pix68k_display", nullptr);
+    c.opt = platform::parseDisplayOption(c.optText);
+#if RASPPI >= 4
+    c.n = CBcmFrameBuffer::GetNumDisplays();
+    const unsigned n = c.n < platform::MAX_DISPLAYS ? c.n : platform::MAX_DISPLAYS;
+    CBcmPropertyTags tags;
+    // 画面が 1 つでも、どの口かをログに出すために聞く (選ぶのは 2 つ以上のときだけ)
+    for (unsigned i = 0; i < n; i++) {
+        platform::DisplayInfo& d = c.info[i];
+        // Get display ID (0x00040016): 番号を渡すと、口の ID (HDMI0 は 2、HDMI1 は 7) が返る
+        TPropertyTagSimple id;
+        id.nValue = i;
+        d.idKnown = GetAnsweredTag(tags, 0x00040016, &id, sizeof id, 4, 4);
+        d.id = id.nValue;
+        if (!d.idKnown) continue;
+        // Get EDID block display (0x00030023): 口の ID を渡して、その口のモニタの EDID の 0 番のブロックを読む。
+        // 2 つめの語は、送るときは口の ID、返るときは状態 (0 が成功)。Pi 400J のモニタのない口では、タグは成功の
+        // まま状態が 0xFFFFFFFE になり、EDID の頭の 8 バイト (00 FF FF FF FF FF FF 00) も入らなかった
+        struct {
+            TPropertyTag Tag;
+            u32 nBlock;
+            u32 nDisplayOrStatus;
+            u8 Edid[128];
+        } PACKED edid;
+        edid.nBlock = 0;
+        edid.nDisplayOrStatus = d.id;
+        memset(edid.Edid, 0, sizeof edid.Edid);
+        static const u8 head[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+        d.edid = GetAnsweredTag(tags, 0x00030023, &edid, sizeof edid, 8, 8) && edid.nDisplayOrStatus == 0 &&
+                 memcmp(edid.Edid, head, sizeof head) == 0;
+    }
+    c.index = platform::pickDisplay(c.info, n, c.opt, c.why);
+    if (n > 1) {
+        TPropertyTagSimple select;
+        select.nValue = c.index;
+        tags.GetTag(PROPTAG_SET_DISPLAY_NUM, &select, sizeof select, 4);
+    }
+#endif
+    return c.index;
+}
+
+// ChooseDisplay() の結果をログに出す
+void CKernel::LogDisplay() {
+    const DisplayChoice& c = s_Display;
+    if (c.opt == platform::DisplayOption::INVALID)
+        m_Logger.Write(FromKernel, LogWarning, "pix68k_display=%s: use auto, hdmi0 or hdmi1; using auto", c.optText);
+#if RASPPI >= 4
+    // hdmi0 / hdmi1 を書いたのに、その口が数えられていなかった (画面が 1 つ、または口の ID が分からない)
+    if ((c.opt == platform::DisplayOption::HDMI0 || c.opt == platform::DisplayOption::HDMI1) &&
+        c.why != platform::DisplayPick::OPTION)
+        m_Logger.Write(FromKernel, LogWarning, "pix68k_display=%s: the firmware does not report that port; using auto",
+                       c.optText);
+    if (c.n <= 1) {
+        m_Logger.Write(FromKernel, LogNotice, "screen: the firmware reports %u display; using display 0 (%s%s)", c.n,
+                       platform::displayIdName(c.info[0].idKnown, c.info[0].id), c.info[0].edid ? ", monitor" : "");
+        return;
+    }
+#else
+    if (c.optText != nullptr && c.opt != platform::DisplayOption::AUTO && c.opt != platform::DisplayOption::INVALID)
+        m_Logger.Write(FromKernel, LogWarning, "pix68k_display=%s: only on Raspberry Pi 4 / 400 / 5; ignored", c.optText);
+    if (c.n <= 1) return;
+#endif
+    CString list;
+    const unsigned n = c.n < platform::MAX_DISPLAYS ? c.n : platform::MAX_DISPLAYS;
+    for (unsigned i = 0; i < n; i++) {
+        CString one;
+        one.Format("%s%u=%s%s", i ? ", " : "", i, platform::displayIdName(c.info[i].idKnown, c.info[i].id),
+                   c.info[i].edid ? " (monitor)" : "");
+        list.Append(one);
+    }
+    m_Logger.Write(FromKernel, LogNotice, "screen: display %u (%s) of %u: %s", c.index,
+                   platform::displayIdName(c.info[c.index].idKnown, c.info[c.index].id), c.n,
+                   platform::displayPickName(c.why));
+    m_Logger.Write(FromKernel, LogNotice, "screen: displays %s", (const char*)list);
 }
 
 // InitScreen() の結果をログに出す
@@ -645,6 +748,14 @@ unsigned CKernel::ReadDeployId(const char* drive) {
 
 // 16MB あるので .bss ではなくヒープに置く (カーネルの大きさの上限を超えるため)
 static bench::Memory* s_benchMemory;
+
+void CCoreRunner::IPIHandler(unsigned core, unsigned ipi) {
+    if (ipi == CFukUsb::IPI) {
+        if (core == 0) CFukUsb::OnIpi();
+        return;
+    }
+    CMultiCoreSupport::IPIHandler(core, ipi);
+}
 
 void CCoreRunner::Run(unsigned core) {
     if (failFrom != 0 && core >= failFrom) return; // 起動しなかったことにする (startedMask にも残さない)
@@ -1035,6 +1146,7 @@ TShutdownMode CKernel::Run() {
                    CMachineInfo::Get()->GetMachineName());
     m_Logger.Write(FromKernel, LogNotice, "screen %ux%u, pixel order %s", m_Screen.GetWidth(), m_Screen.GetHeight(),
                    m_PixelOrderResult < 0 ? "not set" : (m_PixelOrderResult == 0 ? "BGR" : "RGB"));
+    LogDisplay();
     LogOverscan();
     LogGpuScale();
 

@@ -441,6 +441,58 @@ void testMixSaturates() {
     CHECK_EQ(lv.midi, 0u);
     CHECK_EQ(lv.clipped, 0u);
     CHECK_EQ(lv.midiFull, 0u);
+    // 上限に届いた数は、音量 (#300) を掛ける前の音源の出力で数える (Fable のレビュー): MIDI を下げても、音源の中で止めて
+    // いれば数え、上げて足したあとに超えても、音源の出力が範囲の中なら数えない
+    sound.setVolume(x68k::Sound::VOL_MIDI, -6);
+    out.level = 32767;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    n = sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.midi < 17000u, true);
+    CHECK_EQ(lv.midiFull, (uint32_t)n);
+    sound.setVolume(x68k::Sound::VOL_MIDI, 6);
+    out.level = 20000;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    n = sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.clipped, (uint32_t)n);
+    CHECK_EQ(lv.midiFull, 0u);
+    // ミキサーの画面の MIDI の最大 (midiSrc) は、ほかの音源とそろえて MIDI の音量だけを掛けた値で、Master は掛けない
+    // (Fable のレビュー)。ログの midi は Master のあと
+    sound.setVolume(x68k::Sound::VOL_MIDI, 0);
+    sound.setVolume(x68k::Sound::VOL_MASTER, -12);
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.midiSrc, 20000u);
+    CHECK_EQ(lv.midi > 4900u && lv.midi < 5100u, true);
+    sound.setVolume(x68k::Sound::VOL_MIDI, -6);
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.midiSrc > 9900u && lv.midiSrc < 10100u, true);
+    sound.setVolume(x68k::Sound::VOL_MIDI, 0);
+    sound.setVolume(x68k::Sound::VOL_MASTER, 0);
+    // 振れ幅 (#310): 左右に別の一定の値 (直流) を出し続ける音源は、最大は大きくても振れ幅は 0 (画面の隅で鳴っていないことにする。
+    // 止まったあとに最後の値を出し続ける ADPCM と同じ形)。値が変われば、その差が振れ幅
+    out.level = 20000;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    sound.takeLevels(); // 値を変えたところを入れない
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.midiSrc, 20000u);
+    CHECK_EQ(lv.swing[x68k::Sound::SWING_MIDI], 0u);
+    out.level = 21000;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    out.level = 20000;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    sound.ring().drain(buf, 4096);
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.swing[x68k::Sound::SWING_MIDI], 1000u);
+    CHECK_EQ(lv.swing[x68k::Sound::SWING_OPM], 0u); // 鳴らしていない OPM は 0
 }
 
 // MIDI の音源を足す前 (OPM、ADPCM、まーきゅりーゆにっとを足してフィルタを通したあと) に 16 ビットに止めた分と、
@@ -521,7 +573,7 @@ void testLevelsBeforeMidi() {
         CHECK_EQ(lv.mercury, 16383u);
         CHECK_EQ(lv.opm, 0u);
         CHECK_EQ(lv.opn, 0u);
-        // YMF288: 1 チャネルを、4 つのオペレータを並べる形 (アルゴリズム 7)、最大の音量で鳴らす。足す量は半分 (約 16336)
+        // YMF288: 1 チャネルを、4 つのオペレータを並べる形 (アルゴリズム 7)、最大の音量で鳴らす。足す量は 1/3 (約 10890)
         const auto opn = [&](uint8_t reg, uint8_t v) { m.opnWriteReg(0, 0, reg, v); };
         for (int op = 0; op < 4; op++) {
             const uint8_t o = (uint8_t)(op * 4);
@@ -544,7 +596,7 @@ void testLevelsBeforeMidi() {
             if ((i & 255) == 0) pcm.ring().drain(buf, 4096);
         }
         lv = pcm.takeLevels();
-        CHECK_EQ(lv.opn > 15000 && lv.opn <= 16400, true);
+        CHECK_EQ(lv.opn > 10000 && lv.opn <= 11000, true); // 62.5kHz に直すフィルタで、少し超える
     }
     // 取り出さずに作り続けると、リングバッファが満杯になって捨てる
     sound.ring().drain(buf, 4096);
@@ -554,6 +606,255 @@ void testLevelsBeforeMidi() {
     CHECK_EQ(lv.dropped > 0, true);
     const int expected = 48000 * 600 / 1000 - (int)x68k::AudioRing::SIZE;
     CHECK_EQ((int)lv.dropped >= expected - 2 && (int)lv.dropped <= expected + 2, true);
+}
+
+// 音量 (Sound::setVolume()、#300): 0dB は何も変えない。音源ごとの音量はその音源だけに、全体の音量はすべてに掛かる
+void testVolume() {
+    printf("sound: per-source and master volume\n");
+    static int16_t buf[2 * 4096];
+    // 倍率の表: 0dB は 4096、-6dB はほぼ半分、+6dB はほぼ 2 倍、無音は 0。範囲の外は端に寄せる
+    CHECK_EQ(x68k::Sound::volumeGain(0), 4096u);
+    CHECK_EQ(x68k::Sound::volumeGain(-6), 2053u);
+    CHECK_EQ(x68k::Sound::volumeGain(6), 8173u);
+    CHECK_EQ(x68k::Sound::volumeGain(-20), 410u);
+    CHECK_EQ(x68k::Sound::volumeGain(x68k::Sound::VOLUME_OFF), 0u);
+    CHECK_EQ(x68k::Sound::volumeGain(-100), x68k::Sound::volumeGain(-40));
+    CHECK_EQ(x68k::Sound::volumeGain(100), x68k::Sound::volumeGain(12));
+    {
+        x68k::Sound s;
+        for (int g = 0; g < x68k::Sound::VOL_COUNT; g++) CHECK_EQ(s.volume((x68k::Sound::Volume)g), 0);
+        s.setVolume(x68k::Sound::VOL_MIDI, -7);
+        CHECK_EQ(s.volume(x68k::Sound::VOL_MIDI), -7);
+        s.setVolume(x68k::Sound::VOL_MIDI, 99);
+        CHECK_EQ(s.volume(x68k::Sound::VOL_MIDI), 12);
+        s.setVolume(x68k::Sound::VOL_MIDI, -99);
+        CHECK_EQ(s.volume(x68k::Sound::VOL_MIDI), -40);
+        s.setVolume(x68k::Sound::VOL_MIDI, x68k::Sound::VOLUME_OFF);
+        CHECK_EQ(s.volume(x68k::Sound::VOL_MIDI), x68k::Sound::VOLUME_OFF);
+    }
+    // MIDI の音源 (一定の値を足す音源で見る): 音源の音量と全体の音量
+    const auto midiLevel = [&](int midiDb, int masterDb) {
+        x68k::Sound s;
+        s.setOutputRate(48000);
+        s.setVolume(x68k::Sound::VOL_MIDI, midiDb);
+        s.setVolume(x68k::Sound::VOL_MASTER, masterDb);
+        LoudSynth out;
+        out.level = 10000;
+        for (int i = 0; i < 100; i++) s.advance(41, nullptr, &out);
+        const int n = s.ring().drain(buf, 4096);
+        CHECK_EQ(n > 0, true);
+        int bad = 0;
+        for (int i = 1; i < n; i++) bad += buf[2 * i] != buf[0];
+        CHECK_EQ(bad, 0);
+        return (int)buf[0];
+    };
+    CHECK_EQ(midiLevel(0, 0), 10000);
+    CHECK_EQ(midiLevel(-6, 0), 10000 * 2053 / 4096);
+    CHECK_EQ(midiLevel(6, 0), 10000 * 8173 / 4096);
+    CHECK_EQ(midiLevel(x68k::Sound::VOLUME_OFF, 0), 0);
+    CHECK_EQ(midiLevel(0, x68k::Sound::VOLUME_OFF), 0);
+    CHECK_EQ(midiLevel(0, -6), 10000 * 2053 / 4096);
+    CHECK_EQ(midiLevel(-6, -6), (int)(((int64_t)10000 * (((uint64_t)2053 * 2053) >> 12)) >> 12));
+    // OPM の 1 チャネル: OPM の音量だけが掛かり、ADPCM の音量を変えても変わらない。全体の音量は掛かる
+    const auto opmPeak = [&](int opmDb, int adpcmDb, int masterDb) {
+        x68k::Sound s;
+        s.setOutputRate(48000);
+        s.setVolume(x68k::Sound::VOL_OPM, opmDb);
+        s.setVolume(x68k::Sound::VOL_ADPCM, adpcmDb);
+        s.setVolume(x68k::Sound::VOL_MASTER, masterDb);
+        const auto w = [&](uint8_t reg, uint8_t v) {
+            s.opmWrite(1, reg);
+            s.opmWrite(3, v);
+        };
+        w(0x20, 0xc7);
+        w(0x28, 0x4a);
+        for (int op = 0; op < 4; op++) {
+            const uint8_t o = (uint8_t)(op * 8);
+            w((uint8_t)(0x40 + o), 1);
+            w((uint8_t)(0x60 + o), op == 0 ? 0 : 127);
+            w((uint8_t)(0x80 + o), 31);
+            w((uint8_t)(0xe0 + o), 0x0f);
+        }
+        w(0x08, 0x78);
+        int peak = 0;
+        for (int i = 0; i < 200; i++) {
+            s.advance(4000);
+            const int n = s.ring().drain(buf, 4096);
+            for (int k = 0; i >= 100 && k < n; k++) peak = buf[2 * k] > peak ? buf[2 * k] : peak;
+        }
+        return peak;
+    };
+    const int full = opmPeak(0, 0, 0);
+    CHECK_EQ(full > 3800 && full < 4200, true); // 1 オペレータの最大 8191 の 1/2
+    CHECK_EQ(opmPeak(0, -20, 0), full);
+    const int half = opmPeak(-6, 0, 0);
+    CHECK_EQ(half > full / 2 - 20 && half < full / 2 + 30, true);
+    const int masterHalf = opmPeak(0, 0, -6);
+    CHECK_EQ(masterHalf > full / 2 - 20 && masterHalf < full / 2 + 30, true);
+    CHECK_EQ(opmPeak(x68k::Sound::VOLUME_OFF, 0, 0), 0);
+    const int loud = opmPeak(12, 0, 0);
+    CHECK_EQ(loud > full * 39 / 10 && loud < full * 41 / 10, true); // +12dB は 3.98 倍
+}
+
+// YMF288 を足す比 (#296、#300): 2 個の FM 12 音を、キャリア 1 個 (アルゴリズム 4 つのうちキャリアが 1 つの 0)、最大の音量、
+// 同じ高さ、同じ位相で鳴らしても、16 ビットを超えない (1/3 で足す。前の 1/2 では 1.5 倍あふれた)
+void testYmf288Headroom() {
+    printf("sound: twelve YMF288 FM voices at full level do not clip\n");
+    static int16_t buf[2 * 4096];
+    x68k::Sound s;
+    s.setOutputRate(48000);
+    x68k::Mercury m;
+    s.mercuryAttached(true);
+    for (int chip = 0; chip < 2; chip++) {
+        m.opnWriteReg(chip, 0, 0x29, 0x80); // 6 音を使う
+        for (int ch = 0; ch < 6; ch++) {
+            const int bank = ch / 3, c = ch % 3;
+            const auto w = [&](int reg, int v) { m.opnWriteReg(chip, bank, (uint8_t)(reg + c), (uint8_t)v); };
+            for (int op = 0; op < 4; op++) {
+                const int o = op * 4;
+                w(0x30 + o, 1);
+                w(0x40 + o, op == 3 ? 0 : 127); // キャリア (4 つ目) だけ最大、ほかは無音
+                w(0x50 + o, 31);
+                w(0x80 + o, 0x0f);
+            }
+            w(0xb0, 0); // アルゴリズム 0 (直列。キャリアは 1 個)
+            w(0xb4, 0xc0);
+            w(0xa4, 0x22);
+            w(0xa0, 0x69);
+            m.opnWriteReg(chip, 0, 0x28, (uint8_t)(0xf0 | (bank ? 4 + c : c)));
+        }
+    }
+    int peak = 0;
+    for (int i = 0; i < 30000; i++) {
+        s.advance(64, &m);
+        // 鳴り始めの 0.1 秒は見ない (12 音が同時に 0 から最大になる段差で、周波数を直すフィルタが範囲を少し超える。
+        // OPM の 8 音を同時に鳴らし始めたときも同じ)
+        if (i == 6250) {
+            s.ring().drain(buf, 4096);
+            s.ring().drain(buf, 4096);
+            s.takeLevels();
+            continue;
+        }
+        if (i > 6250 && (i & 255) == 255) {
+            const int n = s.ring().drain(buf, 4096);
+            for (int k = 0; k < 2 * n; k++) {
+                const int v = buf[k] < 0 ? -buf[k] : buf[k];
+                if (v > peak) peak = v;
+            }
+        }
+    }
+    const x68k::Sound::Levels lv = s.takeLevels();
+    printf("  YMF288 peak at the mix %u, output peak %d\n", (unsigned)lv.opn, peak);
+    CHECK_EQ(lv.opn > 30000 && lv.opn <= 32767, true); // 12 x 8168 / 3 = 32672
+    CHECK_EQ(lv.mixClipped, 0u);
+    CHECK_EQ(lv.clipped, 0u);
+    CHECK_EQ(peak > 25000 && peak <= 32767, true);
+}
+
+// 音量を上げて (#300) すべての音源を最大で鳴らしても、フィルタに入る値は前提の範囲 (2^20 未満) に収まり、保存した
+// ステートは読み込める (Codex のレビュー: OPM 8 音、YMF288 12 音、PCM を +12dB にすると 2^20 を超え、読めなくなっていた)
+void testVolumeStateRange() {
+    printf("sound: loud volumes keep the filter input in range, so the state still loads\n");
+    static int16_t buf[2 * 4096];
+    x68k::Sound s;
+    s.setOutputRate(48000);
+    x68k::Mercury m;
+    s.mercuryAttached(true);
+    for (int g = 0; g < x68k::Sound::VOL_MASTER; g++) s.setVolume((x68k::Sound::Volume)g, 12);
+    const auto opm = [&](uint8_t reg, uint8_t v) {
+        s.opmWrite(1, reg);
+        s.opmWrite(3, v);
+    };
+    for (int c = 0; c < 8; c++) { // OPM 8 音、4 つのオペレータを並べる形 (CON 7)、最大の音量
+        opm((uint8_t)(0x20 + c), 0xc7);
+        opm((uint8_t)(0x28 + c), 0x4a);
+        for (int op = 0; op < 4; op++) {
+            const uint8_t o = (uint8_t)(op * 8 + c);
+            opm((uint8_t)(0x40 + o), 1);
+            opm((uint8_t)(0x60 + o), 0);
+            opm((uint8_t)(0x80 + o), 31);
+            opm((uint8_t)(0xe0 + o), 0x0f);
+        }
+        opm(0x08, (uint8_t)(0x78 | c));
+    }
+    for (int chip = 0; chip < 2; chip++) { // YMF288 12 音、アルゴリズム 7、最大の音量
+        m.opnWriteReg(chip, 0, 0x29, 0x80);
+        for (int ch = 0; ch < 6; ch++) {
+            const int bank = ch / 3, c = ch % 3;
+            const auto w = [&](int reg, int v) { m.opnWriteReg(chip, bank, (uint8_t)(reg + c), (uint8_t)v); };
+            for (int op = 0; op < 4; op++) {
+                const int o = op * 4;
+                w(0x30 + o, 1);
+                w(0x40 + o, 0);
+                w(0x50 + o, 31);
+                w(0x80 + o, 0x0f);
+            }
+            w(0xb0, 7);
+            w(0xb4, 0xc0);
+            w(0xa4, 0x22);
+            w(0xa0, 0x69);
+            m.opnWriteReg(chip, 0, 0x28, (uint8_t)(0xf0 | (bank ? 4 + c : c)));
+        }
+    }
+    s.mercuryWrite(m, 0x91, 0xbe); // PCM: 48kHz、ステレオ、最大の値
+    static uint8_t st[1 << 16];
+    int saved = 0, loaded = 0;
+    for (int i = 0; i < 4000; i++) {
+        while (m.drq()) {
+            s.mercuryWrite(m, 0x80, 0x7f);
+            s.mercuryWrite(m, 0x81, 0xff);
+        }
+        s.advance(64, &m);
+        if ((i & 255) == 255) s.ring().drain(buf, 4096);
+        if (i < 2000) { // 鳴り始め (いちばん大きくなる) の間、毎回保存して、読めるかを見る
+            x68k::StateIO save(x68k::StateIO::SAVE, st, sizeof st);
+            s.state(save);
+            saved += save.ok();
+            x68k::StateIO check(x68k::StateIO::CHECK, st, save.pos());
+            x68k::Sound t;
+            t.state(check);
+            loaded += check.ok();
+        }
+    }
+    const x68k::Sound::Levels lv = s.takeLevels();
+    CHECK_EQ(lv.opm + lv.opn + lv.mercury > (1u << 20), true); // 音源ごとの最大の和は、確かに 2^20 を超えている
+    printf("  peaks: OPM %u, YMF288 %u, PCM %u\n", (unsigned)lv.opm, (unsigned)lv.opn, (unsigned)lv.mercury);
+    CHECK_EQ(saved, 2000);
+    CHECK_EQ(loaded, 2000);
+}
+
+// 振れ幅 (#310): YMF288 の SSG を、音もノイズも止めて音量だけ上げると直流を出す。最大は 0 でなくても振れ幅は 0 (画面の隅で
+// 鳴っていないことにする)。音を出せば振れ幅が出る
+void testOpnSwing() {
+    printf("sound: a DC level from the YMF288 SSG has no swing\n");
+    static int16_t buf[2 * 4096];
+    x68k::Sound s;
+    s.setOutputRate(48000);
+    x68k::Mercury m;
+    s.mercuryAttached(true);
+    m.opnWriteReg(0, 0, 0x07, 0x3f); // 音もノイズも止める
+    m.opnWriteReg(0, 0, 0x08, 0x0f); // A の音量を最大
+    for (int i = 0; i < 4000; i++) {
+        s.advance(64, &m);
+        if ((i & 255) == 255) s.ring().drain(buf, 4096);
+    }
+    s.takeLevels();
+    for (int i = 0; i < 4000; i++) {
+        s.advance(64, &m);
+        if ((i & 255) == 255) s.ring().drain(buf, 4096);
+    }
+    x68k::Sound::Levels lv = s.takeLevels();
+    printf("  DC: YMF288 peak %u, swing %u\n", (unsigned)lv.opn, (unsigned)lv.swing[x68k::Sound::SWING_OPN]);
+    CHECK_EQ(lv.swing[x68k::Sound::SWING_OPN], 0u);
+    m.opnWriteReg(0, 0, 0x00, 0x40); // A の音程
+    m.opnWriteReg(0, 0, 0x07, 0x3e); // A の音を出す
+    for (int i = 0; i < 4000; i++) {
+        s.advance(64, &m);
+        if ((i & 255) == 255) s.ring().drain(buf, 4096);
+    }
+    lv = s.takeLevels();
+    printf("  tone: YMF288 peak %u, swing %u\n", (unsigned)lv.opn, (unsigned)lv.swing[x68k::Sound::SWING_OPN]);
+    CHECK_EQ(lv.swing[x68k::Sound::SWING_OPN] > 64u, true);
 }
 
 // 止めたフレームの数は、音を作るのと取るのが別のスレッドで重なっても、消えも重なりもしない: 取った数の合計が、
@@ -1757,6 +2058,10 @@ int main() {
     testJournal();
     testMixSaturates();
     testLevelsBeforeMidi();
+    testVolume();
+    testYmf288Headroom();
+    testVolumeStateRange();
+    testOpnSwing();
     testLevelsFromAnotherThread();
     testState();
     testStream();

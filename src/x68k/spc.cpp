@@ -279,10 +279,15 @@ uint8_t Spc::psns() {
 
 // SSTS。bit7-4 は「SSTS の状態の表」(Inside X68000 の図 18): イニシエータとして結合していて、
 //   実行中の動作がなければ 1000、REQ が来ているが転送していなければ 1001、ハード転送の実行中は 1011。
-// FIFO に受け取ったデータが残っている間は、ハード転送は終わっていない (Service Required の説明)
+// FIFO に受け取ったデータが残っている間は、ハード転送は終わっていない (Service Required の説明)。
+// 答えのないセレクションで SEL を出したまま待っている間も、イニシエータとして動いているので bit7 (INIT) を 1 にする。
+// FORMAT.X が SCSI のディスクに書くドライバ (68000 の機種で使う) は、Time Out のあとに INIT が 1 なら
+// Time Out のあとの手順 (TEMP に $00、転送カウンタに短い時間を入れて待ち直す) に進み、最後に INIT が 0 なら
+// 「装置がない」として返る。最初の Time Out のあとに INIT が 0 だと、セレクションをやり直す
+// (0 だと、装置のない ID でやり直し続ける)
 uint8_t Spc::ssts() {
     uint8_t v = 0;
-    if (connected_) v |= SSTS_INIT;
+    if (connected_ || selWait_) v |= SSTS_INIT;
     if (xfer_ || fifoCount_) v |= SSTS_BUSY | SSTS_TRIP;
     else if (connected_ && req()) v |= SSTS_TRIP;
     if (selWait_ && !(ints_ & INTS_TIMEOUT)) v |= SSTS_BUSY; // 待つ時間が無限大のセレクション

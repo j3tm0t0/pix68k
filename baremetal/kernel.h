@@ -32,6 +32,7 @@
 #include "platform/boot_drive.h"
 #include "platform/bezel.h"
 #include "platform/crt_effect.h"
+#include "platform/display_select.h"
 #include "platform/boot_profile.h"
 #include "platform/frame_scale.h"
 #include "platform/snapshot_wait.h"
@@ -47,6 +48,7 @@
 #include "platform/reboot_keys.h"
 #include "platform/settings_file.h"
 #include "platform/sample_clock.h"
+#include "platform/sound_info.h"
 #include "platform/uart_midi.h"
 #include "x68k/sram_file.h"
 
@@ -117,10 +119,17 @@ private:
 
 // 2 番目以降のコアの処理。コア 1 は X68000 を動かす (ROM がなければ CPU コアの速度計測を走らせる)。
 // コア 2 は画面を合成し (render_core=off なら何もしない)、コア 3 は音を合成する (sound_core=off なら何もしない)
+class CFukUsb;
+namespace x68k {
+class Fuk;
+}
+
 class CCoreRunner : public CMultiCoreSupport {
 public:
     CCoreRunner() : CMultiCoreSupport(CMemorySystem::Get()) {}
     void Run(unsigned core) override;
+    // コア間の割り込み。FUK の送信 (fuk_usb.h) を、コア 1 がコア 0 に頼むのに使う
+    void IPIHandler(unsigned core, unsigned ipi) override;
 
     // コア間で受け渡すデータ。読み書きはすべて __atomic_* で行う
     unsigned startedMask = 0; // 起動したコアのビット
@@ -197,6 +206,7 @@ private:
     void SetupFastSeek(FIL* f, const char* label);
     void ReportDisks();
     void ReportSoundLevels(); // 音の大きさと、MT-32 の音源が捨てたメッセージの数 (machine_run.cpp)
+    void TakeSoundLevels();   // 音の大きさを取り、m_SoundWindow と m_SoundLog に足す (machine_run.cpp)
     // 起動の時間 (LogBootTime())。段階の番号は時刻を入れる m_BootTicks の添字
     enum BootStage {
         BootKernel,     // カーネルに入った (CKernel のコンストラクタ)
@@ -224,6 +234,18 @@ private:
     static void ShowSnapshotFrame(void* ctx, const Emulator::Frame* frame);
     void LogShownScreen();
     void LogOverscan();
+    // 画面を出す口 (#329、platform/display_select.h)。ChooseDisplay() は m_Screen を作る前に呼ぶので static
+    struct DisplayChoice {
+        const char* optText = nullptr;                              // cmdline.txt の pix68k_display
+        platform::DisplayOption opt = platform::DisplayOption::AUTO;
+        unsigned n = 0;                                             // ファームウェアが数えた画面の数
+        platform::DisplayInfo info[platform::MAX_DISPLAYS];
+        unsigned index = 0;                                         // Circle の画面の番号
+        platform::DisplayPick why = platform::DisplayPick::SINGLE;
+    };
+    static DisplayChoice s_Display;
+    static unsigned ChooseDisplay(CKernelOptions& options);
+    void LogDisplay();
     boolean InitScreen();
     void LogGpuScale();
     static void PresentFromComposer(void* ctx, const Emulator::Frame& frame);
@@ -271,6 +293,9 @@ private:
     static FRESULT ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size, bool& usedTmp);
     u8* ReadRom(const char* name, unsigned size);
     bool LoadDisk(int drive, const char* name);
+    void StartFuk(Emulator* emu); // fuk=on: FUK を探し、見つかれば内蔵の FDC の代わりに使う (#295)
+    void ServiceFuk();            // 主ループから: 抜き差しを見て、ログに出す
+    void ReportFuk();             // FUK とのやり取りの数をログに出す
     bool LoadRealFloppy(int drive, int unit); // fd<N>=usb-fdd:<unit> (unit は 0 から。USB-FDD の実物のディスクを読む。#286)
     bool m_RealFloppy[2] = {false, false};    // m_pDisks[drive] は USB-FDD から読んだディスク (書き出せる。#287)
     u8* m_pRealFloppyBuf[2] = {nullptr, nullptr}; // USB-FDD から読んだイメージの置き場 (ドライブごと。一度確保したら使い回す)
@@ -401,6 +426,13 @@ private:
         m_OsdTicks = 0;
     }
     // 画面の右下の使用率のバー (osd_bars=)。ShowFrame() が次のフレームから読む
+    // 音のミキサー (#300)。音量は、音を作っている Sound にすぐ渡す (メニューを閉じたら、その音量で鳴る)
+    bool hasMixer() const override { return true; }
+    void volumeChanged(int group, int dB) override {
+        m_Settings.volume[group] = dB;
+        if (m_pEmulator != nullptr) m_pEmulator->setVolume((x68k::Sound::Volume)group, dB);
+    }
+    bool soundInfo(SoundInfo& info) override; // machine_run.cpp
     bool hasOsdBars() const override { return true; }
     void osdBarsChanged(int on) override { __atomic_store_n(&m_Settings.osdBars, on, __ATOMIC_RELAXED); }
     void UpdateOsd();
@@ -496,9 +528,18 @@ private:
     Emulator* m_pEmulator = nullptr;
     CNetBridge* m_pNetBridge = nullptr;  // Neptune-X のフレームの送受信 (neptune=on のときだけ)
     NetSerialLink* m_pSerialLink = nullptr; // RS-232C の相手 (rs232c=tcp:PORT のときだけ。host_net.cpp の CSerialTask)
+    // FUK (fuk=on で、起動のときに見つかったときだけ。x68k/fuk.h、fuk_usb.h)
+    CFukUsb* m_pFukUsb = nullptr;
+    x68k::Fuk* m_pFuk = nullptr;
+    unsigned m_FukChanges = 0;   // ログに出した Fuk::linkChanges()
+    unsigned m_FukReadsLogged = 0; // ログに出した Fuk::Stats::reads
     x68k::MidiOut* m_pMidiOut = nullptr; // MIDI ボードの音源 (midi=on のときだけ。SoundFont、MT-32 か UART)
     CUartMidiOut* m_pUartMidi = nullptr; // midi_out=uart のときの m_pMidiOut
     platform::Mt32Synth* m_pMt32 = nullptr; // midi_out=mt32 のときの m_pMidiOut (捨てたメッセージの数をログに出す)
+    // 音の大きさ (TakeSoundLevels()、ReportSoundLevels()、soundInfo()。どれもコア 0)。取った値は、ミキサーの画面に出す
+    // 直近 10 秒 (m_SoundWindow) と、次の 10 秒ごとのログに出す分 (m_SoundLog) の両方に足す
+    platform::SoundWindow m_SoundWindow;
+    x68k::Sound::Levels m_SoundLog = {};
     uint32_t m_Mt32DroppedLogged[2] = {0, 0}; // ログに出したときの droppedMessages() と droppedSysex()
     CSerialDevice* m_pMidiSerial = nullptr; // midi_out=uart で、ログと別の UART を使うとき
     unsigned m_UartMidiDevice = 0;          // midi_out=uart で使う UART (CSerialDevice の番号)

@@ -1,0 +1,26 @@
+{
+  "version": [1, 0],
+  "unpartitioned": {
+    "families": ["absolute"],
+    "permissions": {"secure": "rw", "nonsecure": "rw", "bootloader": "rw"}
+  },
+  "partitions": [
+    {
+      "name": "pico_fukemu A",
+      "id": 0,
+      "start": "8K",
+      "size": "496K",
+      "families": ["rp2350-arm-s"],
+      "permissions": {"secure": "rw", "nonsecure": "rw", "bootloader": "rw"}
+    },
+    {
+      "name": "pico_fukemu B",
+      "id": 0,
+      "start": "504K",
+      "size": "496K",
+      "families": ["rp2350-arm-s"],
+      "permissions": {"secure": "rw", "nonsecure": "rw", "bootloader": "rw"},
+      "link": ["a", 0]
+    }
+  ]
+}

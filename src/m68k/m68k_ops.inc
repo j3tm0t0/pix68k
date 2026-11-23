@@ -158,18 +158,19 @@ template <int OP> void Cpu::opImmSr(uint16_t op) {
     refetch();
 }
 
-template <int S, bool SUB> void Cpu::opAddqSubq(uint16_t op) {
+// ADDQ と SUBQ は bool のテンプレート引数で切り替えずに別の関数にする (#351。cpu020_ops.inc の opAddq() と同じ)
+template <int S> void Cpu::opAddq(uint16_t op) {
     int mode = MODE, reg = REG;
     uint32_t q = REG9;
     if (q == 0) q = 8;
     if (mode == 1) {
-        a_[reg] = SUB ? a_[reg] - q : a_[reg] + q;
+        a_[reg] = a_[reg] + q;
         prefetch();
         idle(4); // .w/.l とも 8 サイクル (SingleStepTests の .l = 6 は WinUAE と合わない)
         return;
     }
     if (mode == 0) {
-        uint32_t r = SUB ? sub<S>(q, d_[reg], 0, false) : add<S>(q, d_[reg], 0, false);
+        uint32_t r = add<S>(q, d_[reg], 0, false);
         prefetch();
         if (S == 4) idle(4);
         setD<S>(reg, r);
@@ -177,7 +178,31 @@ template <int S, bool SUB> void Cpu::opAddqSubq(uint16_t op) {
     }
     uint32_t addr = ea<S>(mode, reg);
     uint32_t d = read<S>(addr);
-    uint32_t r = SUB ? sub<S>(q, d, 0, false) : add<S>(q, d, 0, false);
+    uint32_t r = add<S>(q, d, 0, false);
+    prefetch();
+    write<S>(addr, r);
+}
+
+template <int S> void Cpu::opSubq(uint16_t op) {
+    int mode = MODE, reg = REG;
+    uint32_t q = REG9;
+    if (q == 0) q = 8;
+    if (mode == 1) {
+        a_[reg] = a_[reg] - q;
+        prefetch();
+        idle(4); // .w/.l とも 8 サイクル (SingleStepTests の .l = 6 は WinUAE と合わない)
+        return;
+    }
+    if (mode == 0) {
+        uint32_t r = sub<S>(q, d_[reg], 0, false);
+        prefetch();
+        if (S == 4) idle(4);
+        setD<S>(reg, r);
+        return;
+    }
+    uint32_t addr = ea<S>(mode, reg);
+    uint32_t d = read<S>(addr);
+    uint32_t r = sub<S>(q, d, 0, false);
     prefetch();
     write<S>(addr, r);
 }

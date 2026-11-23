@@ -96,6 +96,24 @@ void AudioRing::readAudio(int16_t* out, int frames) {
 
 const int16_t* Sound::resampleRow(int phase) { return kResample[phase]; }
 
+// 10^(dB / 20) の 2^12 倍 (dB は -40 から +12)。0dB はちょうど 4096
+uint32_t Sound::volumeGain(int dB) {
+    static const uint16_t kGain[VOLUME_MAX - VOLUME_MIN + 1] = {
+        41,   46,   52,   58,   65,   73,   82,   92,   103,  115,  130,  145,  163,  183,   205,   230,   258,   290,
+        325,  365,  410,  460,  516,  579,  649,  728,  817,  917,  1029, 1154, 1295, 1453,  1631,  1830,  2053,  2303,
+        2584, 2900, 3254, 3651, 4096, 4596, 5157, 5786, 6492, 7284, 8173, 9170, 10289, 11544, 12953, 14533, 16306};
+    if (dB == VOLUME_OFF) return 0;
+    if (dB < VOLUME_MIN) dB = VOLUME_MIN;
+    if (dB > VOLUME_MAX) dB = VOLUME_MAX;
+    return kGain[dB - VOLUME_MIN];
+}
+
+void Sound::setVolume(Volume which, int dB) {
+    if (dB != VOLUME_OFF) dB = dB < VOLUME_MIN ? VOLUME_MIN : dB > VOLUME_MAX ? VOLUME_MAX : dB;
+    __atomic_store_n(&volumeDb_[which], (uint8_t)(int8_t)dB, __ATOMIC_RELAXED);
+    __atomic_store_n(&gain_[which], volumeGain(dB), __ATOMIC_RELAXED);
+}
+
 // 出力の周波数に合わせた表の決め方。フィルタは、真ん中の周波数の約 4kHz 下まで通し、約 4kHz 上から止める (32 タップ、
 // カイザー窓 70dB)。
 //   - 止め始めは、出力の周波数の 0.55 倍にする (それより上の成分は、出力の周波数の 0.45 倍より下に折り返すので止める。
@@ -365,20 +383,36 @@ void Sound::advanceLocal(uint32_t clocks, Mercury* mercury, MidiOut* midi, CdMix
         opm_.clockSample(fm);
         // OPM 1 チャネル (+-8191 x 4) と、ADPCM (12 ビット) の音量の比は
         // おおよそで決めた。OPM を 1/2 に、ADPCM を 8 倍にして足す
-        const int32_t ol = fm[0] >> 1, orr = fm[1] >> 1, al = adpcm_.left() * 8, ar = adpcm_.right() * 8;
+        // 音量 (setVolume()) は、ここで音源ごとに掛ける (0dB なら値は変わらない)
+        const uint32_t gOpm = gain(VOL_OPM), gAdpcm = gain(VOL_ADPCM);
+        const int32_t ol = scaled(fm[0] >> 1, gOpm), orr = scaled(fm[1] >> 1, gOpm);
+        const int32_t al = scaled(adpcm_.left() * 8, gAdpcm), ar = scaled(adpcm_.right() * 8, gAdpcm);
         int32_t l = ol + al, r = orr + ar;
         notePeak(levelOpm_, ol, orr);
         notePeak(levelAdpcm_, al, ar);
-        // まーきゅりーゆにっとの 16 ビットの PCM は 1/2 にして足す (OPM と ADPCM との比はおおよそ)
-        // YMF288 は OPM と同じ比 (1 スロットの最大がほぼ同じなので、同じ 1/2) で足す
+        noteSwing(SWING_OPM, ol, orr);
+        noteSwing(SWING_ADPCM, al, ar);
+        // まーきゅりーゆにっとの 16 ビットの PCM は 1/2 にして足す (OPM と ADPCM との比はおおよそ)。
+        // YMF288 (2 個の和) は 1/3 にして足す。実物では YMF288 の音は別の端子に出て、本体の音とは外のミキサーで混ぜるので、
+        // 実物から決まる比はない。OPM と同じ決め方にした: OPM は、8 音すべてをキャリア 1 個、最大の音量で鳴らすと、ちょうど
+        // 16 ビットいっぱいになる (8 x 8191 / 2 = 32764)。YMF288 も、2 個の FM 12 音を同じように鳴らすと、ちょうどいっぱいに
+        // なる (12 x 8168 / 3 = 32672)。前は OPM と同じ 1/2 で、そのとき 1.5 倍あふれていた (#296、#300)
         if (mercury) {
-            const int32_t ml = mercury->left() >> 1, mr = mercury->right() >> 1;
-            const int32_t nl = mercury->opnLeft() >> 1, nr = mercury->opnRight() >> 1;
+            const uint32_t gPcm = gain(VOL_MERCURY), gOpn = gain(VOL_YMF288);
+            const int32_t ml = scaled(mercury->left() >> 1, gPcm), mr = scaled(mercury->right() >> 1, gPcm);
+            const int32_t nl = scaled(third(mercury->opnLeft()), gOpn), nr = scaled(third(mercury->opnRight()), gOpn);
             l += ml + nl;
             r += mr + nr;
             notePeak(levelMercury_, ml, mr);
             notePeak(levelOpn_, nl, nr);
+            noteSwing(SWING_PCM, ml, mr);
+            noteSwing(SWING_OPN, nl, nr);
         }
+        // 音量を上げると (+12dB で 4 倍)、和がフィルタの前提の範囲 (絶対値 2^20 未満。state.cpp のステートの読み込みも
+        // この範囲で断る) を超えうる。ステートの範囲を守るため、その手前で止める。0dB では和は 2^20 に届かない (多くて
+        // 約 52 万) ので、値は変わらない
+        l = l > MIX_LIMIT ? MIX_LIMIT : l < -MIX_LIMIT ? -MIX_LIMIT : l;
+        r = r > MIX_LIMIT ? MIX_LIMIT : r < -MIX_LIMIT ? -MIX_LIMIT : r;
         // CD-ROM 装置のオーディオは、ここでは足さない (X68000 の出力のフィルタを通さない)。OPM の 1 サンプル分だけ進め、
         // output() が出力のフレームごとに足す
         CdMixer* playing = nullptr;
@@ -490,20 +524,42 @@ void Sound::output(int32_t l, int32_t r, MidiOut* midi, CdMixer* cd) {
             al += (int64_t)h[j] * xl[j];
             ar += (int64_t)h[j] * xr[j];
         }
-        int32_t ol = (int32_t)((al + (1 << 14)) >> 15);
-        int32_t orr = (int32_t)((ar + (1 << 14)) >> 15);
+        // 全体の音量 (VOL_MASTER) は、ここからあとのすべてに掛ける。CD-ROM 装置のオーディオと MIDI の音源は、それぞれの
+        // 音量と全体の音量を掛けてから足す
+        const uint32_t gMaster = gain(VOL_MASTER);
+        int32_t ol = scaled((int32_t)((al + (1 << 14)) >> 15), gMaster);
+        int32_t orr = scaled((int32_t)((ar + (1 << 14)) >> 15), gMaster);
         // OPM、ADPCM、まーきゅりーゆにっとだけで 16 ビットを超えたフレームを数える (ここでは止めない)
         if (ol > 32767 || ol < -32768 || orr > 32767 || orr < -32768) __atomic_fetch_add(&levelMixClipped_, 1u, __ATOMIC_RELAXED);
         int32_t f = (int32_t)(pos_ >> 4); // CD-ROM 装置のオーディオの位置 (12 ビット)
         if (cd) {
+            const uint32_t g = (uint32_t)(((uint64_t)gain(VOL_CD) * gMaster) >> 12);
             int32_t cl, cr;
             cd->between(f, cl, cr);
-            ol += cl >> 1;
-            orr += cr >> 1;
+            ol += scaled(cl >> 1, g);
+            orr += scaled(cr >> 1, g);
+            // ミキサーの画面の最大は、ほかの音源とそろえて、CD の音量だけを掛けた値 (全体の音量の前)
+            const uint32_t gCd = gain(VOL_CD);
+            notePeak(levelCd_, scaled(cl >> 1, gCd), scaled(cr >> 1, gCd));
+            noteSwing(SWING_CD, scaled(cl >> 1, gCd), scaled(cr >> 1, gCd));
         }
         const int32_t bl = ol, br = orr;
-        if (midi) midi->mixFrame(ol, orr);
+        if (midi) {
+            const uint32_t g = (uint32_t)(((uint64_t)gain(VOL_MIDI) * gMaster) >> 12);
+            int32_t ml = 0, mr = 0;
+            midi->mixFrame(ml, mr);
+            // 音源の出力が 16 ビットの上限か下限に届いたか (音源の中で止めたか) は、音量を掛ける前の値で見る
+            if (ml >= 32767 || ml <= -32768 || mr >= 32767 || mr <= -32768)
+                __atomic_fetch_add(&levelMidiFull_, 1u, __ATOMIC_RELAXED);
+            ol += scaled(ml, g);
+            orr += scaled(mr, g);
+            // ミキサーの画面の最大は、ほかの音源とそろえて、MIDI の音量だけを掛けた値 (全体の音量の前)
+            const uint32_t gMidi = gain(VOL_MIDI);
+            notePeak(levelMidiSrc_, scaled(ml, gMidi), scaled(mr, gMidi));
+            noteSwing(SWING_MIDI, scaled(ml, gMidi), scaled(mr, gMidi));
+        }
         noteLevels(bl, br, ol, orr);
+        notePeak(levelOut_, ol, orr);
         ol = ol > 32767 ? 32767 : ol < -32768 ? -32768 : ol;
         orr = orr > 32767 ? 32767 : orr < -32768 ? -32768 : orr;
         if (!ring_.push((int16_t)ol, (int16_t)orr)) __atomic_fetch_add(&levelDropped_, 1u, __ATOMIC_RELAXED);
