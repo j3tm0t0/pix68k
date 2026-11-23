@@ -167,7 +167,7 @@ void testSettings() {
     {
         using namespace platform;
         Settings v;
-        CHECK_EQ(v.videoScale, VIDEO_SCALE_INTEGER); // 既定は整数倍
+        CHECK_EQ(v.videoScale, VIDEO_SCALE_ASPECT);  // 既定は 4:3 で高さいっぱい
         CHECK_EQ(v.videoFilter, CRT_OFF);            // 既定は効果なし
         static const char* const kScales[] = {"off", "integer", "aspect", "full"};
         for (int i = 0; i < 4; i++) {
@@ -262,36 +262,36 @@ void testSettings() {
                      !isLegacySettingKey("video_scale"),
                  1);
         // 行を順に読んだあとの値 (公開版 v0.1.0 のベアメタル版と同じ見た目になる。scale=off は 1 倍、auto は整数倍、
-        // scanline=on はスキャンライン)。legacy は前の書き方の行の数、removed は crt= の行の数
+        // scanline=on はスキャンライン。scale= を書いていなければ拡大の仕方は今の既定 (aspect、#365))。legacy は前の書き方の行の数、removed は crt= の行の数
         static const struct {
             const char* lines;
             int scale, filter, legacy, removed;
         } kLegacy[] = {
             {"scale=off", VIDEO_SCALE_OFF, CRT_OFF, 1, 0},
             {"scale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0},
-            {"scanline=on", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
-            {"scanline=on\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
+            {"scanline=on", VIDEO_SCALE_ASPECT, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nscanline=off", VIDEO_SCALE_ASPECT, CRT_OFF, 2, 0},
             {"scale=off\nscanline=on", VIDEO_SCALE_OFF, CRT_SCANLINE, 2, 0},
             {"scale=off\nscale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
             // いまの書き方とまざったら、キーごとにあとの行が勝つ
             {"video_scale=full\nscale=auto", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0},
             {"scale=off\nvideo_scale=full", VIDEO_SCALE_FULL, CRT_OFF, 1, 0},
-            {"video_filter=mask\nscanline=on", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
-            {"scanline=on\nvideo_filter=mask", VIDEO_SCALE_INTEGER, CRT_MASK, 1, 0},
-            {"scanline=on\nvideo_filter=mask\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 2, 0},
+            {"video_filter=mask\nscanline=on", VIDEO_SCALE_ASPECT, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nvideo_filter=mask", VIDEO_SCALE_ASPECT, CRT_MASK, 1, 0},
+            {"scanline=on\nvideo_filter=mask\nscanline=off", VIDEO_SCALE_ASPECT, CRT_OFF, 2, 0},
             // scale= と video_filter=、scanline= と video_scale= は互いに関係しない
             {"scale=off\nvideo_filter=curve", VIDEO_SCALE_OFF, CRT_CURVE, 1, 0},
             {"video_scale=aspect\nscanline=on", VIDEO_SCALE_ASPECT, CRT_SCANLINE, 1, 0},
             // 受け付けなかった video_scale= / video_filter= の行は、前の scale= / scanline= を消さない
             {"scale=off\nvideo_scale=typo", VIDEO_SCALE_OFF, CRT_OFF, 1, 0},
-            {"scanline=on\nvideo_filter=scanline,", VIDEO_SCALE_INTEGER, CRT_SCANLINE, 1, 0},
-            {"scanline=on\nvideo_filter=cz-600xx", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 0}, // 知らない名前だけでも受け付けた行
-            {"scanline=on\nvideo_filter=cz-600de", VIDEO_SCALE_INTEGER, CRT_BEZEL_DE, 1, 0}, // 枠だけの行も、前の scanline= に勝つ
+            {"scanline=on\nvideo_filter=scanline,", VIDEO_SCALE_ASPECT, CRT_SCANLINE, 1, 0},
+            {"scanline=on\nvideo_filter=cz-600xx", VIDEO_SCALE_ASPECT, CRT_OFF, 1, 0}, // 知らない名前だけでも受け付けた行
+            {"scanline=on\nvideo_filter=cz-600de", VIDEO_SCALE_ASPECT, CRT_BEZEL_DE, 1, 0}, // 枠だけの行も、前の scanline= に勝つ
             // crt= (公開版に出ていない) は読み替えずに無視する
-            {"crt=full", VIDEO_SCALE_INTEGER, CRT_OFF, 0, 1},
-            {"crt=full\nscanline=off", VIDEO_SCALE_INTEGER, CRT_OFF, 1, 1},
+            {"crt=full", VIDEO_SCALE_ASPECT, CRT_OFF, 0, 1},
+            {"crt=full\nscanline=off", VIDEO_SCALE_ASPECT, CRT_OFF, 1, 1},
             {"scale=off\ncrt=grille", VIDEO_SCALE_OFF, CRT_OFF, 1, 1},
-            {"video_filter=mask\ncrt=off", VIDEO_SCALE_INTEGER, CRT_MASK, 0, 1},
+            {"video_filter=mask\ncrt=off", VIDEO_SCALE_ASPECT, CRT_MASK, 0, 1},
         };
         for (const auto& l : kLegacy) {
             ConfigText c;
@@ -328,7 +328,7 @@ void testSettings() {
         CHECK_EQ((int)applySetting(b, "crt", "on"), (int)SettingResult::REMOVED);
         CHECK_EQ((int)applySetting(b, "scale", "2"), (int)SettingResult::BAD_VALUE);
         CHECK_EQ((int)applySetting(b, "scanline", "50"), (int)SettingResult::BAD_VALUE);
-        CHECK_EQ(b.videoScale == VIDEO_SCALE_INTEGER && b.videoFilter == CRT_OFF, 1); // 変えない
+        CHECK_EQ(b.videoScale == VIDEO_SCALE_ASPECT && b.videoFilter == CRT_OFF, 1); // 変えない
         CHECK_EQ((int)applySetting(b, "curve", "on"), (int)SettingResult::UNKNOWN_KEY); // 出していない書き方
         // ログの文言
         char msg[160];

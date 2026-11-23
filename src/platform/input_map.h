@@ -64,6 +64,24 @@ private:
     bool dirty_ = false;
 };
 
+// 設定メニューかミキサー (X68000 に入力を送らない画面) を閉じたときに押していたマウスのボタンを、一度離すまで送らない。
+// X68000 に送らない間も report() を呼び、押しているボタンを覚える (USB の割り込みか、割り込みを止めて触る)
+class MouseButtonMask {
+public:
+    // いま押しているボタンを受け取り、X68000 に送るボタンを返す。menuOpen なら送らない (返す値を使わない)
+    uint8_t report(uint8_t buttons, bool menuOpen) {
+        raw_ = buttons;
+        if (menuOpen) return 0;
+        masked_ &= buttons;
+        return (uint8_t)(buttons & ~masked_);
+    }
+    void closed() { masked_ = raw_; }
+    void reset() { raw_ = masked_ = 0; } // マウスが外れたとき
+
+private:
+    uint8_t raw_ = 0, masked_ = 0;
+};
+
 // USB ゲームパッドの状態 → ジョイスティックのビット (InputSink::JOY_*)
 struct GamePadInput {
     // known: Circle が配置を知っているゲームパッド (GamePadPropertyIsKnown)。そのときの buttons のビットは

@@ -7,6 +7,7 @@
 #   5. 拡張ボード (FPU board、Mercury Unit、MIDI board、MIDI out) を変えて保存し、Restart でつないで作り直す
 #   6. 画面の出し方 (Display のページの Scale、Scanlines、Mask) を変えて保存する。ホスト版では、前の crt= も scanline= も
 #      保存時に残す (crt= は知らせて無視し、scanline= は v0.1.0 のホスト版と同じく読まない)
+#   7. 音を鳴らしたまま変えるミキサー (Shift + F12): 開閉、音量だけの保存、X68000 が止まらないこと
 # 使い方: menu_test.sh <pix68k> 。ROM がなければ 77 (ctest の SKIP_RETURN_CODE)
 set -eu
 PIX68K=$1
@@ -106,4 +107,24 @@ grep -qF 'scanline=on' out.txt && { cat out.txt; echo "NG: scanline= warned on t
 want 'menu: settings saved to images/pix68k.cfg'
 printf 'clock=10\ncrt = geom  # 前の書き方\nscanline=on\n' > want.cfg
 cmp -s want.cfg images/pix68k.cfg || { echo "NG: legacy lines rewritten on the host"; cat images/pix68k.cfg; exit 1; }
+# 音を鳴らしたまま変えるミキサー (#364): Shift + F12 で開き、ADPCM (2 行目) を 2dB 上げ、Save の行 (上に 2 つ) で Enter。
+# 音量だけを書く。F12 だけでも閉じ (設定メニューは開かない)、閉じたあとの F12 では設定メニューが開く。X68000 は止まらない
+printf 'clock=10\n' > images/pix68k.cfg
+"$PIX68K" -r "$ROM_DIR" --config images/pix68k.cfg --clock 16 --no-sram --no-wait --frames 200 --press-after 60 \
+  --press shift+f12,down,right,right,up,up,enter,f12,f12,esc > out.txt 2>&1 || { cat out.txt; echo "NG: mixer run"; exit 1; }
+cat out.txt
+for line in 'mixer: opened' 'mixer: volumes saved' 'mixer: closed' 'menu: opened' 'menu: closed'; do want "$line"; done
+[ "$(grep -c 'menu: opened' out.txt)" = 1 ] || { echo "NG: F12 in the mixer opened the menu"; exit 1; }
+printf 'clock=10\nvol_adpcm=2\n' > want.cfg
+cmp -s want.cfg images/pix68k.cfg || { echo "NG: mixer save"; cat images/pix68k.cfg; exit 1; }
+# Esc と Shift + Scroll Lock でも閉じる。保存しなければ書かない
+run 200 shift+menu,right,esc,shift+menu,right,shift+menu
+[ "$(grep -c 'mixer: opened' out.txt)" = 2 ] && [ "$(grep -c 'mixer: closed' out.txt)" = 2 ] || { echo "NG: mixer open/close"; exit 1; }
+grep -qF 'menu: opened' out.txt && { echo "NG: Shift + menu key opened the menu"; exit 1; }
+cmp -s want.cfg images/pix68k.cfg || { echo "NG: mixer wrote without Save"; cat images/pix68k.cfg; exit 1; }
+# 開いている間も X68000 は止まらない (最後まで開いたままで、200 フレーム分進む)
+run 200 shift+f12
+want 'mixer: opened'
+grep -qF 'mixer: closed' out.txt && { echo "NG: mixer closed by itself"; exit 1; }
+sed -n 's/^200 frames: emulated \([0-9.]*\) s.*/\1/p' out.txt | awk '$1 > 3 { ok = 1 } END { exit !ok }' || { echo "NG: the X68000 stopped"; exit 1; }
 echo OK

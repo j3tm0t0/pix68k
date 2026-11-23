@@ -9,6 +9,7 @@
 //   --no-wait        実時間に合わせず、できるだけ速く動かす
 //   --sram FILE      SRAM の保存先 (既定 ~/.cache/pix68k/sram.dat)。起動時に読み、書き換えられていたら終了時に書く
 //   --no-sram        SRAM のファイルを読み書きしない
+//   --no-boot-warn   SRAM からの起動と、FD のブートセクタの書き換えを知らせない (設定ファイルの boot_warn=off)
 //   --screenshot F   終了時の画面を PPM で書き出す
 //   --type TEXT      起動して --type-after フレーム (既定 900) たったら、TEXT をキーボードから打つ (\n は改行)
 //   --no-audio       音を出さない (--no-wait のときも出さない)
@@ -53,6 +54,8 @@
 //   --fuk SPEC       FUK (USB でつなぐ実物の FDC と FDD) を、内蔵の FDC の代わりに使う (設定ファイルの fuk=)。
 //                    on で Linux のポートの名前から探し、PORT_A,PORT_B で 2 本のシリアルポートの名前を書く (host_fuk.h)。
 //                    使っている間は -0 / -1 のイメージを使わず、ステートは保存できない。見つからなければ内蔵の FDC のまま動かす
+//   --fuk-read N FILE  FUK のドライブ N (0-3) のディスク (2HD) を XDF のイメージ FILE に読み出して終わる (X68000 は動かさない。
+//                    --fuk も要る。ディスクには書かない。FILE があれば上書きしない)
 //   --midi           MIDI ボード CZ-6BM1 (YM3802、$EAFA00、IRQ4) をつなぐ (--no-midi で外す)
 //   --midi-sf2 FILE  MIDI ボードが送った MIDI を、この SoundFont (SF2) で鳴らして音に混ぜる。--midi も付けたことになる
 //                    (指定しなければ、送った MIDI は捨てる)
@@ -100,8 +103,11 @@
 //   --state-dir DIR  ステートのファイル (state0.p68 から state9.p68) の場所 (既定 ~/.cache/pix68k)
 //   --press KEYS     試験用。--press-after 回 (既定 60) 回ってから、KEYS (コンマで区切ったキーの名前か usage の
 //                    16 進: menu f12 up down left right enter esc home end pgup pgdn、例 menu,down,enter) を
-//                    2 回に 1 つずつ押して離す。メニューを開いている間も数える
+//                    2 回に 1 つずつ押して離す。shift+ を前に付けると、左 Shift を押しながら押す (例 shift+f12)。
+//                    メニューを開いている間も数える
 // 設定メニュー: F12 (か Scroll Lock、Application) で開く (platform/menu.h)。開いている間は X68000 を止める。
+// 音を鳴らしたまま変えるミキサー (#364): Shift + F12 (か Scroll Lock、Application) で開く / 閉じる (platform/mixer.h)。
+// X68000 は止めないが、開いている間、キー、マウス、ゲームコントローラは X68000 に送らない。
 // ホスト版では F12 をメニューに使うので、X68000 の XF2 は F12 では打てない (JIS キーボードの無変換で打てる)。
 // マウス: ウィンドウの中を左クリックすると、ホストのマウスを X68000 のマウスにする (カーソルは消え、
 // ウィンドウから出なくなる)。中ボタンのクリックか、Ctrl と Alt (Mac は control と option) を同時に押すと戻る。
@@ -128,6 +134,7 @@
 #include <vector>
 
 #include "host_ether.h"
+#include "fuk_read.h"
 #include "host_fuk.h"
 #include "host_serial.h"
 #include "real_floppy_dev.h"
@@ -137,7 +144,9 @@
 #include "platform/boot_profile.h"
 #include "platform/cue_sheet.h"
 #include "platform/menu.h"
+#include "platform/mixer.h"
 #include "platform/osd.h"
+#include "platform/boot_warn.h"
 #include "platform/osd_message.h"
 #include "platform/platform.h"
 #include "platform/setting_warning.h"
@@ -161,7 +170,7 @@
 namespace {
 
 // ホスト版の設定の既定の値。video_scale はウィンドウに合わせて 4:3 を保って最大 (aspect。ウィンドウが小さくても切らない)。
-// ベアメタル版は整数倍 (integer) のまま。v0.1.0 の scale= と scanline= は、v0.1.0 のホスト版と同じく読まない
+// v0.1.0 の scale= と scanline= は、v0.1.0 のホスト版と同じく読まない
 // (ベアメタル版の項目として残す。保存でも書き直さない)
 platform::Settings hostDefaultSettings() {
     platform::Settings d;
@@ -198,6 +207,8 @@ public:
         msg_ = g;
         msgGen_ = gen;
     }
+    // 左下のミキサー (platform/mixer.h)。v が nullptr か、閉じていれば出さない。次の present() から出す
+    void setMixer(const platform::MixerView* v) { mixer_ = v; }
     // 画面の出し方 (video_scale= の VideoScale と、video_filter= の CrtPreset のビット)。次の present() から使う
     // モニタの枠 (cz-600de、cz-600db) はホスト版では使わない (起動するときにログで知らせる)
     void setVideo(int scale, int filter) {
@@ -206,6 +217,7 @@ public:
     }
     ~SdlVideo() override {
         if (crtTexture_) SDL_DestroyTexture(crtTexture_);
+        if (mixerTexture_) SDL_DestroyTexture(mixerTexture_);
         if (msgTexture_) SDL_DestroyTexture(msgTexture_);
         if (osdTexture_) SDL_DestroyTexture(osdTexture_);
         if (texture_) SDL_DestroyTexture(texture_);
@@ -234,8 +246,12 @@ public:
             SDL_RenderCopy(renderer_, texture_, &src, &dst);
         }
         osdRect_ = platform::OsdRect();
+        // ミキサーに重なる数字とメッセージは出さない (ベアメタル版と同じ)
+        const bool mixer = mixer_ != nullptr && mixer_->open && ow > 0;
+        mixerRect_ = mixer ? platform::placeMixer(ow, oh, fs.dstX, fs.dstY, fs.dstW, fs.dstH) : platform::OsdRect();
         if (osd_.valid()) drawOsd();
         if (msg_ != nullptr && msg_->lines != 0) drawMessage();
+        if (mixerRect_.w > 0) drawMixer();
         SDL_RenderPresent(renderer_);
     }
 
@@ -299,7 +315,7 @@ private:
         const int n = platform::osdChars(osd_);
         const int chars = n < platform::OSD_CHARS ? n : platform::OSD_CHARS;
         const platform::OsdRect rect = platform::placeOsd(ow, oh, fs.dstX, fs.dstY, fs.dstW, fs.dstH, scale, chars);
-        if (rect.w <= 0 || (rect.overlay && !osdOverlay_)) return;
+        if (rect.w <= 0 || (rect.overlay && !osdOverlay_) || platform::mixerCovers(rect, mixerRect_)) return;
         osdRect_ = rect;
         const int tw = platform::OSD_CHARS * 8, th = 16;
         if (!osdTexture_) {
@@ -331,7 +347,7 @@ private:
         const int scale = oh / 512 < 1 ? 1 : oh / 512;
         const int limitX = platform::messageLimitX(ow, oh, osdRect_, *msg_, scale);
         const platform::OsdRect r = platform::placeMessage(ow, oh, fs.dstX, fs.dstY, fs.dstW, fs.dstH, *msg_, scale, limitX);
-        if (r.w <= 0) return;
+        if (r.w <= 0 || platform::mixerCovers(r, mixerRect_)) return;
         const int tw = platform::MSG_COLS * 8, th = platform::MSG_LINES * 16;
         if (!msgTexture_) {
             msgTexture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tw, th);
@@ -353,6 +369,27 @@ private:
         SDL_RenderCopy(renderer_, msgTexture_, &src, &dst);
     }
 
+    // 左下のミキサー。1 倍の絵をテクスチャに描き (変わった行だけ)、倍率は SDL が拡大する
+    void drawMixer() {
+        const int tw = platform::MIXER_COLS * 8, th = platform::MIXER_ROWS * 16;
+        if (!mixerTexture_) {
+            mixerTexture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tw, th);
+            if (!mixerTexture_) return;
+            SDL_SetTextureScaleMode(mixerTexture_, SDL_ScaleModeNearest);
+            mixerImage_.assign((size_t)tw * th, 0);
+        }
+        platform::OsdRect one;
+        one.w = tw;
+        one.h = th;
+        one.scale = 1;
+        const unsigned rows = mixerState_.update(true, *mixer_, one).rows;
+        for (int i = 0; i < platform::MIXER_ROWS; i++)
+            if (rows >> i & 1) platform::renderMixerRow(mixerImage_.data(), one, *mixer_, i);
+        if (rows) SDL_UpdateTexture(mixerTexture_, nullptr, mixerImage_.data(), tw * 4);
+        const SDL_Rect dst = {mixerRect_.x, mixerRect_.y, mixerRect_.w, mixerRect_.h};
+        SDL_RenderCopy(renderer_, mixerTexture_, nullptr, &dst);
+    }
+
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
     SDL_Texture* texture_ = nullptr;
@@ -367,6 +404,11 @@ private:
     platform::CrtMap crtMap_;
     std::vector<uint32_t> crtMem_, crtLine_[2];
     platform::OsdRect osdRect_; // 最後に描いた右上の数字の場所 (描かなければ w = 0)
+    const platform::MixerView* mixer_ = nullptr;
+    platform::OsdRect mixerRect_; // 最後に描いたミキサーの場所 (描かなければ w = 0)
+    platform::MixerState mixerState_;
+    std::vector<uint32_t> mixerImage_;
+    SDL_Texture* mixerTexture_ = nullptr;
     const platform::MessageGlyphs* msg_ = nullptr;
     uint32_t msgGen_ = 0, msgDrawn_ = 0;
     platform::OsdValue osd_, osdDrawn_;
@@ -398,12 +440,13 @@ bool pollEvents(platform::InputSink& input) {
 }
 
 // X68000 を動かすときの入力: キー、マウス (捕まえている間だけ)、ゲームコントローラ、ジョイスティックにするキー。
-// 設定メニュー (menu) を開いている間は、キーはメニューに渡し、X68000 には何も送らない
+// 設定メニュー (menu) かミキサー (mixer) を開いている間は、キーはそちらに渡し、X68000 には何も送らない
 class HostInput {
 public:
     using Sink = platform::InputSink;
-    HostInput(Sink& sink, bool joyKeys, platform::Menu* menu = nullptr, std::function<void()> onOpen = nullptr)
-        : sink_(sink), joyKeys_(joyKeys), menu_(menu), onOpen_(onOpen) {
+    HostInput(Sink& sink, bool joyKeys, platform::Menu* menu = nullptr, std::function<void()> onOpen = nullptr,
+              platform::Mixer* mixer = nullptr)
+        : sink_(sink), joyKeys_(joyKeys), menu_(menu), mixer_(mixer), onOpen_(onOpen) {
         const char* driver = SDL_GetCurrentVideoDriver();
         // 画面のないドライバ (CI の dummy) では、マウスを捕まえない
         canCapture_ = !(driver && !strcmp(driver, "dummy"));
@@ -429,7 +472,8 @@ public:
                     key((uint8_t)e.key.keysym.scancode, e.type == SDL_KEYDOWN, e.key.repeat != 0);
                 break;
             case SDL_MOUSEMOTION:
-                if (captured_ && (e.motion.xrel || e.motion.yrel)) sink_.onMouse(e.motion.xrel, e.motion.yrel, buttons_);
+                if (captured_ && !mixerOpen() && (e.motion.xrel || e.motion.yrel))
+                    sink_.onMouse(e.motion.xrel, e.motion.yrel, mouseMask_.report(buttons_, false));
                 break;
             case SDL_MOUSEBUTTONDOWN:
             case SDL_MOUSEBUTTONUP: mouseButton(e.button); break;
@@ -450,13 +494,30 @@ public:
 
     // キーを押した / 離した (SDL の scancode は USB HID の usage ID と同じ値。--press からも呼ぶ)
     void key(uint8_t sc, bool down, bool repeat = false) {
+        if (sc == SDL_SCANCODE_LSHIFT || sc == SDL_SCANCODE_RSHIFT) {
+            const uint8_t bit = sc == SDL_SCANCODE_LSHIFT ? 1 : 2;
+            shift_ = (uint8_t)(down ? shift_ | bit : shift_ & ~bit);
+        }
         if (menuOpen()) {
             // メニューには押したときと、OS のキーリピートを渡す (↑↓ を押し続けて動かせるように)
             if (down) menu_->key(sc);
             return;
         }
+        if (mixerOpen()) {
+            // 上下左右だけは、ミキサーで押したキーの OS のキーリピートも渡す (開いたキーの繰り返しで閉じないように)
+            if (down) releaseMouseByKeys();
+            if (!down || (repeat && (sc != mixerLastKey_ || !platform::MenuKeyRepeat::repeats(sc)))) return;
+            mixerLastKey_ = sc;
+            if (platform::isMenuKey(sc, true)) sc = platform::menu_key::ESC; // F12 でも閉じる
+            mixerKey(sc);
+            return;
+        }
         // OS のキーリピートは捨てる。リピートは X68000 のキーボードがする
         if (repeat) return;
+        if (down && mixer_ && shift_ && platform::isMenuKey(sc, true)) {
+            openMixer();
+            return;
+        }
         if (down && menu_ && platform::isMenuKey(sc, true)) {
             openMenu();
             return;
@@ -484,14 +545,10 @@ public:
         }
         sink_.onKey(sc, down);
         setSent(sc, down);
-        // Ctrl と Alt を同時に押したら、マウスを放す
-        if (captured_ && down) {
-            SDL_Keymod mod = SDL_GetModState();
-            if ((mod & KMOD_CTRL) && (mod & KMOD_ALT)) setCapture(false);
-        }
+        if (down) releaseMouseByKeys();
     }
 
-    // メニューを閉じたあとに呼ぶ (ゲームコントローラの今の状態を X68000 に送り直す)
+    // メニューかミキサーを閉じたあとに呼ぶ (ゲームコントローラの今の状態を X68000 に送り直す)
     void refresh() { updateJoysticks(); }
     // ゲームコントローラの Start + Select (Back) を押したときに呼ぶもの (X68000 のリセット)
     void setPadReset(std::function<void()> onReset) { onPadReset_ = onReset; }
@@ -499,8 +556,44 @@ public:
 private:
     bool menuOpen() const { return menu_ && menu_->isOpen(); }
 
+    // Ctrl と Alt を同時に押したら、マウスを放す
+    void releaseMouseByKeys() {
+        const SDL_Keymod mod = captured_ ? SDL_GetModState() : KMOD_NONE;
+        if ((mod & KMOD_CTRL) && (mod & KMOD_ALT)) setCapture(false);
+    }
+
+    bool mixerOpen() const { return mixer_ && mixer_->isOpen(); }
+    bool inputToMenu() const { return menuOpen() || mixerOpen(); }
+
+    // ミキサーに渡す。閉じたときに押したままのマウスのボタンは、一度離すまで X68000 に送らない
+    // (キーは押したと送っていないので、離しても何も送らない。ゲームコントローラは platform::PadPairInput が同じことをする)
+    void mixerKey(uint8_t u) {
+        mixer_->key(u);
+        if (!mixer_->isOpen()) mouseMask_.closed();
+    }
+    // メニューかミキサーを開いている間の、ゲームコントローラのキー
+    void menuKey(uint8_t u) {
+        if (menuOpen()) menu_->key(u);
+        else if (mixerOpen()) mixerKey(u);
+    }
+
+    // ミキサーを開く: メニューと同じく、押しているものをすべて離したことにする。マウスは捕まえたまま
+    void openMixer() {
+        releaseKeys();
+        if (captured_ && buttons_) sink_.onMouse(0, 0, 0);
+        mixerLastKey_ = 0;
+        mixer_->open();
+        updateJoysticks();
+    }
+
     // メニューを開く: 押しているキー、マウスのボタン、ジョイスティックをすべて離したことにして、マウスを放す
     void openMenu() {
+        releaseKeys();
+        setCapture(false);
+        if (onOpen_) onOpen_();
+        updateJoysticks();
+    }
+    void releaseKeys() {
         for (int u = 0; u < 256; u++)
             if (sent((uint8_t)u)) {
                 setSent((uint8_t)u, false);
@@ -508,9 +601,6 @@ private:
             }
         keyJoy_ = 0;
         padLastKey_ = 0;
-        setCapture(false);
-        if (onOpen_) onOpen_();
-        updateJoysticks();
     }
     static bool joyKeyBit(uint8_t sc) {
         return sc == SDL_SCANCODE_UP || sc == SDL_SCANCODE_DOWN || sc == SDL_SCANCODE_LEFT || sc == SDL_SCANCODE_RIGHT ||
@@ -531,14 +621,15 @@ private:
         }
         if (!captured_) {
             // 捕まえていないときの左クリックは、捕まえるだけで X68000 には送らない
-            if (down && b.button == SDL_BUTTON_LEFT) setCapture(true);
+            if (down && !mixerOpen() && b.button == SDL_BUTTON_LEFT) setCapture(true);
             return;
         }
         uint8_t bit = b.button == SDL_BUTTON_LEFT ? Sink::MOUSE_LEFT : b.button == SDL_BUTTON_RIGHT ? Sink::MOUSE_RIGHT : 0;
         if (!bit) return;
         if (down) buttons_ |= bit;
         else buttons_ &= (uint8_t)~bit;
-        sink_.onMouse(0, 0, buttons_);
+        const uint8_t v = mouseMask_.report(buttons_, mixerOpen());
+        if (!mixerOpen()) sink_.onMouse(0, 0, v);
     }
 
     void setCapture(bool on) {
@@ -551,6 +642,7 @@ private:
         captured_ = on;
         if (!on && buttons_) {
             buttons_ = 0;
+            mouseMask_.reset();
             sink_.onMouse(0, 0, 0);
         }
     }
@@ -610,7 +702,7 @@ private:
     // ↑↓←→、A / X を Enter、B / Y を Esc にする。Start + Back で X68000 をリセットする (メニューを開いている間は扱わない)。
     // 判定はベアメタル版と同じ platform::PadResetCombo と PadMenuInput (2 台をまとめて platform::PadPairInput)
     void updateJoysticks() {
-        const bool wasOpen = menuOpen();
+        const bool wasOpen = inputToMenu();
         platform::PadPairInput::Pad in[2];
         for (int i = 0; i < 2; i++) {
             in[i].present = pads_[i] != nullptr;
@@ -619,8 +711,8 @@ private:
         }
         const platform::PadPairInput::Result r = padInput_.update(in, wasOpen);
         // 1 台目でメニューを閉じたら、2 台目のキーは渡さない
-        for (int e = 0; e < r.nEvents && menuOpen(); e++) {
-            menu_->key(r.events[e]);
+        for (int e = 0; e < r.nEvents && inputToMenu(); e++) {
+            menuKey(r.events[e]);
             padLastKey_ = r.events[e];
         }
         for (int i = 0; i < 2; i++) {
@@ -632,20 +724,24 @@ private:
             }
         }
         if (r.reset && onPadReset_) onPadReset_();
-        if (r.open && menu_ && !menuOpen()) openMenu();
+        if (r.open && menu_ && !inputToMenu()) openMenu();
     }
     // メニューの中で、ゲームコントローラの上下左右を押し続けたら繰り返す (キーボードは OS のキーリピートを渡している)
     void repeatPadMenuKey() {
         uint8_t held = 0;
-        if (menuOpen() && platform::MenuKeyRepeat::repeats(padLastKey_) &&
+        if (inputToMenu() && platform::MenuKeyRepeat::repeats(padLastKey_) &&
             padInput_.holds(padLastKey_))
             held = padLastKey_;
-        if (const uint8_t r = padRepeat_.update(held, SDL_GetTicks())) menu_->key(r);
+        if (const uint8_t r = padRepeat_.update(held, SDL_GetTicks())) menuKey(r);
     }
 
     Sink& sink_;
     bool joyKeys_;
     platform::Menu* menu_;
+    platform::Mixer* mixer_;
+    platform::MouseButtonMask mouseMask_;
+    uint8_t mixerLastKey_ = 0; // ミキサーに最後に渡した、キーボードのキー
+    uint8_t shift_ = 0;        // 押している Shift (bit0 左、bit1 右)
     std::function<void()> onOpen_;
     std::function<void()> onPadReset_;
     platform::PadPairInput padInput_;
@@ -863,6 +959,7 @@ struct Options {
     int videoScale = platform::VIDEO_SCALE_ASPECT; // video_scale= (メニューで変えるとすぐに反映する。既定は hostDefaultSettings())
     int videoFilter = 0;                            // video_filter= (同じ)
     bool sramGiven = false;
+    bool bootWarn = true;          // --no-boot-warn (boot_warn=。platform/boot_warn.h)
     bool fixSramMemorySize = true; // --sram-memsize (false なら keep)
     char config[1024] = {0};    // --config (空ならなし)
     char profile[64] = {0};     // --profile (空ならなし)
@@ -885,6 +982,8 @@ struct Options {
     char neptuneLink[platform::Settings::PATH_SIZE] = {0}; // フレームの送受信の先 (空なら echo)
     char rs232c[platform::Settings::PATH_SIZE] = {0};      // RS-232C の相手 (空ならつながない)
     char fuk[platform::Settings::PATH_SIZE] = {0};         // FUK (空なら使わない)
+    int fukReadDrive = -1;                                  // --fuk-read
+    const char* fukReadPath = nullptr;
     int fukLead = 0;                                        // fuk_lead= (us。0 なら自動)
     bool midi = false;            // MIDI ボード
     char midiSf2[1024] = {0};     // その音源の SoundFont (空なら鳴らさない)
@@ -1063,6 +1162,7 @@ void applySettings(const platform::Settings& s, Options& opt) {
     opt.videoScale = s.videoScale;
     opt.videoFilter = s.videoFilter;
     opt.fixSramMemorySize = s.fixSramMemsize != 0;
+    opt.bootWarn = s.bootWarn != 0;
     opt.scsiEx = s.scsiEx != 0;
     configPath(opt.config, s.scsiExRom, opt.scsiExRom, sizeof opt.scsiExRom);
     for (int id = 0; id < 7; id++) configPath(opt.config, s.sc[id], opt.sc[id], sizeof opt.sc[id]);
@@ -1187,6 +1287,7 @@ platform::Settings runningSettings(const Options& opt) {
     s.videoScale = opt.videoScale;
     s.videoFilter = opt.videoFilter;
     s.fixSramMemsize = opt.fixSramMemorySize;
+    s.bootWarn = opt.bootWarn ? 1 : 0;
     s.scsiEx = opt.scsiEx;
     platform::copyString(s.scsiExRom, sizeof s.scsiExRom, opt.scsiExRom);
     for (int id = 0; id < 7; id++) platform::copyString(s.sc[id], sizeof s.sc[id], opt.sc[id]);
@@ -1318,22 +1419,29 @@ public:
                 {"pgup", platform::menu_key::PAGE_UP},     {"pgdn", platform::menu_key::PAGE_DOWN},
             };
             int u = -1;
+            const bool shift = strncmp(tok, "shift+", 6) == 0;
+            if (shift) tok += 6;
             for (const auto& n : kNames)
                 if (!strcmp(tok, n.name)) u = n.usage;
             if (u < 0) u = (int)strtol(tok, nullptr, 16);
-            if (u > 0 && u < 256) keys_[count_++] = (uint8_t)u;
+            if (u > 0 && u < 256) keys_[count_++] = (uint16_t)(u | (shift ? SHIFT : 0));
             else fprintf(stderr, "--press: unknown key: %s\n", tok);
         }
     }
     void step(long frame, HostInput& input) {
         const long i = frame - after_;
         if (i < 0 || i >= 2L * count_) return;
-        input.key(keys_[i / 2], (i & 1) == 0);
+        const uint16_t k = keys_[i / 2];
+        const bool down = (i & 1) == 0;
+        if ((k & SHIFT) && down) input.key(SDL_SCANCODE_LSHIFT, true);
+        input.key((uint8_t)k, down);
+        if ((k & SHIFT) && !down) input.key(SDL_SCANCODE_LSHIFT, false);
     }
 
 private:
     long after_;
-    uint8_t keys_[128];
+    static constexpr uint16_t SHIFT = 0x100;
+    uint16_t keys_[128];
     int count_ = 0;
 };
 
@@ -1437,7 +1545,7 @@ bool loadCdImage(const char* path, uint8_t*& data, size_t& size, x68k::CdToc*& t
 }
 
 // メニューから頼まれたことをする (ホスト版)
-class HostMenu : public platform::MenuHost {
+class HostMenu : public platform::MenuHost, public platform::MixerControl {
 public:
     HostMenu(Options& opt, x68k::Machine& m, Disk* disks, ScsiUnit* units) : opt_(opt), m_(m), disks_(disks), units_(units) {}
 
@@ -1641,6 +1749,7 @@ public:
         const x68k::Sound::Levels lv = m_.sound().takeLevels();
         soundWindow_.add(lv);
         x68k::Sound::mergeLevels(levelsSeen, lv);
+        x68k::Sound::mergeLevels(mixerLevels_, lv);
     }
     void tickSound() {
         takeSound();
@@ -1653,15 +1762,38 @@ public:
         src.cd = opt_.cd[0] != 0;
         src.midi = opt_.midi;
         src.midiOut = opt_.midiOut;
+        src.midiFault = midiFault;
         return src;
+    }
+    // MixerControl (platform/mixer.h)。takeLevels() は takeSound() だけが呼ぶ
+    int mixerVolume(int group) const override { return opt_.volume[group]; }
+    void setMixerVolume(int group, int dB) override { volumeChanged(group, dB); }
+    x68k::Sound::Levels takeMixerLevels() override {
+        takeSound();
+        const x68k::Sound::Levels lv = mixerLevels_;
+        mixerLevels_ = {};
+        return lv;
+    }
+    platform::SoundSources mixerSources() const override { return sources(); }
+    // 音量だけを書く (メニューで変えて保存していない音量以外の項目と、コマンドラインで変えた音量以外の項目は書かない)
+    bool saveMixerVolumes() override {
+        platform::Settings s = opt_.fileSettings;
+        memcpy(s.volume, opt_.volume, sizeof s.volume);
+        char buf[64];
+        platform::MenuText msg(buf, sizeof buf);
+        const bool ok = saveSettings(s, msg);
+        if (!ok) fprintf(stderr, "mixer: volumes not saved: %s\n", buf);
+        return ok;
     }
     bool soundInfo(SoundInfo& info) override {
         takeSound();
         platform::fillSoundInfo(info, soundWindow_.recent(), sources());
         return true;
     }
+    int midiFault = platform::OSD_MIDI_OK; // MIDI の音源を用意できなかったか (runMachine() が決める。#362)
     x68k::Sound::Levels levelsSeen = {}; // takeSound() が取った分の合計 (終わるときのログに出す)
     platform::SoundWindow soundWindow_;
+    x68k::Sound::Levels mixerLevels_ = {}; // ミキサーがまだ取っていない分
     // ホスト版はどの組み合わせも選べる
     bool hasVideo() const override { return true; }
     void videoChanged(int scale, int filter) override {
@@ -2044,6 +2176,7 @@ int runMachine(Options& opt) {
         printf("SASI ID 0: %s (%u records)\n", opt.hdfPath, hd.blocks());
     }
 
+    bool sramBootWarn = false;
     if (opt.useSram) {
         // 正しい SRAM のファイル (16KB か、ベアメタル版の 16KB + 後書き。x68k/sram_file.h) のときだけ写す
         // (途中までのファイルで SRAM を半端に書き換えない)
@@ -2053,6 +2186,11 @@ int runMachine(Options& opt) {
         if (data && x68k::SramSlots::parse(data, size, generation)) {
             memcpy(m->sram(), data, x68k::Machine::SRAM_SIZE);
             printf("SRAM: %s\n", opt.sram);
+            uint32_t address;
+            if (opt.bootWarn && platform::sramBootsFromSram(m->sram(), address)) {
+                sramBootWarn = true;
+                fprintf(stderr, "SRAM: the boot device is SRAM ($ED0018 = $B000, address $%08X) (boot_warn)\n", (unsigned)address);
+            }
         } else if (data) {
             fprintf(stderr, "SRAM: %s is not a valid SRAM file (%zu bytes); ignored\n", opt.sram, size);
         }
@@ -2090,6 +2228,7 @@ int runMachine(Options& opt) {
         audioDev = openAudio(*m);
     }
     // MIDI ボードの音源: 音を作る周波数が決まってから SoundFont か ROM を読む (音を出さないなら読まない)
+    int midiFault = platform::OSD_MIDI_OK;
     if (opt.midi) {
         FILE* dump = nullptr;
         if (opt.midiDump[0] && !(dump = fopen(opt.midiDump, "wb"))) perror(opt.midiDump);
@@ -2100,9 +2239,13 @@ int runMachine(Options& opt) {
                 printf("MIDI: UART bytes to %s (%s)\n", opt.midiDump, mt32 ? "mt32" : "gs");
             } else {
                 fprintf(stderr, "midi: --midi-out uart needs --midi-dump FILE on the host; MIDI is not played\n");
+                midiFault = platform::OSD_MIDI_FAILED;
             }
         } else {
-            if (m->sound().outputRate() > 0) midiSynth.reset(loadMidiSynth(opt, m->sound().outputRate()));
+            if (m->sound().outputRate() > 0) {
+                midiSynth.reset(loadMidiSynth(opt, m->sound().outputRate()));
+                if (!midiSynth) midiFault = platform::OSD_MIDI_NO_FILE; // none のときは表示に出ない (osdMidiFaultText())
+            }
             if (dump) midiTee.reset(new MidiDumpTee(dump, midiSynth.get()));
         }
     }
@@ -2144,12 +2287,25 @@ int runMachine(Options& opt) {
         }
     }
 
+    // 起動にかかわる書き換えの警告 (platform/boot_warn.h)。--message と同じ場所に出す
+    platform::BootWarnSeen bootWarnSeen;
+    auto showWarn = [&](const char* text) {
+        static platform::MessageLayout lay;
+        platform::layoutMessage(text, strlen(text), lay);
+        platform::rasterMessage(lay, haveCg ? cg : nullptr, haveCg ? sizeof cg : 0, message);
+        messageGen++;
+        messageDeadline = (uint64_t)SDL_GetTicks() + (uint64_t)platform::BOOT_WARN_SEC * 1000;
+    };
+    if (sramBootWarn) showWarn(platform::kBootWarnSram);
+
     HostMenu menuHost(opt, *m, disks, units);
+    menuHost.midiFault = midiFault;
     platform::Menu menu(menuHost);
+    platform::Mixer mixer(menuHost);
     HostInput input(m->input(), opt.joyKeys, &menu, [&]() {
         menu.open(runningSettings(opt), opt.fileSettings);
         printf("menu: opened\n");
-    });
+    }, &mixer);
     input.setPadReset([&]() {
         m->powerOn();
         printf("gamepad Start+Select: reset\n");
@@ -2159,7 +2315,8 @@ int runMachine(Options& opt) {
     char shownSources[48] = {};
     bool shownCapture = false;
     bool quit = false;
-    bool menuWasOpen = false;
+    bool menuWasOpen = false, mixerWasOpen = false;
+    uint32_t mixerTicks = 0;
     // ミキサーの画面の直近 10 秒 (menuHost.tickSound()) は、X68000 の時間 (CPU のサイクル数) の 1 秒ごとに進める。
     platform::SoundRunTimer soundTimer;
     long frame = 0;
@@ -2174,6 +2331,22 @@ int runMachine(Options& opt) {
         const uint64_t frameTicks = SDL_GetPerformanceCounter(), frameCycles = m->totalCycles();
         quit = input.poll();
         press.step(frame, input);
+        // ミキサー (#364)。X68000 は止めない
+        if (mixer.isOpen() != mixerWasOpen) {
+            mixerWasOpen = mixer.isOpen();
+            printf("mixer: %s\n", mixerWasOpen ? "opened" : "closed");
+            mixerTicks = SDL_GetTicks();
+            if (!mixerWasOpen) input.refresh();
+        }
+        if (mixer.takeSave()) {
+            const bool ok = menuHost.saveMixerVolumes();
+            mixer.saved(ok);
+            if (ok) printf("mixer: volumes saved\n");
+        }
+        if (mixerWasOpen && SDL_GetTicks() - mixerTicks >= 100) {
+            mixerTicks = SDL_GetTicks();
+            mixer.tick();
+        }
         // 使える音源 (#310) はメニューで CD を入れ替えると変わるので、毎回作って比べる (短い文字列なので軽い)
         char sources[48];
         platform::soundSourcesLine(menuHost.sources(), sources, sizeof sources);
@@ -2194,6 +2367,7 @@ int runMachine(Options& opt) {
                         haveCg ? sizeof cg : 0);
             video->setOsd(platform::OsdValue()); // メニューを開いている間は出さない
             video->setMessage(nullptr, messageGen);
+            video->setMixer(nullptr);
             video->present(overlay, kMenuWidth, kMenuHeight, kMenuWidth);
             if (!opt.noWait) SDL_Delay(16);
             continue;
@@ -2214,12 +2388,21 @@ int runMachine(Options& opt) {
             osdFrame = frame;
             osdValue = platform::OsdValue(); // 数え直すまで出さない (ベアメタル版と同じ)
         }
-        if (typing && frame >= opt.typeAfter) {
+        if (typing && frame >= opt.typeAfter && !mixer.isOpen()) {
             while (*typing && m->keyboard().queued() < x68k::Keyboard::QUEUE_SIZE / 2) m->keyboard().typeAscii(*typing++);
             if (!*typing) typing = nullptr;
         }
         const uint64_t cyclesBefore = m->totalCycles();
         m->runFrame();
+        for (int d = 0; d < 2; d++) {
+            if (!disks[d].image.takeBootChanged() || !opt.bootWarn) continue;
+            char* real = realpath(disks[d].path, nullptr); // 相対パスやリンクで開き直しても同じものとみなす
+            const bool first = bootWarnSeen.first(real ? real : disks[d].path, false);
+            free(real);
+            if (!first) continue;
+            fprintf(stderr, "fd%d: the boot sector of %s was changed (boot_warn)\n", d, disks[d].path);
+            showWarn(platform::kBootWarnFd[d]);
+        }
         // ミキサーの画面の直近 10 秒は、runFrame() で進んだサイクル数だけを数える (ステートを読んで飛んだ分は入らない)
         if (soundTimer.add(platform::soundCyclesElapsed(cyclesBefore, m->totalCycles()), config.cpuHz)) menuHost.tickSound();
         if (opt.wav) {
@@ -2252,6 +2435,7 @@ int runMachine(Options& opt) {
             video->setOsd(opt.osd ? osdValue : platform::OsdValue(), opt.osd == platform::OSD_MODE_FPS);
             video->setMessage(platform::messageVisible(message, messageDeadline, (uint64_t)SDL_GetTicks()) ? &message : nullptr,
                               messageGen);
+            video->setMixer(&mixer.view());
         }
         video->present(screen, renderer.width(), renderer.height(), x68k::Renderer::MAX_WIDTH);
         if (opt.maxSpeed)
@@ -2401,7 +2585,7 @@ void usage(const char* argv0) {
             "          [--speed060 percent] [--max-speed-limit percent] [--bus-sync-sprite]\n"
             "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--mercury-rhythm dir] [--config file] [--profile name] [--image-dir dir]\n"
             "          [--neptune] [--neptune-link echo|loopback|pcap:IF|tap:NAME] [--neptune-mac MAC]\n"
-            "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT] [--fuk off|on|PORT_A,PORT_B]\n"
+            "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT] [--fuk off|on|PORT_A,PORT_B] [--fuk-read drive out.xdf]\n"
             "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none] [--vol name=dB]...\n"
             "          [--midi-mt32-ctrl control.rom] [--midi-mt32-pcm pcm.rom] [--midi-sc55 dir]\n"
             "          [--state-dir dir] [--press keys] [--press-after N]\n",
@@ -2563,6 +2747,13 @@ int main(int argc, char** argv) {
             platform::copyString(opt.rs232c, sizeof opt.rs232c, argv[++i]);
         } else if (!strcmp(a, "--fuk") && hasArg) {
             platform::copyString(opt.fuk, sizeof opt.fuk, argv[++i]);
+        } else if (!strcmp(a, "--fuk-read") && i + 2 < argc) {
+            if (!parseRange(argv[i + 1], 0, 3, opt.fukReadDrive)) {
+                fprintf(stderr, "--fuk-read: drive must be 0..3: %s\n", argv[i + 1]);
+                return 2;
+            }
+            opt.fukReadPath = argv[i + 2];
+            i += 2;
         } else if (!strcmp(a, "--neptune-mac") && hasArg) {
             platform::copyString(opt.neptuneMac, sizeof opt.neptuneMac, argv[++i]);
         } else if (!strcmp(a, "--scsi-ex-rom") && hasArg) {
@@ -2605,6 +2796,8 @@ int main(int argc, char** argv) {
         } else if (!strcmp(a, "--sram") && hasArg) {
             snprintf(opt.sram, sizeof opt.sram, "%s", argv[++i]);
             opt.sramGiven = true;
+        } else if (!strcmp(a, "--no-boot-warn")) {
+            opt.bootWarn = false;
         } else if (!strcmp(a, "--no-sram")) {
             opt.useSram = false;
         } else if (!strcmp(a, "--screenshot") && hasArg) {
@@ -2750,6 +2943,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (opt.fukReadPath != nullptr) return readFukDisk(opt.fuk, opt.fukReadDrive, opt.fukReadPath);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;

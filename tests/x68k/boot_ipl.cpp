@@ -61,6 +61,8 @@
 //   --save-fuk ファイル: 終わったときの偽物の装置のディスクの中身を書き出す
 //   --fuk-ports A,B: 偽物の装置の代わりに、2 本のシリアルポート (host/host_fuk.h。実物の FUK や、
 //                  tools/pico_fukemu の hostsim の pty) につなぐ。X68000 を実時間に合わせて動かす (フレームごとに待つ)
+//   --fuk-read-every N: N フレームごとに X68000 を止めて、偽物の装置のディスクを読み出し (x68k/fuk_reader.h)、元と比べる
+//                  (X68000 が FDC を使っている途中なら、その回は飛ばす)。1 回も読めないか、違えば失敗
 //   --fuk1 ファイル: 偽物の装置のドライブ 1 に入れる 2HD の XDF
 //   --fuk-realtime U:C:H:R:割合: 偽物の装置が、ユニット U の C H R から始まる Read を、R から EOT までディスクから読んだ
 //                  時刻に答える (#320。データは 1 バイトずつ読んだ時刻に送る)。割合 (%) だけ、
@@ -82,6 +84,7 @@
 
 #include "../unit/fuk_fake.h"
 #include "../../host/host_fuk.h"
+#include "x68k/fuk_reader.h"
 #include <chrono>
 #include <thread>
 #include "x68k/machine.h"
@@ -307,6 +310,7 @@ int main(int argc, char** argv) {
     const char* fukPath = nullptr;
     const char* saveFuk = nullptr;
     unsigned fukLatency = 1000;
+    int fukReadEvery = 0;
     const char* fuk1Path = nullptr;
     const char* fukPorts = nullptr;
     bool fukHead = false, fukOneSector = false;
@@ -384,6 +388,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fuk") && i + 1 < argc) fukPath = argv[++i];
         else if (!strcmp(argv[i], "--save-fuk") && i + 1 < argc) saveFuk = argv[++i];
         else if (!strcmp(argv[i], "--fuk-latency") && i + 1 < argc) fukLatency = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fuk-read-every") && i + 1 < argc) fukReadEvery = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fuk1") && i + 1 < argc) fuk1Path = argv[++i];
         else if (!strcmp(argv[i], "--fuk-ports") && i + 1 < argc) fukPorts = argv[++i];
         else if (!strcmp(argv[i], "--fuk-head")) fukHead = true;
@@ -726,8 +731,28 @@ int main(int argc, char** argv) {
     }
     long peak = 0;
     static int16_t audio[2 * 4096];
+    unsigned fukReadFrames = 0, fukReads = 0, fukReadBusy = 0, fukReadBad = 0;
+    auto readFuk = [&]() {
+        std::vector<uint8_t> image(x68k::FukReader::IMAGE_BYTES);
+        const unsigned writes = fukDev.writeCommands;
+        x68k::FukReader reader(fuk);
+        reader.start(0, image.data(), false);
+        while (reader.poll() == x68k::FukReader::RUNNING) fukDev.waitRx(200);
+        const bool ok = reader.state() == x68k::FukReader::DONE;
+        if (reader.result().error == x68k::FukReader::BUSY) fukReadBusy++;
+        else fukReads++;
+        // BUSY を待つ間に、X68000 が頼んだ書き込みが終わることはある (コマンドの数は増えない)
+        if ((!ok && reader.result().error != x68k::FukReader::BUSY) || (ok && image != fukDev.image) ||
+            fukDev.writeCommands != writes) {
+            char text[200];
+            reader.describe(text, sizeof text);
+            printf("fuk-read: %s\n", text);
+            fukReadBad++;
+        }
+    };
     auto runFrame = [&]() {
         m.runFrame();
+        if (fukReadEvery > 0 && fukPath && ++fukReadFrames % (unsigned)fukReadEvery == 0) readFuk();
         if (portFuk) { // 相手は実時間で動くので、X68000 も実時間に合わせる
             const uint64_t us = (m.cycles() - emuStart) * 1000000u / m.config().cpuHz;
             // 眠らずに回って待つ。sleep_until() は Mac で 100 ms ほど遅れて戻ることがあり (15 ms 眠ると 120 ms 後に
@@ -868,6 +893,10 @@ int main(int argc, char** argv) {
             printf("fuk: %u real-time reads, %u streamed reads, %u timed reads\n", fukDev.realtimeReads, st.streamedReads, st.timedReads);
         // Human68k の書き込みは DMA で行われる: 断ったものや、0 で埋めたものがあってはならない
         if (st.timeouts != 0 || fukDev.overlappedReads != 0 || st.refusedWrites != 0 || st.cancelledWrites != 0) saveFailed = true;
+        if (fukReadEvery > 0) {
+            printf("fuk-read: %u reads (%u times busy, %u failed)\n", fukReads, fukReadBusy, fukReadBad);
+            if (fukReads == 0 || fukReadBad != 0) saveFailed = true;
+        }
         if (saveFuk) {
             FILE* f = fopen(saveFuk, "wb");
             bool ok = f && fwrite(fukDev.image.data(), 1, fukDev.image.size(), f) == fukDev.image.size();

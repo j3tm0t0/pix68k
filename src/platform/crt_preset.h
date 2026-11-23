@@ -41,11 +41,18 @@ inline const char* videoBezelName(int filter) {
 // video_scale= の値
 enum VideoScale : int {
     VIDEO_SCALE_OFF = 0,     // 1 倍 (拡大しない)
-    VIDEO_SCALE_INTEGER = 1, // 整数倍 (既定)
+    VIDEO_SCALE_INTEGER = 1, // 整数倍
     VIDEO_SCALE_ASPECT = 2,  // 4:3 を保って高さいっぱい
     VIDEO_SCALE_FULL = 3,    // 画面全体に引き伸ばす
     VIDEO_SCALE_COUNT = 4,
 };
+// video_scale= を書いていないときの値。ベアメタル版の Pi 2 だけ integer (960x540 のフレームバッファを GPU が 2 倍するので、
+// 4:3 に伸ばすと写す量が増え、縦横比も整数倍でなくなる)。ほかは aspect (#365)
+#if defined(RASPPI) && RASPPI == 2
+inline constexpr int kDefaultVideoScale = VIDEO_SCALE_INTEGER;
+#else
+inline constexpr int kDefaultVideoScale = VIDEO_SCALE_ASPECT;
+#endif
 
 // 表を作って写す効果か (ゆがみかマスクがある。スキャンラインだけなら、整数倍では表を使わない)
 inline bool crtNeedsMap(int preset) { return (preset & (CRT_CURVE | CRT_MASK)) != 0; }

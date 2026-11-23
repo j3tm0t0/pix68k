@@ -419,7 +419,7 @@ void testVideoProfile() {
                             quietBad);
         CHECK_EQ(removed, 2);
         CHECK_EQ(s.videoFilter, (int)CRT_OFF);
-        CHECK_EQ(s.videoScale, (int)VIDEO_SCALE_INTEGER);
+        CHECK_EQ(s.videoScale, (int)VIDEO_SCALE_ASPECT);
         bool cb = false, cp = false;
         CHECK_EQ(writeProfileSettings(base, prof, s, s, cb, cp), 1);
         CHECK_EQ(cb, 0);
@@ -666,6 +666,46 @@ void testMenuSjis() {
     m.open(&l, 3, 0, 5000);
     static uint32_t px[640 * 480];
     m.draw(px, 640, 640, 480, 0, nullptr, 0, 0xff000000u);
+}
+
+void testMenuRollback() {
+    ProfileList l;
+    l.add("cbx", "OutRun");
+    BootMenu m;
+    m.open(&l, 1, 0, 5000);
+    CHECK_EQ(m.rows(), 2);
+    m.setRollback("v0.2.4");
+    CHECK_EQ(m.rows(), 3);
+    CHECK_EQ(m.tick(5000), 1); // 待って決まるのは組み合わせだけ
+    CHECK_EQ(m.key(menu_key::DOWN), -1);
+    CHECK_EQ(m.cursor(), 2);
+    CHECK_EQ(m.key(menu_key::ENTER), -1);
+    CHECK_EQ(m.asking(), true);
+    CHECK_EQ(m.yes(), false);
+    CHECK_EQ(m.key(menu_key::ENTER), -1); // No
+    CHECK_EQ(m.asking(), false);
+    m.key(menu_key::ENTER);
+    m.key(menu_key::DOWN);
+    CHECK_EQ(m.yes(), true);
+    static uint32_t px[640 * 480];
+    m.draw(px, 640, 640, 480, 0, nullptr, 0, 0xff000000u);
+    CHECK_EQ(m.key(menu_key::ESC), -1);
+    CHECK_EQ(m.asking(), false);
+    m.key(menu_key::ENTER);
+    CHECK_EQ(m.yes(), false); // 毎回 No から
+    m.key(menu_key::DOWN);
+    CHECK_EQ(m.key(menu_key::ENTER), (int)BootMenu::ROW_ROLLBACK);
+    // 戻せなかったら、理由を出してメニューに戻る。行は、残るときも消えるときもある
+    m.setNote("has changed");
+    CHECK_EQ(m.hasNote(), true);
+    CHECK_EQ(m.cursor(), 2);
+    CHECK_EQ(m.key(menu_key::ESC), -1); // 何か押すと消える
+    CHECK_EQ(m.hasNote(), false);
+    m.setRollback(nullptr);
+    m.setNote("has changed");
+    m.draw(px, 640, 640, 480, 0, nullptr, 0, 0xff000000u);
+    CHECK_EQ(m.cursor(), 0);
+    CHECK_EQ(m.key(menu_key::ENTER), 0);
 }
 
 void testMenu() {
@@ -1033,6 +1073,7 @@ int main() {
     testLayout();
     testLayoutSjis();
     testMenuSjis();
+    testMenuRollback();
     testMenu();
     testDraw();
     testAutoTyper();

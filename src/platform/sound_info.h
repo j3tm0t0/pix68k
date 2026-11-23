@@ -19,26 +19,32 @@ struct SoundSources {
     bool cd = false;      // CD-ROM 装置
     bool midi = false;    // MIDI ボード
     int midiOut = 0;      // Settings::midiOut (0 sf2、1 uart、2 none、3 mt32、4 sc55)
+    int midiFault = OSD_MIDI_OK; // MIDI の音源を用意できなかったか (OsdMidiFault。#362)
 };
 
-inline SoundSources soundSources(const Settings& s) {
+inline SoundSources soundSources(const Settings& s, int midiFault = OSD_MIDI_OK) {
     SoundSources src;
     src.mercury = s.mercury != 0;
     src.cd = s.cd[0] != 0;
     src.midi = s.midi != 0;
     src.midiOut = s.midiOut;
+    src.midiFault = midiFault;
     return src;
 }
 
 // MIDI の行き先の短い名前 (画面に出す。画面の隅の音源の行と同じ)
 inline const char* midiOutShortName(int midiOut) { return osdMidiOutName(midiOut); }
 
-// 使える音源を 1 行にする: 「OPM ADPCM MERC(PCM+OPN3) MIDI:MT-32 CD」。out は 48 バイト以上
+// 使える音源を 1 行にする: 「OPM ADPCM MERC(PCM+OPN3) MIDI:MT-32 CD」。MIDI の音源を用意できなかったときは
+// 「MIDI:MT-32 (no ROM)」(#362)。out は 48 バイト以上 (いちばん長いときに 47 文字)
 inline void soundSourcesLine(const SoundSources& src, char* out, size_t size) {
     MenuText t(out, size);
     t.add("OPM ADPCM");
     if (src.mercury) t.add(" MERC(PCM+OPN3)");
-    if (src.midi) t.add(" MIDI:").add(midiOutShortName(src.midiOut));
+    if (src.midi) {
+        t.add(" MIDI:").add(midiOutShortName(src.midiOut));
+        if (const char* fault = osdMidiFaultText(src.midiOut, src.midiFault)) t.add(" (").add(fault).add(")");
+    }
     if (src.cd) t.add(" CD");
 }
 
@@ -139,6 +145,7 @@ inline void osdSound(OsdStats& st, const SoundSources& src, const x68k::Sound::L
     st.soundSources = sources;
     st.soundActive = on & sources;
     st.midiOut = src.midiOut;
+    st.midiFault = src.midiFault;
 }
 
 // ミキサーの画面に出す値。lv は、メニューを開く前の 10 秒ほどの Sound::takeLevels() をまとめたもの (SoundWindow::recent())

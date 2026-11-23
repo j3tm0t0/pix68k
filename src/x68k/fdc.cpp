@@ -440,6 +440,7 @@ void Fdc::commitWrite() {
                 st1_ |= ST1_NW;
                 continue;
             }
+            img->noteWrite(s, nullptr, s->size, cmd_[5]);
             memset(img->data(s), cmd_[5], s->size);
             // フォーマットしたセクタは通常のデータのマークで、CRC も正しい: 前のデリーテッドデータのフラグと
             // CRC エラーなどの状態を消す (dirty フラグも setMark() が立てる)
@@ -452,6 +453,7 @@ void Fdc::commitWrite() {
         compareScan();
         return;
     }
+    img->noteWrite(sector_, buf_, (uint32_t)bufLen_);
     memcpy(img->data(sector_), buf_, (size_t)bufLen_);
     img->setMark(sector_, (cmd_[0] & 0x1f) == 9); // WRITE DELETED DATA ならデリーテッドデータ
 }

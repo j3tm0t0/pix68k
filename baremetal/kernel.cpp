@@ -14,6 +14,7 @@
 #include <circle/util.h>
 
 #include "bench/bench_program.h"
+#include "build_info.h" // tools/build_baremetal.sh が作る
 #include "event_wait.h"
 
 static const char FromKernel[] = "pix68k";
@@ -430,8 +431,8 @@ void CKernel::LogGpuScale() {
 
 // ファームウェアのオーバースキャン (メールボックスの「Get overscan」0x0004000a。上、下、左、右の画素数) をログに出す。
 // config.txt に disable_overscan=1 がないと、ファームウェアは 1920x1080 などの HDMI のモードで上下左右を空け
-// (1824x984 など)、Circle が決めるフレームバッファもその分小さくなる。768x512 の 2 倍 (1536x1024) が入らなくなり、
-// X68000 の画面を拡大しなくなるので、そのときは disable_overscan=1 を書くよう出す。読めなければ (QEMU など) 何もしない
+// (1824x984 など)、Circle が決めるフレームバッファもその分小さくなる。X68000 の画面が小さくなる (video_scale=integer では
+// 768x512 の 2 倍の 1536x1024 が入らず、拡大しなくなる) ので、そのときは disable_overscan=1 を書くよう出す。読めなければ (QEMU など) 何もしない
 void CKernel::LogOverscan() {
     struct {
         TPropertyTag Tag;
@@ -1091,6 +1092,31 @@ void CKernel::ReportCpu(const char* from) {
                        (const char*)measured, temperature);
 }
 
+// ネットワークの口の GET /version (版とビルド)
+void CKernel::netVersion(CString& out) {
+    out.Format("version=%s\ncommit=%s\nraspi=%u\nmodel=%s\ndrive=%s\n", PIX68K_VERSION, PIX68K_COMMIT, (unsigned)RASPPI,
+               CMachineInfo::Get()->GetMachineName(),
+               m_BootDrive != nullptr ? m_BootDrive : "none");
+}
+
+const char* const* CKernel::netConfigSections() {
+    static const char* const kPi2[] = {"pi2", nullptr};
+    static const char* const kPi3[] = {"pi3", nullptr};
+    static const char* const kPi3Plus[] = {"pi3", "pi3+", nullptr};
+    static const char* const kPi4[] = {"pi4", nullptr};
+    static const char* const kPi400[] = {"pi4", "pi400", nullptr};
+    static const char* const kPi5[] = {"pi5", nullptr};
+    switch (CMachineInfo::Get()->GetMachineModel()) {
+    case MachineModel2B: return kPi2;
+    case MachineModel3B: return kPi3;
+    case MachineModel3BPlus: return kPi3Plus;
+    case MachineModel4B: return kPi4;
+    case MachineModel400: return kPi400;
+    case MachineModel5: return kPi5;
+    default: return nullptr;
+    }
+}
+
 // ネットワークの口の GET /thermal。名前=値 を 1 行ずつ返す。温度はここで読む (メールボックスを 1 回)。
 // クロックと throttled は ReportCpu() が最後に読んだ値 (throttled を読むと「起きたか」のビットが消えるので、ここでは読まない)
 void CKernel::netThermal(CString& out) {
@@ -1144,6 +1170,7 @@ void CKernel::netThermal(CString& out) {
 TShutdownMode CKernel::Run() {
     m_Logger.Write(FromKernel, LogNotice, "pix68k bare metal on %s, compiled " __DATE__ " " __TIME__,
                    CMachineInfo::Get()->GetMachineName());
+    m_Logger.Write(FromKernel, LogNotice, "version " PIX68K_VERSION ", commit " PIX68K_COMMIT);
     m_Logger.Write(FromKernel, LogNotice, "screen %ux%u, pixel order %s", m_Screen.GetWidth(), m_Screen.GetHeight(),
                    m_PixelOrderResult < 0 ? "not set" : (m_PixelOrderResult == 0 ? "BGR" : "RGB"));
     LogDisplay();
@@ -1286,7 +1313,11 @@ void CKernel::UpdateUsbDevices() {
             pid = desc->idProduct;
         }
         // 状態の通知 (USB の割り込み) が読むので、登録する前に決める
-        m_PadLayout[slot] = m_PadKnown[slot] ? nullptr : platform::findPadLayout((uint16_t)vid, (uint16_t)pid);
+        const platform::PadMap* saved = m_PadMaps.find((uint16_t)vid, (uint16_t)pid, pad->GetInterfaceNumber());
+        const platform::PadLayout* builtin = platform::findPadLayout((uint16_t)vid, (uint16_t)pid);
+        const platform::PadMapping mapping = platform::choosePadMapping(saved, m_PadKnown[slot], builtin);
+        m_PadMap[slot] = mapping == platform::PadMapping::SAVED ? saved : nullptr;
+        m_PadLayout[slot] = mapping == platform::PadMapping::BUILTIN ? builtin : nullptr;
         m_LastPadButtons[slot] = 0;
         m_LastPadHat[slot] = -2;
         m_PadWant[slot] = 0;
@@ -1296,12 +1327,18 @@ void CKernel::UpdateUsbDevices() {
         m_PadMenu[slot].reset();
         m_pGamePad[slot] = pad;
         m_PadAttachTicks[slot] = CTimer::GetClockTicks64();
+        m_PadDirection[slot] = false;
+        m_PadRawValid[slot] = false; // 前のゲームパッドの生の値を使わない (ServicePadSetup())
         m_BootPadBits[slot] = 0; // 起動の組み合わせのメニュー (boot_menu.cpp の PadStartFilter)
         m_BootPadReports[slot] = 0;
         pad->RegisterRemovedHandler(GamePadRemovedHandler);
         pad->RegisterStatusHandler(GamePadStatusHandler);
         m_Logger.Write(FromKernel, LogNotice, "gamepad attached (%s, %04x:%04x, joystick %d%s%s)", (const char*)name, vid,
-                       pid, slot + 1, m_PadKnown[slot] ? "" : m_PadLayout[slot] ? ", layout " : ", unknown layout",
+                       pid, slot + 1,
+                       mapping == platform::PadMapping::SAVED     ? ", layout from pads.txt"
+                       : mapping == platform::PadMapping::CIRCLE  ? ""
+                       : mapping == platform::PadMapping::BUILTIN ? ", layout "
+                                                                  : ", unknown layout",
                        m_PadLayout[slot] ? m_PadLayout[slot]->name : "");
     }
 }
@@ -1412,9 +1449,11 @@ void CKernel::KeyboardRemovedHandler(CDevice* device, void* context) {
 // キューが満杯で送れなかった分は m_Mouse が溜めていて、コア 0 の主ループで送り直す
 void CKernel::MouseStatusHandler(unsigned buttons, int dx, int dy, int wheel) {
     if (s_pThis->m_pEmulator != nullptr) {
-        if (s_pThis->m_MenuActive) return; // 設定メニューを開いている間は送らない
+        const bool toMenu = s_pThis->InputToMenu();
+        const u8 send = s_pThis->m_MouseMask.report((u8)(buttons & 7), toMenu);
+        if (toMenu) return; // 設定メニューかミキサーを開いている間は送らない
         Emulator* emu = s_pThis->m_pEmulator;
-        s_pThis->m_Mouse.report(dx, dy, (uint8_t)(buttons & 7),
+        s_pThis->m_Mouse.report(dx, dy, send,
                                 [emu](int x, int y, uint8_t b) { return emu->mouseEvent(x, y, b); });
         return;
     }
@@ -1427,6 +1466,7 @@ void CKernel::MouseRemovedHandler(CDevice*, void*) {
         // 押したままのボタンを離す (キューの書き手を 1 つにするため、USB の割り込みを止めて送る)
         Emulator* emu = s_pThis->m_pEmulator;
         EnterCritical();
+        s_pThis->m_MouseMask.reset();
         s_pThis->m_Mouse.releaseAll([emu](int x, int y, uint8_t b) { return emu->mouseEvent(x, y, b); });
         LeaveCritical();
     }
@@ -1451,28 +1491,49 @@ void CKernel::GamePadStatusHandler(unsigned index, const TGamePadState* state) {
     // VID:PID で並びの分かるゲームパッド (platform::findPadLayout()) は、Circle が配置を知っているものと同じビットに並べ直す
     const platform::PadLayout* layout = k->m_PadLayout[slot];
     platform::GamePadInput in;
-    in.known = k->m_PadKnown[slot] || layout != nullptr;
-    in.buttons = layout != nullptr ? platform::remapPadButtons(*layout, state->buttons) : state->buttons;
-    // Start + Select (X68000 のリセット)。X68000 を動かす前と、設定メニューを開いている間は扱わない。その間も状態は見ておき、
+    const platform::PadMap* map = k->m_PadMap[slot];
+    const int hat0 = state->nhats > 0 ? k->m_PadHat[slot].decode(state->hats[0]) : 8;
+    platform::PadRaw raw;
+    {
+        raw.buttons = state->buttons;
+        raw.nhats = state->nhats < platform::PadRaw::HAT_COUNT ? state->nhats : platform::PadRaw::HAT_COUNT;
+        for (int i = 0; i < raw.nhats; i++) raw.hats[i] = state->hats[i];
+        raw.naxes = state->naxes < platform::PadRaw::AXIS_COUNT ? state->naxes : platform::PadRaw::AXIS_COUNT;
+        for (int i = 0; i < raw.naxes; i++)
+            raw.axes[i] = {state->axes[i].value, state->axes[i].minimum, state->axes[i].maximum};
+    }
+    // ゲームパッドの設定 (ServicePadSetup()) が見る。変わったときだけ送ってくる機種で、開く前から押していたものも分かるよう、いつも残す
+    k->m_PadRaw[slot] = raw;
+    k->m_PadRawValid[slot] = true;
+    if (map != nullptr) {
+        // pads.txt にあるゲームパッド: ボタン、ハット、軸の生の値から、割り当てたものだけを拾う
+        in = platform::applyPadMap(*map, raw, hat0);
+    } else {
+        in.known = k->m_PadKnown[slot] || layout != nullptr;
+        in.buttons = layout != nullptr ? platform::remapPadButtons(*layout, state->buttons) : state->buttons;
+        in.nhats = state->nhats;
+        in.hat = hat0;
+        in.naxes = state->naxes;
+        for (int a = 0; a < 2 && a < state->naxes; a++) {
+            in.value[a] = state->axes[a].value;
+            in.minimum[a] = state->axes[a].minimum;
+            in.maximum[a] = state->axes[a].maximum;
+        }
+    }
+    // Start + Select (X68000 のリセット)。X68000 を動かす前と、設定メニューかミキサーを開いている間は扱わない。その間も状態は見ておき、
     // 押したまま X68000 が動き出したり、メニューを閉じたりしても、両方を離して押し直すまではリセットしない
     const bool reset =
-        k->m_PadReset[slot].update(in.known, in.buttons) && k->m_pEmulator != nullptr && !k->m_MenuActive;
+        k->m_PadReset[slot].update(in.known, in.buttons) && k->m_pEmulator != nullptr && !k->InputToMenu();
     if (reset) __atomic_store_n(&k->m_PadResetRequested, true, __ATOMIC_RELEASE);
-    in.nhats = state->nhats;
-    in.hat = state->nhats > 0 ? k->m_PadHat[slot].decode(state->hats[0]) : 8;
-    in.naxes = state->naxes;
-    for (int a = 0; a < 2 && a < state->naxes; a++) {
-        in.value[a] = state->axes[a].value;
-        in.minimum[a] = state->axes[a].minimum;
-        in.maximum[a] = state->axes[a].maximum;
-    }
     const u8 bits = platform::joystickBits(in);
+    k->m_PadDirection[slot] = (bits & (platform::InputSink::JOY_UP | platform::InputSink::JOY_DOWN |
+                                      platform::InputSink::JOY_LEFT | platform::InputSink::JOY_RIGHT)) != 0;
     // 設定メニューを開く / 操作する (platform::PadMenuInput)。X68000 を動かす前も、押しているボタンは追っておく
     // (押したまま X68000 が動き出しても、離して押し直すまでは開かない)
     u8 out = 0, events[platform::PadMenuInput::MAX_EVENTS];
     int nEvents = 0;
     const platform::PadMenuInput::Result r =
-        k->m_PadMenu[slot].update(in.known, in.buttons, bits, k->m_pEmulator == nullptr || k->m_MenuActive, out, events,
+        k->m_PadMenu[slot].update(in.known, in.buttons, bits, k->m_pEmulator == nullptr || k->InputToMenu(), out, events,
                                   nEvents);
     if (k->m_pEmulator == nullptr) k->m_PadMenu[slot].forgetHeld(); // 設定メニューの繰り返しには使わない
     if (k->m_pEmulator != nullptr) {
@@ -1491,6 +1552,7 @@ void CKernel::GamePadStatusHandler(unsigned index, const TGamePadState* state) {
         case platform::PadMenuInput::MENU:
             // 設定メニューを開いている間は X68000 に送らない。閉じたときに押していたものは、離すまで送らない
             k->m_PadWant[slot] = 0;
+            if (k->m_PadSetupActive) return; // 生の値を見る画面なので、メニューのキーにはしない
             for (int i = 0; i < nEvents; i++) k->PushMenuKey(events[i]);
             return;
         case platform::PadMenuInput::PASS:

@@ -62,6 +62,7 @@ struct HttpRequest {
     bool expectContinue = false; // Expect: 100-continue
     char token[128] = {};       // X-Pix68k-Token か Authorization: Bearer の値
     bool hasOrigin = false;     // Origin: がある (ブラウザのページから送られた)
+    char origin[272] = {};      // Origin: の値 (2 つあるか、長すぎれば空)
     int minorVersion = 1;       // HTTP/1.x の x
     bool hasHost = false;       // Host: がある
     char host[256] = {};        // Host: の値 (前後の空白を除く)
@@ -186,6 +187,7 @@ inline bool parseHttpRequest(const char* head, HttpRequest& r) {
             // chunked もほかの符号化も受けない (本体の長さは Content-Length だけで決める)
             return fail("Transfer-Encoding is not supported; send Content-Length (curl -T FILE URL)\n");
         } else if (equalNoCase(line, nn, "origin")) {
+            if (r.hasOrigin || !copySpan(r.origin, sizeof r.origin, v, vn)) r.origin[0] = 0;
             r.hasOrigin = true;
         } else if (equalNoCase(line, nn, "host")) {
             // 2 つあれば断る (どちらを見るか決められない)

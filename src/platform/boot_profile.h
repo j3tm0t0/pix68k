@@ -203,7 +203,8 @@ inline bool isCommonSettingKey(const char* key) {
     static const char* const kCommon[] = {"net",       "net_ip",    "net_gw",           "net_dns",    "net_name",
                                           "net_allow", "net_token", "syslog",           "keyboard",   "hat",       "pad_log",
                                           "video_filter", "video_scale", "osd",       "osd_bars",    "render_core", "sound_core",
-                                          "midi_uart", "midi_uart_family", "write_back", "profile_wait",
+                                          "midi_uart", "midi_uart_family", "write_back", "boot_warn", "experimental_usb_fdd_write",
+                                          "profile_wait",
                                           // 前の書き方 (v0.1.0 の scale= と scanline= は読み替え、crt= は知らせて無視する)。
                                           // pix68k.cfg に残っていても受け継ぐ
                                           "scale",     "scanline",  "crt"};
@@ -215,7 +216,7 @@ inline bool isCommonSettingKey(const char* key) {
 // 設定を読む。profile が nullptr なら base (pix68k.cfg) のすべての行、そうでなければ base の共通の項目だけを
 // 読んでから profile のすべての行を読む。warn と bad は platform::readSettings() と同じ。fromProfile は、
 // どちらのファイルの行かを知らせる (base の行は 1 回目に読んだときに知らせてあれば、warnBase = false で黙らせる)。
-// defaults は書いていない項目の値 (ホスト版は video_scale の既定が aspect)
+// defaults は書いていない項目の値 (ホスト版は hostDefaultSettings())
 template <typename Warn, typename Bad>
 void readProfileSettings(const ConfigText& base, const ConfigText* profile, Settings& s, bool warnBase, Warn&& warn,
                          Bad&& bad, const Settings& defaults = Settings()) {
@@ -477,9 +478,24 @@ public:
         list_ = list;
         cursor_ = initial >= 0 && initial < rows() ? initial : 0;
         deadline_ = nowMs + waitMs;
+        asking_ = false;
+        note_[0] = 0;
         waiting_ = true;
     }
-    int rows() const { return 1 + (list_ ? list_->count() : 0); }
+    // 更新で残した前の版に戻す行 (一番下) を出す。version は戻す先の版 (nullptr なら出さない)。Enter のあと No / Yes を尋ね
+    // (はじめは No)、Yes なら key() が ROW_ROLLBACK を返す
+    static constexpr int ROW_ROLLBACK = 1000;
+    void setRollback(const char* version) {
+        rollback_ = version;
+        if (version == nullptr && cursor_ >= rows()) cursor_ = 0;
+    }
+    // 案内の行に出す文 (戻せなかった理由)
+    void setNote(const char* s) { copyString(note_, sizeof note_, s); }
+    bool asking() const { return asking_; }
+    bool yes() const { return yes_; }
+    bool hasNote() const { return note_[0] != 0; } // 何か押すと消える
+    int profileRows() const { return 1 + (list_ ? list_->count() : 0); }
+    int rows() const { return profileRows() + (rollback_ != nullptr ? 1 : 0); }
     int cursor() const { return cursor_; }
     bool waiting() const { return waiting_; }
     // 待つ時間を、少なくとも untilMs までにする (USB の装置を探していた間に時間が過ぎたとき)
@@ -496,6 +512,23 @@ public:
     int key(uint8_t usage) {
         namespace mk = menu_key;
         waiting_ = false;
+        note_[0] = 0;
+        if (asking_) {
+            switch (usage) {
+            case mk::UP:
+            case mk::LEFT: yes_ = false; break;
+            case mk::DOWN:
+            case mk::RIGHT: yes_ = true; break;
+            case mk::ENTER:
+            case mk::KP_ENTER:
+                asking_ = false;
+                return yes_ ? ROW_ROLLBACK : -1;
+            case mk::ESC:
+            case mk::BACKSPACE: asking_ = false; break;
+            default: break;
+            }
+            return -1;
+        }
         const int last = rows() - 1;
         switch (usage) {
         case mk::UP: cursor_ = cursor_ > 0 ? cursor_ - 1 : last; break;
@@ -505,7 +538,11 @@ public:
         case mk::END:
         case mk::PAGE_DOWN: cursor_ = last; break;
         case mk::ENTER:
-        case mk::KP_ENTER: return cursor_;
+        case mk::KP_ENTER:
+            if (cursor_ < profileRows()) return cursor_;
+            asking_ = true;
+            yes_ = false;
+            break;
         default: break;
         }
         return -1;
@@ -517,7 +554,7 @@ public:
     }
 
     // 行の名前 (pix68k.cfg か、組み合わせの名前)
-    const char* rowName(int r) const { return r == 0 ? "pix68k.cfg" : list_->at(r - 1).name; }
+    const char* rowName(int r) const { return r >= profileRows() ? "Roll back" : r == 0 ? "pix68k.cfg" : list_->at(r - 1).name; }
 
     // pixels の width x height に描く (全体を塗る)。opaque は書く画素に OR する
     void draw(uint32_t* pixels, int pitch, int width, int height, uint32_t nowMs, const uint8_t* cgrom,
@@ -570,8 +607,9 @@ public:
             }
             MenuText t(buf, sizeof buf);
             t.add(rowName(r));
-            const char* title = r == 0 ? "" : list_->at(r - 1).title;
-            const bool sjis = r != 0 && list_->at(r - 1).sjis; // 名前と空白は ASCII なので、行ごと題の字で読める
+            if (r >= profileRows()) t.add(" pix68k to ").add(rollback_);
+            const char* title = r == 0 || r >= profileRows() ? "" : list_->at(r - 1).title;
+            const bool sjis = r != 0 && r < profileRows() && list_->at(r - 1).sjis; // 名前と空白は ASCII なので、行ごと題の字で読める
             if (title[0]) {
                 for (int k = (int)strlen(buf); k < 12; k++) t.add(" ");
                 t.add(" ").add(title);
@@ -579,6 +617,15 @@ public:
             text(line, buf, 0xffffffu, sjis);
         }
         MenuText t(buf, sizeof buf);
+        if (asking_) {
+            t.add("Change config.txt and restart?  ").add(yes_ ? " No  [Yes]" : "[No]  Yes");
+            text(shown - 1, buf, 0xffe080u);
+            return;
+        }
+        if (note_[0]) {
+            text(shown - 1, note_, 0xff8080u);
+            return;
+        }
         t.add("Up/Down, Enter");
         const int left = secondsLeft(nowMs);
         if (left >= 0) t.add("   starting in ").add((long)left).add(" s");
@@ -590,6 +637,9 @@ private:
     int cursor_ = 0;
     uint32_t deadline_ = 0;
     bool waiting_ = false;
+    const char* rollback_ = nullptr;
+    bool asking_ = false, yes_ = false;
+    char note_[64] = {};
 };
 
 // ゲームパッドのジョイスティックのビット (x68k::Ppi::JOY_*) の変化を、メニューのキーにする。

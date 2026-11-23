@@ -1,7 +1,7 @@
 // X68000 の画面をフレームバッファに写すときの拡大 (整数倍、最近傍)。ベアメタル版の CKernel::ShowFrame()
-// (baremetal/machine_run.cpp) が使う。pix68k.cfg の video_scale=integer (既定) で拡大し、off で拡大しない。
+// (baremetal/machine_run.cpp) が使う。pix68k.cfg の video_scale=integer で拡大し、off で拡大しない。
 //
-// 倍率の決め方 (computeFrameScale()):
+// 倍率の決め方 (computeFrameScale()。整数倍のとき。aspect と full の枠は crt_effect.h の videoFrameScale()):
 //   768x512 の画面を縦横同じ倍率 n で拡大した大きさ (768n x 512n) を「枠」とする。n はフレームバッファに入る最大の
 //   整数で、2 までにする (3840x2160 などで 3 倍、4 倍にすると、写す量が 9 倍、16 倍になるため)。
 //   どの画面モードも、横と縦それぞれ枠に入る最大の整数倍にする。768x512 は 2x2、512x512 は 3x2、256x256 は 6x4 で、
@@ -274,7 +274,7 @@ struct OverlaySpan {
     const FrameOverlay* img;
     int x0, x1;
 };
-static constexpr int MAX_OVERLAYS = 3; // presentScaled() と presentCrt() に渡せる重ねる絵の数 (右上の数字、左上のメッセージ、右下のバー)
+static constexpr int MAX_OVERLAYS = 4; // presentScaled() と presentCrt() に渡せる重ねる絵の数 (右上の数字、左上のメッセージ、右下のバー、左下のミキサー)
 // ovs の n 個 (MAX_OVERLAYS まで。nullptr は飛ばす) のうち、写す範囲に横に重なるものを out に入れ、左にあるものを先に
 // 並べる。入れた数を返す
 inline int overlaySpans(const FrameOverlay* const* ovs, int n, const FrameScale& s, OverlaySpan* out) {
@@ -394,7 +394,7 @@ inline bool syncRow(uint32_t* __restrict prev, const uint32_t* __restrict in, in
 
 // src (1 行 srcPitch 画素) を s のとおりに拡大して fb (1 行 fbPitch バイト) に写す。画素は不透明にする
 // (アルファが 0 だと黒く出るファームウェアがあるため)。line は s.dstW + 3 画素以上で、ふつうのメモリ。
-// ov (と ov2、ov3) があれば、重なる部分はその絵を書く。scanline が true で縦の倍率が 2 以上なら、各行の最後の 1 回を暗くする
+// ov (と ov2、ov3、ov4) があれば、重なる部分はその絵を書く。scanline が true で縦の倍率が 2 以上なら、各行の最後の 1 回を暗くする
 // (上の「スキャンライン」。line を書き換える)。
 // cache があれば、前に写したときと同じ行はフレームバッファに書かない (FrameRowCache)。比べるのはふつうのメモリどうし
 // なので、Device のメモリのフレームバッファに書くより速い (画面がほとんど変わらない起動の間やディスクを読む間に、
@@ -403,11 +403,11 @@ template <class Store = DeviceStore>
 inline void presentScaled(const uint32_t* src, int srcPitch, uint8_t* fb, size_t fbPitch, const FrameScale& s,
                           uint32_t* line, const FrameOverlay* ov = nullptr, FrameRowCache* cache = nullptr,
                           bool scanline = false, const FrameOverlay* ov2 = nullptr,
-                          const FrameOverlay* ov3 = nullptr) {
-    // 重ねる絵 (ov、ov2、ov3) の重なる横の範囲 (s.dstX からの位置)。重ならないものは数えない。左にあるものを先にする
+                          const FrameOverlay* ov3 = nullptr, const FrameOverlay* ov4 = nullptr) {
+    // 重ねる絵 (ov、ov2、ov3、ov4) の重なる横の範囲 (s.dstX からの位置)。重ならないものは数えない。左にあるものを先にする
     using Span = frame_scale_detail::OverlaySpan;
     Span spans[frame_scale_detail::MAX_OVERLAYS];
-    const FrameOverlay* const ovs[frame_scale_detail::MAX_OVERLAYS] = {ov, ov2, ov3};
+    const FrameOverlay* const ovs[frame_scale_detail::MAX_OVERLAYS] = {ov, ov2, ov3, ov4};
     const int nspans = frame_scale_detail::overlaySpans(ovs, frame_scale_detail::MAX_OVERLAYS, s, spans);
     // 写しが s の写す範囲を収められなければ使わない
     if (cache != nullptr && (cache->pixels == nullptr || s.srcX + s.srcW > cache->pitch || s.srcY + s.srcH > cache->rows))

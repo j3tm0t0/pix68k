@@ -58,8 +58,9 @@ class MenuKeyFilter {
 public:
     enum Result {
         PASS, // X68000 に送る (out のレポート)
+        OPEN_MIXER, // Shift + メニューのキーが押された (filterBits() だけ)。押しているキーをすべて離してから、ミキサー (platform/mixer.h) を開く
         OPEN, // メニューのキーが押された。押しているキーをすべて離してからメニューを開く
-        MENU, // メニューが開いている。events の usage (新しく押したキー) をメニューに渡す
+        MENU, // メニュー (かミキサー) が開いている。events の usage (新しく押したキー) をメニューに渡す
     };
     // menuOpen: いまメニューが開いているか。events は 6 個分
     Result filter(uint8_t mods, const uint8_t keys[6], bool menuOpen, uint8_t& outMods, uint8_t outKeys[6],
@@ -105,7 +106,8 @@ public:
     }
     // filter() と同じことを、押しているキーを usage ごとの 1 ビット (32 バイト) で受け取って行う (何台かのキーボードを
     // 合わせたあと。platform/key_merge.h)。ErrorRollOver などは来ない (合わせる前に除いてある)。
-    // out は X68000 に送る分 (PASS のとき)。events は 6 個分で、新しく押したキーが 7 個以上なら 6 個まで
+    // out は X68000 に送る分 (PASS のとき)。events は 6 個分で、新しく押したキーが 7 個以上なら 6 個まで。
+    // menuOpen は、設定メニューか、X68000 を止めないミキサー (platform/mixer.h) を開いているか
     Result filterBits(uint8_t mods, const uint8_t down[32], bool menuOpen, uint8_t& outMods, uint8_t outDown[32],
                       uint8_t events[6], int& nEvents) {
         nEvents = 0;
@@ -120,7 +122,7 @@ public:
         maskedMods_ &= mods;
         if (menuOpen) return MENU;
         nEvents = 0;
-        if (menuPressed) return OPEN;
+        if (menuPressed) return (mods & 0x22) ? OPEN_MIXER : OPEN; // 0x22 は左右の Shift
         outMods = (uint8_t)(mods & ~maskedMods_);
         for (int b = 0; b < 32; b++) outDown[b] = (uint8_t)(down[b] & ~masked_[b]);
         static constexpr uint8_t kMenuKeys[3] = {menu_key::SCROLL_LOCK, menu_key::APPLICATION, menu_key::MENU};
@@ -146,6 +148,14 @@ private:
     uint8_t masked_[32] = {}; // 閉じたときに押していて、まだ離していないキー
     uint8_t maskedMods_ = 0;
 };
+
+static constexpr int VOLUME_MIN_DB = -40, VOLUME_MAX_DB = 12;
+// 音量 (vol_*=) を dir (1 か -1) の向きに 1dB 変えた値。-40 の下は無音 (off)、その下へは行かない。+12 より上へも行かない
+inline int stepVolume(int v, int dir) {
+    if (v == Settings::VOLUME_OFF) return dir > 0 ? VOLUME_MIN_DB : v;
+    if (v + dir < VOLUME_MIN_DB) return Settings::VOLUME_OFF;
+    return v + dir > VOLUME_MAX_DB ? VOLUME_MAX_DB : v + dir;
+}
 
 // メニューの ↑↓←→ を押し続けたときの繰り返し (最初は 400ms、そのあと 60ms ごと)
 class MenuKeyRepeat {
@@ -272,7 +282,7 @@ private:
 // ---------------------------------------------------------------- 環境に頼むこと
 
 // メニューの操作の種類 (MenuHost::beginAction())。書き戻せずに断った操作を、続けてもう一度選んだかを見るため
-enum MenuAction { MENU_ACTION_OTHER = 0, MENU_ACTION_RESTART = 1, MENU_ACTION_EJECT = 2 /* + ドライブの番号 */ };
+enum MenuAction { MENU_ACTION_OTHER = 0, MENU_ACTION_RESTART = 1, MENU_ACTION_EJECT = 2 /* + ドライブの番号 */, MENU_ACTION_ROLLBACK = 8 /* EJECT の後ろ */ };
 
 // 書き戻せずに断った操作を、ほかの操作をはさまずに続けてもう一度選んだら、書き戻さずに進める (データを捨てて抜ける)。
 // 環境 (MenuHost) が持ち、beginAction() で begin() を、断ったときに arm() を呼ぶ
@@ -390,6 +400,10 @@ public:
     virtual bool hasOsdBars() const { return false; }
     // メニューで osd_bars= を変えた (すぐに反映する。呼ぶ時機は videoChanged() と同じ)
     virtual void osdBarsChanged(int on) { (void)on; }
+    // ゲームパッドのボタンの並びを決める画面 (platform/pad_setup.h) をメニューに出すか (ベアメタル版だけ)
+    virtual bool hasPadSetup() const { return false; }
+    // メニューで選んだ。メニューは閉じるので、閉じたあとに画面を開く
+    virtual void startPadSetup() {}
     // ドライブに入っているのが、実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクか (platform/real_floppy.h)。
     // そうなら、メニューに「Save FD<N> image」を出す
     virtual bool hasRealFloppy(int drive) const {
@@ -400,6 +414,12 @@ public:
     // 結果は msg (英語の短い文)。書き出したか、同じものがもうあれば true
     virtual bool saveFloppyImage(int drive, MenuText& msg) {
         (void)drive;
+        (void)msg;
+        return false;
+    }
+    // 更新 (#369) で残した前の版の名前。戻せなければ nullptr (項目を出さない)。rollBack() が true なら再起動する
+    virtual const char* rollbackVersion() const { return nullptr; }
+    virtual bool rollBack(MenuText& msg) {
         (void)msg;
         return false;
     }
@@ -525,7 +545,7 @@ public:
         if (fit < 1) fit = height / (16 * scale);
         if (fit < 1) return;
         // 高さが足りなければ、最後の FOOTER 行は残し、その上の行は、選んでいる行が入るように出す範囲を動かす
-        // (主のページは 68000 のベアメタル版で 31 行あり、768x512 では 30 行、640x480 や 720x480 では 28 行しか出せない)
+        // (主のページは 68000 のベアメタル版で 32 行あり、960x540 では 31 行、768x512 では 30 行、640x480 や 720x480 では 28 行しか出せない)
         const int footer = rows > fit && fit > FOOTER ? FOOTER : 0;
         const int body = rows - footer, bodyFit = fit - footer;
         int first = 0, shownBody = body;
@@ -589,17 +609,19 @@ public:
     int stateSlot() const { return slot_; }
 
 private:
-    enum Page { MAIN, FILES, BOARDS, DISPLAY, MIXER };
+    enum Page { MAIN, FILES, BOARDS, DISPLAY, MIXER, ROLLBACK };
     enum Item {
         I_FD0, I_FD1, I_FD0_DUMP, I_FD1_DUMP, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
-        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_MIXER, I_OSD, I_OSD_BARS,
-        I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_RESTART, I_CLOSE,
+        I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_MIXER, I_OSD, I_OSD_BARS, I_PAD_SETUP,
+        I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_ROLLBACK, I_RESTART, I_CLOSE,
         // ここから拡張ボードのページの項目
         I_FPU_BOARD, I_MERCURY, I_NEPTUNE, I_MIDI, I_MIDI_OUT, I_BACK,
         // ここから画面の出し方のページの項目
         I_SCALE, I_SCANLINE, I_CURVE, I_MASK, I_BEZEL, I_DISPLAY_BACK,
         // ここから音のミキサーのページの項目 (I_VOL_OPM からの並びは Settings::volume と同じ)
-        I_VOL_OPM, I_VOL_ADPCM, I_VOL_MERCURY, I_VOL_YMF288, I_VOL_MIDI, I_VOL_CD, I_VOL_MASTER, I_MIXER_BACK, I_COUNT
+        I_VOL_OPM, I_VOL_ADPCM, I_VOL_MERCURY, I_VOL_YMF288, I_VOL_MIDI, I_VOL_CD, I_VOL_MASTER, I_MIXER_BACK,
+        // 前の版に戻してよいかを尋ねるページ (はじめは No)
+        I_ROLLBACK_NO, I_ROLLBACK_YES, I_COUNT
     };
     static constexpr int MAX_ROWS = 40;
     static constexpr int FOOTER = 2; // どのページも、最後の 2 行は「*」の説明 (か空行) と状態の行
@@ -633,12 +655,14 @@ private:
         case I_BEZEL: return host_.hasVideo() && host_.hasBezel();
         case I_OSD_BARS: return host_.hasOsdBars();
         case I_MIXER: return host_.hasMixer();
+        case I_ROLLBACK: return host_.rollbackVersion() != nullptr;
+        case I_PAD_SETUP: return host_.hasPadSetup();
         default: return true;
         }
     }
     // 項目を出すページ
     static Page pageOf(Item it) {
-        return it >= I_VOL_OPM ? MIXER : it >= I_SCALE ? DISPLAY : it >= I_FPU_BOARD ? BOARDS : MAIN;
+        return it >= I_ROLLBACK_NO ? ROLLBACK : it >= I_VOL_OPM ? MIXER : it >= I_SCALE ? DISPLAY : it >= I_FPU_BOARD ? BOARDS : MAIN;
     }
     // いま開いているページに出す項目か
     bool shown(Item it) const { return usable(it) && pageOf(it) == page_; }
@@ -652,16 +676,17 @@ private:
             if (!shown((Item)i)) continue;
             if (index-- == 0) return (Item)i;
         }
-        return page_ == BOARDS ? I_BACK : page_ == DISPLAY ? I_DISPLAY_BACK : page_ == MIXER ? I_MIXER_BACK : I_CLOSE;
+        return page_ == BOARDS ? I_BACK : page_ == DISPLAY ? I_DISPLAY_BACK : page_ == MIXER ? I_MIXER_BACK : page_ == ROLLBACK ? I_ROLLBACK_NO : I_CLOSE;
     }
     const char* label(Item it) const {
         static const char* const kLabels[I_COUNT] = {
             "FD0", "FD1", "Save FD0 image", "Save FD1 image", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
-            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "Sound mixer", "OSD", "OSD bars",
-            "State slot", "Save state", "Load state", "Reset", "Save settings", "Restart", "Close",
+            "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "Sound mixer", "OSD", "OSD bars", "Gamepad setup",
+            "State slot", "Save state", "Load state", "Reset", "Save settings", "Roll back", "Restart", "Close",
             "FPU board", "Mercury Unit", "Neptune-X", "MIDI board", "MIDI out", "Back",
             "Scale", "Scanlines", "Curve", "Mask", "Bezel", "Back",
             "OPM", "ADPCM", "Mercury PCM", "YMF288", "MIDI", "CD", "Master", "Back",
+            "No", "Yes, roll back and restart",
         };
         return kLabels[it];
     }
@@ -855,6 +880,9 @@ private:
         case I_OSD_BARS:
             t.add(pending_.osdBars ? "on" : "off");
             break;
+        case I_ROLLBACK:
+            if (host_.rollbackVersion() != nullptr) t.add("to ").add(host_.rollbackVersion());
+            break;
         case I_SLOT:
             t.add((long)slot_);
             break;
@@ -874,6 +902,7 @@ private:
             line(page_ == BOARDS    ? "Expansion boards  (Esc: back)"
                  : page_ == DISPLAY ? "Display  (Esc: back)"
                  : page_ == MIXER   ? "Sound mixer  (Left / Right: 1 dB, Esc: back)"
+                 : page_ == ROLLBACK ? "Roll back pix68k to the previous version?  (Esc: back)"
                                     : "pix68k menu  (X68000 is paused)");
             // ミキサーのページは、見出しの下に使える音源を 1 行出す (なければ空行)
             line(page_ == MIXER && mixerKnown_ ? mixer_.sources : "");
@@ -892,8 +921,8 @@ private:
                 if (i == cursor_) hl = n;
                 line(t.str());
             }
-            // 項目のすぐ下に「*」の説明 (なければ空行)、その下に状態。主のページは 68000 のベアメタル版で 27 項目あり
-            // (Sound mixer を足して、768x512 に出せる 30 行 (draw() の fit) を 1 行超え、1 行ずれて出る)。行を増やさないよう、
+            // 項目のすぐ下に「*」の説明 (なければ空行)、その下に状態。主のページは 68000 のベアメタル版で 28 項目あり
+            // (768x512 に出せる 30 行 (draw() の fit) を 2 行、960x540 の 31 行を 1 行超え、ずれて出る)。行を増やさないよう、
             // ここに空行をもう 1 つは置かない
             if (page_ == MIXER) {
                 // 音量はすぐに反映するので「*」は付かない。ここには、メニューを開く前に止めたフレームの数を出す
@@ -1066,11 +1095,8 @@ private:
         case I_VOL_MIDI:
         case I_VOL_CD:
         case I_VOL_MASTER: {
-            // 1dB ずつ。-40 の下は無音 (off)、その下へは行かない。+12 より上へも行かない
             int& v = pending_.volume[it - I_VOL_OPM];
-            if (v == Settings::VOLUME_OFF) v = dir > 0 ? VOLUME_MIN_DB : Settings::VOLUME_OFF;
-            else if (v + dir < VOLUME_MIN_DB) v = Settings::VOLUME_OFF;
-            else v = clamp(v + dir, VOLUME_MIN_DB, VOLUME_MAX_DB);
+            v = stepVolume(v, dir);
             host_.volumeChanged(it - I_VOL_OPM, v);
             break;
         }
@@ -1116,7 +1142,6 @@ private:
         cursor_ = mainCursor_;
     }
     static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
-    static constexpr int VOLUME_MIN_DB = -40, VOLUME_MAX_DB = 12;
     // ミキサーの 1 行の値: 「[##########...]   0 dB  53%」。棒は -40 から +12 を 13 文字で (4dB で 1 文字。0dB は 10 文字)。
     // 最後は、ページを開く前の 10 秒ほどのその音源の最大 (16 ビットいっぱいを 100%)。100% を超えていれば「!」を付ける。
     // つないでいない音源は「-」。メニューの幅 (COLS) に入るよう、1 行は見出しと合わせて 44 文字まで
@@ -1154,10 +1179,12 @@ private:
             status_.clear();
         // ファイルの一覧を開くのは操作に数えない (FD の取り出しは一覧の中で選ぶ)。値を変える項目は change() が呼ぶ
         if (it == I_SAVE_STATE || it == I_LOAD_STATE || it == I_RESET || it == I_SAVE_SETTINGS || it == I_CLOSE ||
-            it == I_FD0_DUMP || it == I_FD1_DUMP)
+            it == I_FD0_DUMP || it == I_FD1_DUMP || it == I_ROLLBACK_NO)
             host_.beginAction(MENU_ACTION_OTHER);
         else if (it == I_RESTART)
             host_.beginAction(MENU_ACTION_RESTART);
+        else if (it == I_ROLLBACK_YES)
+            host_.beginAction(MENU_ACTION_ROLLBACK);
         switch (it) {
         case I_FD0:
         case I_FD1:
@@ -1195,7 +1222,21 @@ private:
         case I_BACK:
         case I_DISPLAY_BACK:
         case I_MIXER_BACK:
+        case I_ROLLBACK_NO:
             leavePage();
+            break;
+        case I_ROLLBACK:
+            enterPage(ROLLBACK);
+            status_.add("config.txt is changed and the Pi restarts");
+            break;
+        case I_ROLLBACK_YES:
+            leavePage();
+            if (host_.rollBack(status_)) {
+                restartPending_ = true;
+                open_ = false;
+            } else if (host_.rollbackVersion() == nullptr) {
+                cursor_ = 0; // 項目が消えたら、隣の Restart に重ならないように
+            }
             break;
         case I_SAVE_STATE:
             if (host_.saveState(slot_, status_) && status_.str()[0] == 0) status_.add("state saved");
@@ -1205,6 +1246,10 @@ private:
                 if (status_.str()[0] == 0) status_.add("state loaded");
                 open_ = false;
             }
+            break;
+        case I_PAD_SETUP:
+            host_.startPadSetup();
+            open_ = false;
             break;
         case I_RESET:
             host_.resetMachine();

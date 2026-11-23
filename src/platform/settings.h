@@ -66,6 +66,8 @@ struct Settings {
     int midiUart = 0;           // midi_uart= (ベアメタル版だけ。midi_out=uart で使う UART。Circle の CSerialDevice の番号)
     int midiUartFamily = 0;     // midi_uart_family= (midi_out=uart の先の音源: 0 gs、1 mt32。送り直しと音の止め方を決める)
     int writeBack = 1;          // write_back= (ベアメタル版だけ。X68000 が書いた内容をイメージのファイルに書き戻す)
+    int bootWarn = 1;           // boot_warn= (SRAM からの起動と、FD のブートセクタの書き換えを知らせる。platform/boot_warn.h)
+    char usbFddWrite[PATH_SIZE] = {}; // experimental_usb_fdd_write= (#386)。知らないキーとして警告しないためだけにあり、読まない (決めるのは platform/ufd_write_config.h)
     char writeProtect[PATH_SIZE] = {}; // write_protect= (ベアメタル版だけ。書き込み禁止にするディスク。「fd1,sc0」のように並べる)
     // ネットワークの口 (ベアメタル版だけ。baremetal/host_net.h、platform/net_config.h)
     int net = 0;                // net= (on なら TCP/IP を動かし、HTTP の口と syslog を使う)
@@ -80,9 +82,9 @@ struct Settings {
     // 読み終えてから resolveLegacySettings() がこの 2 つに読み替える
     // video_filter= (ブラウン管のように見せる効果。CRT_SCANLINE、CRT_CURVE、CRT_MASK を重ねた数。既定は効果なし)
     int videoFilter = 0;
-    // video_scale= (VideoScale。off: 1 倍、integer: 整数倍 (既定)、aspect: 4:3 で高さいっぱい、full: 画面全体)。
-    // ホスト版の既定は aspect (host/main.cpp の hostDefaultSettings())
-    int videoScale = VIDEO_SCALE_INTEGER;
+    // video_scale= (VideoScale。off: 1 倍、integer: 整数倍、aspect: 4:3 で高さいっぱい、full: 画面全体)。
+    // 既定は aspect (ベアメタル版の Pi 2 だけ integer。crt_preset.h の kDefaultVideoScale)
+    int videoScale = kDefaultVideoScale;
     // v0.1.0 の scale= と scanline= を読み替えるか。v0.1.0 ではどちらもベアメタル版だけの項目で、ホスト版は読まなかった
     // ので、ホスト版は 0 (hostDefaultSettings()。読んでも何もせず、保存でも行を書き直さない)
     int legacyVideo = 1;
@@ -227,6 +229,8 @@ static const SettingKey kSettingKeys[] = {
     {"midi_uart",    SettingKey::INT,    PIX68K_OFF(midiUart),        0, 10,  settings_detail::kMidiUartValues, nullptr, nullptr,                                 true,  false},
     {"midi_uart_family", SettingKey::CHOICE, PIX68K_OFF(midiUartFamily), 0, 0, nullptr, settings_detail::kMidiUartFamilyChoices, settings_detail::kMidiUartFamilyValues, true, true},
     {"write_back",   SettingKey::ONOFF,  PIX68K_OFF(writeBack),       0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
+    {"boot_warn",    SettingKey::ONOFF,  PIX68K_OFF(bootWarn),        0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
+    {"experimental_usb_fdd_write", SettingKey::PATH, PIX68K_OFF(usbFddWrite), 0, 0, nullptr, nullptr, nullptr,                                                    true,  false},
     {"write_protect", SettingKey::PATH,  PIX68K_OFF(writeProtect),    0, 0,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"net",          SettingKey::ONOFF,  PIX68K_OFF(net),             0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"net_ip",       SettingKey::PATH,   PIX68K_OFF(netIp),           0, 0,   nullptr, nullptr, nullptr,                                                          true,  false},

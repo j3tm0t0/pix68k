@@ -54,7 +54,7 @@ inline bool parseKeyLayout(const char* s, KeyLayout& layout, bool& detect) {
 // つないだキーボードの VID:PID と、HID 記述子の bCountryCode (なければ 0) から種類を決める。
 // pi400 は動いている機種が Pi 400 か。04d9 は Holtek の VID でほかのキーボードにもあるので、Pi 400 の上でだけ
 // Pi 400 のキーボードとみなす。Pi 400 の英語版と日本語版は VID:PID が同じなので、bCountryCode が日本 (15) のときだけ
-// 日本語版とする (日本語版がこの値を返すかは実機で確かめていない。違えば pix68k.cfg の keyboard=pi400jp で選ぶ)
+// 日本語版とする (実機の日本語版 (c03130) は 0 を返し、英語版と判定された。そのときは pix68k.cfg の keyboard=pi400jp で選ぶ。#359)
 inline KeyLayout detectKeyLayout(uint16_t vid, uint16_t pid, uint8_t country, bool pi400) {
     if (!pi400 || vid != PI400_KEYBOARD_VID || pid != PI400_KEYBOARD_PID) return KeyLayout::STANDARD;
     return country == HID_COUNTRY_JAPAN ? KeyLayout::PI400_JP : KeyLayout::PI400_US;

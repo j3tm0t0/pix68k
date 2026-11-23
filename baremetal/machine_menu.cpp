@@ -45,6 +45,8 @@ int CKernel::PopMenuKey() {
 // コア 0 の主ループから毎回呼ぶ
 void CKernel::ServiceMenu() {
     if (!m_MenuActive) return;
+    // Restart を選んで閉じた (m_MenuActive は true のまま)。FUK の読み出しが終わるのを待つ間に開き直さない
+    if (m_RebootRequested) return;
     if (!m_Menu.isOpen()) OpenMenu();
     bool redraw = false;
     for (int u; (u = PopMenuKey()) >= 0;) {
@@ -72,8 +74,9 @@ void CKernel::ServiceMenu() {
     if (redraw) DrawMenu();
 }
 
-// メニューを閉じた (割り込みを止めて呼ぶ)。ゲームパッドで押したままのボタンと方向は、一度離すまで X68000 に送らない
+// メニューを閉じた (割り込みを止めて呼ぶ)。ゲームパッドとマウスで押したままのボタンと方向は、一度離すまで X68000 に送らない
 void CKernel::ClosedPadMenu() {
+    m_MouseMask.closed();
     for (int s = 0; s < 2; s++) {
         m_PadMenu[s].closed();
         m_PadWant[s] = 0;
@@ -121,6 +124,7 @@ void CKernel::OpenMenu() {
             EnterCritical();
             m_MenuKeys.closed(m_LastMods);
             ClosedPadMenu();
+            m_MenuKeyHead = m_MenuKeyTail = 0;
             m_MenuActive = false;
             LeaveCritical();
             return;
@@ -131,6 +135,7 @@ void CKernel::OpenMenu() {
     // midi_out=uart なら、止めている間に実機の音源が鳴り続けないよう、鳴っている音を止める (送るのは待たない)
     SilenceMidiUart(0);
     m_Discard.clear();
+    FindRollback();
     m_Menu.open(m_Settings, m_FileSettings);
     m_MenuLastKey = 0;
     m_MenuRepeat.update(0, 0);
@@ -142,7 +147,8 @@ void CKernel::CloseMenu() {
                    m_Menu.status()[0] ? ")" : "");
     // 断った POST /reboot?profile= が残っていて前回の選択に戻せなければ、再起動せずに閉じる (X68000 を動かし直す)
     if (m_Menu.restartRequested() && CancelProfileChoiceForRestart("menu Restart")) {
-        // pix68k.cfg は書いてあり、ディスクも書き戻してある (restart())。SRAM を書いてから再起動する
+        // Restart なら pix68k.cfg を書き、Roll back なら config.txt を替えてある (どちらも、ディスクは書き戻したか、捨てると
+        // 決めた。rollBack() は取り消しも先に済ませてある)。SRAM を書いてから再起動する
         // (主ループが ShutdownReboot を返す)
         if (m_pEmulator->machine().sramDirty() || m_pEmulator->pendingSram() != nullptr)
             SaveSram(m_pEmulator->machine().sram());
@@ -158,6 +164,11 @@ void CKernel::CloseMenu() {
     m_MenuKeys.closed(m_LastMods);
     ClosedPadMenu();
     m_MenuKeyHead = m_MenuKeyTail = 0;
+    if (m_PadSetupWanted && !m_DeployHeld) {
+        // 「Gamepad setup」を選んだ: メニューを下ろすのと同時に立てる。開くのは主ループ (ServicePadSetup())
+        m_PadSetupActive = true;
+    }
+    m_PadSetupWanted = false;
     m_MenuActive = false;
     LeaveCritical();
     // 止めていた間は数えない。画面の隅の数字は数え直し、数え終えるまで出さない (ホスト版も同じ)
@@ -165,7 +176,7 @@ void CKernel::CloseMenu() {
     m_OsdTicks = 0;
     m_Discard.clear();
     // deploy の再起動を待たせている間は、X68000 を止めたまま (machine_run.cpp)
-    if (m_DeployHeld) return;
+    if (m_DeployHeld || m_FukReading) return; // FUK のディスクを読み出している間も止めたまま (ServiceFukRead())
     // コア 1 が動き出すまで待つ (すぐに開き直したときに、前の「止まった」を見て Machine を触らないように)
     m_pEmulator->requestPause(false);
     const u64 t0 = CTimer::GetClockTicks64();
@@ -189,12 +200,253 @@ void CKernel::DrawMenu() {
     m_OsdState.invalidate(); // 画面の隅の数字も消えた (閉じたあとに描き直す)
     m_BarsState.invalidate(); // 右下の使用率のバーも同じ
     m_MsgState.invalidate(); // 左上のメッセージも同じ
+    m_MixerState.invalidate(); // 左下のミキサーも同じ (メニューを開いている間は出さない)
     // 日本語のファイル名は CGROM の字で描く
     const uint8_t* cg = m_pEmulator != nullptr ? m_pEmulator->cgRom() : nullptr;
     m_Menu.draw(base, (int)(fb->GetPitch() / 4), (int)m_Screen.GetWidth(), (int)m_Screen.GetHeight(), 0xff000000u, cg,
                 cg != nullptr ? x68k::Machine::CG_SIZE : 0);
     // X68000 の画面の上にメニューを描いたので、次に写すときはすべての行を写す
     m_RowCache.valid = false;
+}
+
+// ---------------------------------------------------------------- 音を鳴らしたまま変えるミキサー (platform/mixer.h。#364)
+
+// 主ループから毎回呼ぶ。X68000 は動かしたまま、キーとレベルを見て、出す中身が変わったら写す役のコアに渡す。
+// X68000 が止まっている間は出さない (音が進まず、フレームも来ない)
+void CKernel::ServiceMixer() {
+    if (m_pEmulator == nullptr) return;
+    if (!m_MixerActive && !m_Mixer.isOpen()) return;
+    const u64 now = CTimer::GetClockTicks64();
+    if (!m_Mixer.isOpen()) {
+        m_Mixer.open();
+        m_MixerTicks = now;
+        m_MenuLastKey = 0;
+        m_MenuRepeat.update(0, 0);
+        WhileComposerPresents([&] { m_Logger.Write(FromMenu, LogNotice, "mixer opened"); });
+    }
+    for (int u; m_Mixer.isOpen() && (u = PopMenuKey()) >= 0;) {
+        m_MenuLastKey = (u8)u;
+        m_Mixer.key((u8)u);
+    }
+    const u8 held = platform::MenuKeyRepeat::repeats(m_MenuLastKey) &&
+                            (m_MenuKeys.isHeld(m_MenuLastKey) || m_PadMenu[0].holds(m_MenuLastKey) ||
+                             m_PadMenu[1].holds(m_MenuLastKey))
+                        ? m_MenuLastKey
+                        : 0;
+    if (const u8 r = m_MenuRepeat.update(held, (uint32_t)(now / (CLOCKHZ / 1000)))) m_Mixer.key(r);
+    if (m_Mixer.takeSave()) {
+        bool ok = false;
+        WhileComposerPresents([&] { ok = saveMixerVolumes(); });
+        m_Mixer.saved(ok);
+    }
+    EnterCritical();
+    if (m_DeployHeld || m_pEmulator->paused()) m_Mixer.close();
+    if (!m_Mixer.isOpen()) ClosedMixer();
+    LeaveCritical();
+    if (m_Mixer.isOpen() && now - m_MixerTicks >= CLOCKHZ / 10) {
+        m_MixerTicks = now;
+        m_Mixer.tick();
+    }
+    PublishMixer();
+    if (!m_Mixer.isOpen()) {
+        m_MsgRedraw = true; // X68000 が止まっていれば、最後の画面を写し直して消す (ServiceMessage())
+        WhileComposerPresents([&] { m_Logger.Write(FromMenu, LogNotice, "mixer closed"); });
+    }
+}
+
+// Web のミキサー (platform/mixer_web.h)。主ループから毎回呼ぶ。HTTP のタスクも同じコア 0 で、Yield() するところでだけ
+// 切り替わるので、音量を変える途中に入り合うことはない
+void CKernel::ServiceWebMixer() {
+    if (m_pEmulator == nullptr) return;
+    if (m_WebSave.wanted()) {
+        if (m_MenuActive || m_DeployHeld) {
+            m_WebSave.refuse();
+        } else {
+            bool ok = false;
+            WhileComposerPresents([&] { ok = saveMixerVolumes(); });
+            if (m_Mixer.isOpen()) {
+                m_Mixer.saved(ok);
+                PublishMixer();
+            }
+            m_WebSave.finish(ok);
+        }
+    }
+    const uint32_t ms = (uint32_t)(CTimer::GetClockTicks64() / (CLOCKHZ / 1000));
+    if (m_WebLevels.due(ms)) {
+        TakeSoundLevels();
+        m_WebLevels.close(ms);
+    }
+}
+
+bool CKernel::netMixerJson(char* out, unsigned size) {
+    if (m_pEmulator == nullptr) return false;
+    const uint32_t ms = (uint32_t)(CTimer::GetClockTicks64() / (CLOCKHZ / 1000));
+    TakeSoundLevels(); // 読み始めるときは、ここまでの分を出さない
+    m_WebLevels.touch(ms);
+    platform::formatMixerJson(out, size, *this, m_WebLevels.recent(),
+                              memcmp(m_Settings.volume, m_FileSettings.volume, sizeof m_Settings.volume) != 0);
+    return true;
+}
+
+bool CKernel::netMixerSet(int group, int dB) {
+    if (m_pEmulator == nullptr) return false;
+    setMixerVolume(group, dB);
+    m_Mixer.changedElsewhere();
+    return true;
+}
+
+// ミキサーを閉じた (割り込みを止めて呼ぶ)。押したままのキー、ボタンと方向は、一度離すまで X68000 に送らない
+void CKernel::ClosedMixer() {
+    m_MenuKeys.closed(m_LastMods);
+    ClosedPadMenu();
+    m_MenuKeyHead = m_MenuKeyTail = 0;
+    m_MixerActive = false;
+}
+
+// ---------------------------------------------------------------- ゲームパッドのボタンの並びを決める (platform/pad_setup.h。#379)
+
+// 2 つの枠のゲームパッドの、USB の ID と最後の生の値
+void CKernel::CollectPads(platform::PadSetup::Pad pads[platform::PadSetup::PADS]) {
+    for (int s = 0; s < platform::PadSetup::PADS; s++) {
+        EnterCritical();
+        CUSBGamePadDevice* pad = m_pGamePad[s];
+        if (pad != nullptr) {
+            // 主ループの UpdateUsbDevices() のほかに、つなぎ直しを数える値。0 にはならない
+            pads[s].id = (uint32_t)m_PadAttachTicks[s] | 1u;
+            pads[s].iface = pad->GetInterfaceNumber();
+            CUSBDevice* dev = pad->GetDevice();
+            const TUSBDeviceDescriptor* desc = dev ? dev->GetDeviceDescriptor() : nullptr;
+            if (desc != nullptr) {
+                pads[s].vid = desc->idVendor;
+                pads[s].pid = desc->idProduct;
+            }
+            pads[s].valid = m_PadRawValid[s];
+            pads[s].direction = m_PadDirection[s];
+            pads[s].raw = m_PadRaw[s];
+        }
+        LeaveCritical();
+    }
+}
+
+// 主ループから毎回呼ぶ。X68000 は動かしたまま、生の値とキーを見て、画面の文字が変わったら写す役のコアに渡す
+void CKernel::ServicePadSetup() {
+    if (m_pEmulator == nullptr || !m_PadSetupActive) return;
+    const u64 ticks = CTimer::GetClockTicks64();
+    const uint32_t now = (uint32_t)(ticks / (CLOCKHZ / 1000));
+    platform::PadSetup::Pad pads[platform::PadSetup::PADS];
+    CollectPads(pads);
+    if (!m_PadSetup.isOpen()) {
+        m_PadSetup.openFor(m_PadSetupSlot, pads, now); // -1 なら、選ぶところから
+        m_PadSetupSlot = -1;
+        m_PadSetupTicks = 0;
+        WhileComposerPresents([&] { m_Logger.Write(FromMenu, LogNotice, "gamepad setup opened"); });
+    }
+    for (int u; m_PadSetup.isOpen() && (u = PopMenuKey()) >= 0;) m_PadSetup.key((u8)u, now);
+    m_PadSetup.update(pads, now);
+    if (m_PadSetup.takeSave()) {
+        const char* error = nullptr;
+        const int slot = m_PadSetup.slot();
+        WhileComposerPresents([&] { error = SavePadMap(m_PadSetup.map(), slot); });
+        m_PadSetup.saved(error, (uint32_t)(CTimer::GetClockTicks64() / (CLOCKHZ / 1000)));
+    }
+    if (m_DeployHeld || m_pEmulator->paused()) m_PadSetup.close();
+    if (m_PadSetup.isOpen() && m_PadSetupTicks != 0 && ticks - m_PadSetupTicks < CLOCKHZ / 10) return;
+    m_PadSetupTicks = ticks;
+    platform::MixerView view;
+    if (m_PadSetup.isOpen()) {
+        view.open = platform::MixerView::PANEL_TEXT;
+        static_assert(platform::PadSetup::ROWS == platform::MIXER_ROWS && platform::PadSetup::COLS == platform::MIXER_COLS,
+                      "the panel of the gamepad setup");
+        m_PadSetup.text(view.text, pads);
+    }
+    if (!PublishPanel(view)) m_PadSetup.close();
+    if (!m_PadSetup.isOpen()) {
+        EnterCritical();
+        ClosedPadSetup();
+        LeaveCritical();
+        m_MsgRedraw = true; // X68000 が止まっていれば、最後の画面を写し直して消す (ServiceMessage())
+        WhileComposerPresents([&] { m_Logger.Write(FromMenu, LogNotice, "gamepad setup closed"); });
+    }
+}
+
+// 設定の画面を閉じた (割り込みを止めて呼ぶ)。押したままのものは、一度離すまで X68000 に送らない
+void CKernel::ClosedPadSetup() {
+    m_MenuKeys.closed(m_LastMods);
+    ClosedPadMenu();
+    m_MenuKeyHead = m_MenuKeyTail = 0;
+    m_PadSetupActive = false;
+}
+
+// map を /pix68k/pads.txt に書き、書けたら枠 slot のゲームパッドに当てて nullptr を返す。だめなら画面に出す理由 (28 字まで)
+const char* CKernel::SavePadMap(const platform::PadMap& map, int slot) {
+    if (slot < 0 || !m_PadMaps.canAdd(map)) {
+        m_Logger.Write(FromMenu, LogWarning, "pads.txt: too many gamepads; not saved");
+        return "pads.txt is full (32 pads)";
+    }
+    CString txt, tmp;
+    txt.Format("%s/pix68k/pads.txt", m_BootDrive);
+    tmp.Format("%s/pix68k/pads.new", m_BootDrive);
+    u8* old = nullptr;
+    unsigned oldSize = 0;
+    bool usedTmp = false;
+    FRESULT r = ReadWithFallback(txt, tmp, old, oldSize, usedTmp);
+    if (r != FR_OK && r != FR_NO_FILE && r != FR_NO_PATH) {
+        // 読めないまま書くと、ほかの機種の行が消える
+        m_Logger.Write(FromMenu, LogWarning, "%s: cannot read (FRESULT %d); not saved", (const char*)txt, (int)r);
+        return "cannot read pads.txt";
+    }
+    const size_t cap = (size_t)oldSize + platform::PAD_LINE_MAX + 5;
+    char* buf = new char[cap];
+    const size_t n = buf != nullptr ? platform::upsertPadLine((const char*)old, oldSize, map, buf, cap) : 0;
+    delete[] old;
+    if (n == 0) {
+        const char* why = buf == nullptr ? "not enough memory" : "cannot make the line";
+        delete[] buf;
+        m_Logger.Write(FromMenu, LogWarning, "%s: %s; not saved", (const char*)txt, why);
+        return why;
+    }
+    MakeBootDir();
+    r = WriteFileReplacing(txt, tmp, buf, (unsigned)n);
+    delete[] buf;
+    if (r != FR_OK) {
+        m_Logger.Write(FromMenu, LogWarning, "%s: write failed (FRESULT %d)", (const char*)txt, (int)r);
+        return "cannot write pads.txt";
+    }
+    char line[platform::PAD_LINE_MAX + 1];
+    platform::formatPadLine(map, line, sizeof line);
+    m_Logger.Write(FromMenu, LogNotice, "gamepad layout saved to %s: %s", (const char*)txt, line);
+    // USB の割り込みが読むので、割り込みを止めて差し替える。押したままのボタンを新しい並びで数え直す (閉じるときに隠すため)
+    EnterCritical();
+    m_PadMaps.add(map);
+    for (int s = 0; s < 2; s++) {
+        CUSBGamePadDevice* pad = m_pGamePad[s];
+        if (pad == nullptr) continue;
+        CUSBDevice* dev = pad->GetDevice();
+        const TUSBDeviceDescriptor* desc = dev ? dev->GetDeviceDescriptor() : nullptr;
+        if (desc == nullptr) continue;
+        const platform::PadMap* found = m_PadMaps.find(desc->idVendor, desc->idProduct, pad->GetInterfaceNumber());
+        if (found == nullptr || (s != slot && found == m_PadMap[s] && !found->sameKey(map))) continue;
+        m_PadMap[s] = found;
+        m_PadLayout[s] = nullptr;
+        m_PadReset[s].reset();
+        if (!m_PadRawValid[s]) continue;
+        const int hat0 = m_PadRaw[s].nhats > 0 ? m_PadHat[s].decode(m_PadRaw[s].hats[0]) : 8;
+        const platform::GamePadInput in = platform::applyPadMap(*found, m_PadRaw[s], hat0);
+        u8 out = 0, events[platform::PadMenuInput::MAX_EVENTS];
+        int nEvents = 0;
+        m_PadReset[s].update(in.known, in.buttons);
+        m_PadMenu[s].update(in.known, in.buttons, platform::joystickBits(in), true, out, events, nEvents);
+        m_PadMenu[s].forgetHeld();
+    }
+    LeaveCritical();
+    return nullptr;
+}
+
+// 音量だけを保存する (起動の組み合わせで動いていれば組み合わせのファイル、でなければ pix68k.cfg) (m_Settings のほかの項目は、メニューで変えてまだ保存していないかもしれない)
+bool CKernel::saveMixerVolumes() {
+    platform::Settings s = m_FileSettings;
+    memcpy(s.volume, m_Settings.volume, sizeof s.volume);
+    return SaveConfig(s);
 }
 
 // ---------------------------------------------------------------- MenuHost (X68000 は止まっている)

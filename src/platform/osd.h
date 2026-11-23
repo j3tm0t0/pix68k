@@ -71,6 +71,19 @@ enum OsdSound {
 inline const char* osdMidiOutName(int midiOut) {
     return midiOut == 0 ? "SF2" : midiOut == 1 ? "UART" : midiOut == 3 ? "MT-32" : midiOut == 4 ? "SC-55" : "none";
 }
+// MIDI の音源を用意できなかったか (OsdStats::midiFault。#362)。読んでいる間は OK のまま
+enum OsdMidiFault {
+    OSD_MIDI_OK = 0,
+    OSD_MIDI_NO_FILE = 1, // ROM か SoundFont の指定がない、ファイルがない、読めない、合わない
+    OSD_MIDI_FAILED = 2,  // ほかの理由 (メモリが足りない、この Pi では使えないなど)
+    OSD_MIDI_FAULT_MAX = OSD_MIDI_FAILED
+};
+// 用意できなかった理由の短い語 (6 文字)。OK と none (鳴らさない設定) では nullptr
+inline const char* osdMidiFaultText(int midiOut, int fault) {
+    if (midiOut == 2 || fault <= OSD_MIDI_OK || fault > OSD_MIDI_FAULT_MAX) return nullptr;
+    if (fault == OSD_MIDI_FAILED || midiOut == 1) return "failed"; // uart にファイルはない
+    return midiOut == 0 ? "no SF2" : "no ROM";
+}
 // 詰められるいちばん大きい値 (これより大きい値はこの値にする)
 static constexpr unsigned OSD_FPS_DECI_MAX = 9999; // fps (0.1 単位。999.9)
 static constexpr unsigned OSD_COUNT_MAX = 999;     // 置き換わった数、速さ (%)
@@ -151,6 +164,7 @@ struct OsdStats {
     // 0 なら音源の行を出さない)、soundActive はそのうち直近 1 秒に鳴ったもの (鳴っていない音源は灰色)、midiOut は MIDI の行き先
     unsigned soundSources = 0, soundActive = 0;
     int midiOut = 0;
+    int midiFault = OSD_MIDI_OK; // MIDI の音源を用意できなかったか (OsdMidiFault)
 };
 
 // 詰めた数字。a が 0 なら「まだ数字がない」(a の bit 63 が 1 なら数字がある)。下位からの並び:
@@ -159,7 +173,8 @@ struct OsdStats {
 //   b: 0-2 ファンの段階に 1 を足した値 (0 なら出さない)、3-13 回転数 (10rpm 単位)、14-23 ヒープの MB に 1 を足した値
 //      (0 なら出さない)、24-25 MPU (0 出さない、1 68000、2 68030、3 68060)、26-33 MPU のクロック (MHz)、
 //      34-38 Pi のモデル (OsdPi)、39-47 ARM のクロック (10MHz 単位)、48-61 最高速モードの実効のクロック (MHz。0 なら出さない)
-//   c: 0-31 IP アドレス (0 なら出さない)、32-37 つないでいる音源、38-43 鳴った音源、44-46 MIDI の行き先 (#310)
+//   c: 0-31 IP アドレス (0 なら出さない)、32-37 つないでいる音源、38-43 鳴った音源、44-46 MIDI の行き先 (#310)、
+//      47-48 MIDI の音源を用意できなかったか (OsdMidiFault。#362)
 struct OsdValue {
     uint64_t a = 0, b = 0, c = 0;
     bool valid() const { return a != 0; }
@@ -193,6 +208,9 @@ inline OsdValue packOsd(const OsdStats& s) {
     v.c = s.ipv4;
     v.c |= (uint64_t)(s.soundSources & OSD_SND_ALL) << 32 | (uint64_t)(s.soundActive & s.soundSources & OSD_SND_ALL) << 38 |
            (uint64_t)(s.midiOut >= 0 && s.midiOut <= 4 ? s.midiOut : 2) << 44;
+    // MIDI ボードがなければ 0 にする (出ない値の違いで描き直さないように)
+    if ((s.soundSources & OSD_SND_MIDI) && s.midiFault > OSD_MIDI_OK && s.midiFault <= OSD_MIDI_FAULT_MAX)
+        v.c |= (uint64_t)s.midiFault << 47;
     return v;
 }
 
@@ -225,6 +243,8 @@ inline OsdStats unpackOsd(const OsdValue& v) {
     s.soundActive = (unsigned)(v.c >> 38 & OSD_SND_ALL) & s.soundSources;
     const unsigned midi = (unsigned)(v.c >> 44 & 7);
     s.midiOut = midi <= 4 ? (int)midi : 2;
+    const unsigned fault = (unsigned)(v.c >> 47 & 3);
+    s.midiFault = fault <= OSD_MIDI_FAULT_MAX ? (int)fault : OSD_MIDI_FAILED;
     return s;
 }
 
@@ -358,7 +378,9 @@ inline void ipTwoRows(Text& a, Text& b, uint32_t ip) {
 
 // 音源の行 (#310)。つないでいる音源を、1 行 1 つの組で out[0] から順に作り、作った行の数を返す (OSD_V_SOUND_ROWS まで)。
 // 鳴っていない音源の名前は OSD_DIM_BIT を立てる。並びは「OPM ADPCM」「MERC PCM+OPN3」(狭い並びでは「PCM+OPN3」)、
-// 「MIDI:MT-32」、「CD」。MIDI の行き先が UART のときは、鳴ったかが分からないので明るく出す
+// 「MIDI:MT-32」、「CD」。MIDI の行き先が UART のときは、鳴ったかが分からないので明るく出す。
+// MIDI の音源を用意できなかったときは (#362)、灰色で「MT-32 (no ROM)」(15 文字に入るように「MIDI:」を省く)、
+// 狭い並びでは「MIDI:no ROM」と出す
 inline int soundRows(Text* out, const OsdStats& s, bool narrow) {
     const unsigned src = s.soundSources, on = s.soundActive;
     if (src == 0) return 0;
@@ -375,9 +397,17 @@ inline int soundRows(Text* out, const OsdStats& s, bool narrow) {
         k++;
     }
     if (src & OSD_SND_MIDI) {
-        const bool bright = s.midiOut == 1 || (on & OSD_SND_MIDI) != 0;
-        out[k].str("MIDI:", bright);
-        out[k].str(osdMidiOutName(s.midiOut), bright);
+        const char* fault = osdMidiFaultText(s.midiOut, s.midiFault);
+        const bool bright = fault == nullptr && (s.midiOut == 1 || (on & OSD_SND_MIDI) != 0);
+        if (fault == nullptr || narrow) {
+            out[k].str("MIDI:", bright);
+            out[k].str(fault != nullptr ? fault : osdMidiOutName(s.midiOut), bright);
+        } else {
+            out[k].str(osdMidiOutName(s.midiOut), false);
+            out[k].str(" (", false);
+            out[k].str(fault, false);
+            out[k].str(")", false);
+        }
         k++;
     }
     if (src & OSD_SND_CD) {

@@ -63,7 +63,7 @@ pix68kcli を動かすターミナルのアプリを許可する。
 
 token は画面にもログにも出さない (`-v` も、送った要求の行に token の出どころだけを書く)。`pix68kcli config` で、決まった宛先と token の出どころ (値は出さない) を確かめられる。
 
-プロキシは使わず (`HTTP_PROXY` を読まない)、口がリダイレクト (3xx) を返してもついて行かない。token を LAN の外に出さないため。
+Pi とのやり取りにはプロキシを使わず (`HTTP_PROXY` を読まない)、口がリダイレクト (3xx) を返してもついて行かない。token を LAN の外に出さないため。
 
 ## 命令
 
@@ -86,15 +86,26 @@ pix68kcli key down --mod 09 4c          # Ctrl + GUI + Delete (X68000 のリセ�
 pix68kcli key up                        # すべて離す (key up 4c なら 1 つ)
 pix68kcli message --sec 30 '案1\nいまの版'   # 画面の左上に 30 秒出す (既定 10 秒、0 なら消すまで)
 pix68kcli message --clear               # 消す
+pix68kcli fuk-read --drive 0 disk.xdf   # FUK につないだ FDD のディスクを XDF に読み出す (docs/fuk.md)
 pix68kcli files ls /pix68k              # SD カードの一覧
 pix68kcli files get /pix68k/pix68k.cfg  # 読む (手元に pix68k.cfg を作る。2 つ目の引数で名前、- なら標準出力)
 pix68kcli files put kernel8.img /       # 書く (/ で終われば手元の名前を付ける)
 pix68kcli files put - /pix68k/pix68k.cfg < pix68k.cfg
 pix68kcli files rm /pix68k/old.cfg      # 消す
+pix68kcli update --check                # 今のカーネルと、配布している最新の版を比べる (--tag v0.3.0 で版を選ぶ)
+pix68kcli update --no-tryboot           # カーネルを入れ替えて再起動する (下の「更新」)
+pix68kcli update --rollback             # 更新の前の版に戻す
 pix68kcli api                           # 口の使い方の一覧 (GET /) をそのまま
 ```
 
 - `status` の Pi の型は、起動したときのログの行 (`pix68k bare metal on ...`) から取る。X68000 を動かして 10 分ほどでログが 64KB を超え、その行が消えると「分からない」と出す
+- `update --check` は比べるだけで、Pi には何も書かない。GitHub の Releases から zip を取り、SHA256SUMS と照合し、その機種のカーネルを、Pi のドライブの
+  カーネル (config.txt の `kernel=`) と比べる。`GET /version` と `GET /sha256` のあるカーネル (v0.2.3 より後) が要る。空き容量は調べない。
+  動いているカーネルとドライブのカーネルの版 (コミット) が違えば (LAN から起動しているときなど)、更新できないと出す。ドライブに config.txt かカーネルがないときも同じ。
+  配布元 (github.com) へは token を送らず、ふつうの HTTPS の要求で、環境変数のプロキシ (`HTTPS_PROXY`) も使う。転送先は https だけ
+  使える機種は Raspberry Pi 2 Model B、3 Model B / B+、4 Model B、400、5
+- `update --check` の終了コードは、比べられたときは結果によらず 0 (同じ、違う、更新できない、のどれも)。結果は出力で見る。版の新旧は、版の名前がどちらも `vX.Y.Z` か `vX.Y.Z-beta.N` のときだけ出す。
+  配布元 (GitHub) につながらなければ 3、指定した版がなければ 5、回数の制限など (403、429) とほかの失敗は 1。制限のときは `--tag` で版を指定すると API を使わない
 - 命令ごとのオプション (`--sec`、`--profile`、`-o` など) は、引数より前に書く
 - `reboot --profile` は、先に `GET /` の一覧に `POST /reboot?profile=` の行があるか確かめ、なければ送らずに終了コード 7 で終える。
   #231 より前のカーネルは `profile=` を読まずに、そのまま `pix68k.cfg` で再起動してしまうため
@@ -118,11 +129,11 @@ pix68kcli api                           # 口の使い方の一覧 (GET /) を�
 | 0 | 成功 |
 | 1 | そのほかの失敗 (口の 400 や 500、手元のファイルの読み書き) |
 | 2 | 使い方の誤り、設定ファイルの誤り、宛先がない |
-| 3 | つながらない、時間切れ (つなぐのは 5 秒、ふつうの要求は 30 秒で切る) |
+| 3 | つながらない、時間切れ (`update` では配布元も。つなぐのは 5 秒、ふつうの要求は 30 秒で切る) |
 | 4 | 断られた (403。token が違う、`net_allow=`、`Host:`、書き込みを許していない) |
 | 5 | ない (404。`files` のファイル、`reboot --profile` の組み合わせ) |
 | 6 | 使用中か、動いていない (409 は X68000 が使っているディスクのイメージ、503 は設定メニューを開いている、X68000 が動いていない、など) |
-| 7 | 動いているカーネルにその口がない (`thermal`、`screen`、`type`、`key`、`message` の 404 と、`reboot --profile` で一覧に `/reboot?profile=` がないとき) |
+| 7 | 動いているカーネルにその口がない (`thermal`、`screen`、`type`、`key`、`message`、`update` の 404 と、`reboot --profile` で一覧に `/reboot?profile=` がないとき) |
 
 誤りは標準エラーに 1 行で出す。口が返した文 (英語) をそのまま付ける。
 
@@ -132,6 +143,29 @@ pix68kcli: 192.168.1.x: GET /files/nonexist: 404 no such file
 pix68kcli: 192.168.1.x: GET /: つながらない: 時間切れ (dial tcp 192.168.1.x:80: i/o timeout)
 pix68kcli: 192.168.1.x: GET /: つながらない: dial tcp 192.168.1.x:80: connect: connection refused
 ```
+
+## 更新
+
+`update` は、`--check` と同じ確認をしてから、Pi のカーネルを入れ替えて再起動する。`update` そのものは、実機ではまだ試していない。`--rollback` と、`update` と同じ順に要求を送るスクリプトでの更新は、Pi 400 (英語キーボード、SD カードから起動) で、開発中の版の間で確かめた。ほかの機種では、まだ確かめていない。
+
+1. config.txt の控えを、今のディレクトリに `pix68k-config-<Pi>-<日時>.txt` で置く
+2. 新しいカーネルを、使っていないほうの名前で SD カードに書き、SHA-256 を確かめる。名前は `kernel8.img` と `pix68k8.img` のように、機種ごとに 2 つを交互に使う。今の版のファイルは消さない (2 つ前の版は上書きする)
+3. 前の版の名前と SHA-256 を `/pix68k/update.txt` に書く
+4. config.txt の `kernel=` の値だけを替え (`POST /config/kernel`)、読み直して全部のバイトを比べる
+5. 再起動し、`GET /version` が新しい版になるのを待つ (3 分)
+
+2 と 3 で電源が切れても、次は今の版で起動する見込み (SD カードが壊れる場合は除く)。4 は 1 セクタ (512 バイト) を書くだけだが、書いている最中に電源が切れると config.txt が壊れることがある。そのときは SD カードを PC に入れ、控えを config.txt に戻す。
+
+- `--no-tryboot` が要る。新しい版を 1 回だけ試して起動する方法 (Raspberry Pi の tryboot) は、今は使わない。新しい版が起動しないときは、SD カードを PC に入れ、config.txt の `kernel=` を戻す
+- 古い版にするときは `--allow-downgrade`、新しいか分からないとき (nightly や自分でビルドした版から、など) は `--force` が要る
+- config.txt の `kernel=` が上の 2 つの名前でないとき、`include` や条件付きの見出しで判断できないとき、LAN、USB メモリ、NVMe から起動しているときは断る
+- 替えるのはカーネルだけ。ファームウェア、config.txt のほかの行、pix68k.cfg は替えない。新しい版がそれらの変更を必要とするなら、zip を展開して手で入れ替える
+- `--rollback` は、`/pix68k/update.txt` にある前の版に `kernel=` を戻して再起動する。SHA-256 が書いたときと同じときだけ。戻したあとに、もう一度 `--rollback` で進めることはできない
+- `POST /config/kernel` のあるカーネルと `net_token=` が要る。空き容量は調べない (足りなければ、カーネルを書くところで止まり、config.txt は替えない)
+- LAN から起動しているときに断るのは pix68kcli だけ (Pi は、SD カードがあれば受ける)
+- `--rollback` は、更新した版が動いているとき (か、更新のあと再起動していないとき) だけ。ほかの版を LAN から起動しているときなどは断る
+- Pi の画面からも戻せる (設定メニューと起動メニューの「Roll back」。[docs/settings-menu.md](../../docs/settings-menu.md))
+- 終了コードは、新しい版が動いたことを確かめられなければ 3
 
 ## 試験
 

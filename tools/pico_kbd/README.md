@@ -330,7 +330,7 @@ printf 'G 0 3\n' > $d; printf 'G\n' > $d    # ハットを右に倒したまま�
   kernel=kernel8.img
   ```
   `arm_64bit=1` がないと 32 ビットで起動しようとして `kernel8.img` を読まない。
-  `disable_overscan=1` がないとフレームバッファが削られ、画面が 2 倍に拡大されない。
+  `disable_overscan=1` がないとフレームバッファが削られ (1920x1080 が 1824x984 になるなど)、画面が小さく出る。
 - 試験機の SD カードには `bootcode.bin`、空のファイル `timeout`、`/pix68k/` (ROM とディスクのイメージ) だけを置く。
   SD カードの `bootcode.bin` が LAN からの起動に進み、pix68k は SD カードから ROM とイメージを読む。
   SD カードがなくても Pi 3B+ は LAN から起動するが、始まるまでに時間がかかる (約 15 秒。SD カードの `bootcode.bin` からなら約 6 秒)。

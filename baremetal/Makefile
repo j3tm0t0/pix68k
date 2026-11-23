@@ -19,11 +19,11 @@ endif
 
 # X68000 本体 (src/x68k)
 X68K_OBJS = x68k_machine.o x68k_mfp.o x68k_rtc.o x68k_video.o x68k_devices.o x68k_render.o x68k_gvram.o \
-	x68k_fdd.o x68k_fdc.o x68k_fuk.o x68k_dmac.o x68k_keyboard.o x68k_textscreen.o x68k_sram_file.o \
+	x68k_fdd.o x68k_fdc.o x68k_fuk.o x68k_fuk_reader.o x68k_dmac.o x68k_keyboard.o x68k_textscreen.o x68k_sram_file.o \
 	x68k_scc.o x68k_mouse.o x68k_ppi.o x68k_sasi.o x68k_spc.o x68k_cd_drive.o x68k_opm.o x68k_adpcm.o x68k_sound.o x68k_video_replay.o x68k_sound_replay.o x68k_state.o \
 	x68k_ts6bga.o $(FPU_BOARD_OBJS) x68k_mercury.o x68k_opn3.o x68k_neptune.o x68k_ym3802.o
 
-OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o net_bridge.o host_net.o fuk_usb.o pi5_fan.o m68k.o $(FPU_OBJS) $(X68K_OBJS) \
+OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o update_menu.o config_switch.o net_bridge.o host_net.o fuk_usb.o pi5_fan.o m68k.o $(FPU_OBJS) $(X68K_OBJS) \
 	platform_sf2_synth.o platform_mt32_synth.o munt_libc.o $(MUNT_OBJS) platform_sc55_synth.o $(NUKED_OBJS)
 
 # MT-32 の音源 Munt (external/munt、LGPL 2.1 以降)。ソースは変えずに、C++ の標準ライブラリと libm のかわりに

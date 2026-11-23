@@ -37,6 +37,16 @@ inline int realFloppyUnit(const char* name) {
     return -1;
 }
 
+// experimental_usb_fdd_write= の値。空か off なら -1、usb-fdd:0〜usb-fdd:3 ならその番号、ほかは -2 (番号のない usb-fdd: も受けない)
+inline int usbFddWriteUnit(const char* value) {
+    if (value == nullptr || value[0] == 0) return -1;
+    if ((value[0] | 0x20) == 'o' && (value[1] | 0x20) == 'f' && (value[2] | 0x20) == 'f' && value[3] == 0) return -1;
+    const int unit = realFloppyUnit(value);
+    const char* e = value;
+    while (*e) e++;
+    return unit >= 0 && e[-1] != ':' ? unit : -2;
+}
+
 inline bool isRealFloppyName(const char* name) { return realFloppyUnit(name) >= 0; }
 
 // 実物のドライブから読んだディスクを、イメージのファイルに書き出すときの名前 (#287)。中身の CRC-32 (zlib の crc32() と

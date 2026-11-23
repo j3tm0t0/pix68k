@@ -68,7 +68,9 @@ else
 fi
 check '書き出し: 手順は platform::saveFloppyImageFile()' "$RUN" 'bool CKernel::saveFloppyImage(' 'platform::saveFloppyImageFile(fs, path, tmp, m_pDiskData[drive], size, crc, &tmpLeft);'
 NET=$ROOT/baremetal/host_net.cpp
-check 'HTTP: /fd<N>.xdf は、ファイルを読むのと同じ扱い (トークン)' "$NET" 'void CHttpTask::Handle(' ': files || fdImage >= 0 ? platform::NetOp::READ_FILES'
+check 'HTTP: /fd<N>.xdf は、ファイルを読むのと同じ扱い (トークン)' "$NET" 'void CHttpTask::Handle(' ': files || sha256 || fdImage >= 0 || fukImage ? platform::NetOp::READ_FILES'
+check 'HTTP: /sha256 は /files と同じパスの検査を通る' "$NET" 'void CHttpTask::Handle(' '!platform::urlDecode(p + 7, decoded, sizeof decoded) ||'
+check 'HTTP: /sha256 は大きさの上限を見る' "$NET" 'bool CHttpTask::HashFile(' 'const bool tooLarge = size > MAX_SHA256;'
 check 'HTTP: 答え方は platform::floppyImageReply() で決める' "$NET" 'void CHttpTask::GetFloppyImage(' 'platform::floppyImageReply(bytes, head,'
 # バッファを確保するのは、答え方が ALLOCATE に決まったあとだけ
 alloc=$(body "$NET" 'void CHttpTask::GetFloppyImage(' | awk '/case Reply::ALLOCATE:/ { a = NR } /new u8\[/ { n++; where = NR } END { print (n == 1 && a && where == a + 1) ? "ok" : "ng" }')
@@ -117,6 +119,68 @@ else
   ng 'WRITE(10) を TryWrite() の外で作っている'
 fi
 grep -q 'bPix68kLong ? 30\*HZ : 3\*HZ' "$T/x.cpp" && ok 'xHCI: 30 秒まで待つのは USB-FDD への転送だけ' || ng 'xHCI の時間切れの書き換えがない'
+
+# Pi 4 / Pi 5 のビルドに足す、書き込みの関数 (#386)。pix68k.cfg の experimental_usb_fdd_write= のときだけ動く
+if grep -qE 'Pix68k(Arm|Command|Gate)|pix68k_ufi_gate' "$T/o.cpp" "$T/o.h"; then
+  ng 'Pi 2 / Pi 3 のビルドに、書き込みの関数が入っている'
+else
+  ok 'Pi 2 / Pi 3 のビルドには、書き込みの関数が入らない'
+fi
+if sh "$PATCH" "$CPP" "$T/w.cpp" "$H" "$T/w.h" "$X" "$T/wx.cpp" "$ROOT/baremetal/ufd_write.inc" 2>"$T/err"; then
+  cat "$T/o.cpp" "$ROOT/baremetal/ufd_write.inc" | cmp -s - "$T/w.cpp" && ok '元の関数 (読み取り専用) は変えない' ||
+    ng '元の関数が変わっている'
+  # 書き込みの関数の最初の判定が、許していないときに断ること。装置に送るのは、その判定と UfiGate の判定のあと
+  for fn in 'boolean CUSBFloppyDiskDevice::Pix68kArmWrite (' 'int CUSBFloppyDiskDevice::Pix68kCommand ('; do
+    body "$T/w.cpp" "$fn" | awk '/if \(/ { print; exit }' | grep -qF 'if (   !platform::UfiGate::enabled ((int) m_nDeviceNumber - 1)' &&
+      ok "$fn は、許していなければ断る" || ng "$fn の最初の判定が UfiGate::enabled() でない"
+  done
+  n=$(grep -c 'm_Pix68kGate.allow' "$T/w.cpp")
+  pc=$(body "$T/w.cpp" 'int CUSBFloppyDiskDevice::Pix68kCommand (' |
+    awk '/UfiGate::enabled/ { e = NR } /m_Pix68kGate\.allow/ { a = NR } /pHost->/ && !p { p = NR } END { print (e && a && p && e < a && a < p) ? "ok" : "ng" }')
+  [ "$n" = 1 ] && [ "$pc" = ok ] && ok '送る前に UfiGate で判定する' || ng 'UfiGate の判定が送る前にない'
+  grep -q 'uchCompletionCode == 6 && pURB->GetEndpoint ()->GetType () == EndpointTypeControl' "$T/wx.cpp" &&
+    ok 'xHCI: STALL を知らせるのは制御転送だけ' || ng 'xHCI の STALL の書き換えがない'
+else
+  ng "書き込みの関数を足す書き換えが当たらない: $(cat "$T/err")"
+fi
+# 既定は閉じている。許すのは pix68k.cfg の値を確かめたあとの 1 か所、確認を開けるのは (あれば) 1 か所だけ
+grep -qE '^    char usbFddWrite\[PATH_SIZE\] = \{\};' "$ROOT/src/platform/settings.h" && grep -qF 'static State s = {-1, false};' "$ROOT/src/platform/ufi_gate.h" &&
+  ok '書き込みの既定は閉じている' || ng '書き込みの既定が閉じていない'
+# 呼び出しを数える (Circle の書き方の、括弧の前の空白も。.inc と、書き換えのスクリプトの中も)
+calls() {
+  grep -rnE "(UfiGate *::|[Gg]ate(\(\))?(\.|->)) *$1" "$ROOT/src" "$ROOT/baremetal" "$ROOT/host" "$ROOT/tools" |
+    grep -vE '^[^:]*:[0-9]+: *(//|#)'
+}
+n=$(calls 'enable *\(' | wc -l)
+[ "$n" -eq 1 ] && body "$ROOT/baremetal/machine_run.cpp" 'void CKernel::EnableUsbFloppyWrite(' |
+  awk '/usbFddWriteUnitFrom\(readOk, path, cfg, base/ { v = NR } /if \(unit < 0\)/ { r = NR } /UfiGate::enable\(unit\)/ { e = NR } END { exit !(v && r && e && v < r && r < e) }' &&
+  ok '書き込みを許すのは、値を確かめた 1 か所だけ' || ng "書き込みを許すところが 1 か所でないか、値を確かめていない ($n)"
+# 読めたか、どのファイルか、の判定は ufi_disk_test が試す (usbFddWriteUnitFrom())。ここでは、読んだ直後に 1 回だけ渡すことを見る
+n=$(grep -rn 'EnableUsbFloppyWrite(' "$ROOT"/baremetal/*.cpp | grep -v '^[^:]*:[0-9]*:void ' | wc -l)
+[ "$n" -eq 1 ] && body "$ROOT/baremetal/machine_run.cpp" 'void CKernel::ReadConfig()' |
+  awk '/LoadConfigText\("pix68k.cfg", "pix68k.new", base, path\)/ { l = NR } /EnableUsbFloppyWrite\(r == FR_OK, path, base\);/ { e = NR } END { exit !(l && e == l + 1) }' &&
+  ok 'pix68k.cfg を読んだ結果だけを渡す' || ng 'pix68k.cfg を読んだ結果のほかのものを渡している'
+# 比べるパスと、読んだファイルのパス (pix68k.new を読んだのに pix68k.cfg と答えない)。ほかの代入があれば落ちる
+EN=$(body "$RUN" 'void CKernel::EnableUsbFloppyWrite(')
+LC=$(body "$RUN" 'FRESULT CKernel::LoadConfigText(')
+[ "$(printf '%s\n' "$EN" | grep -cE 'cfg(\.Format| *=|\.Append)')" = 1 ] &&
+  printf '%s\n' "$EN" | grep -qxF '    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);' &&
+  [ "$(printf '%s\n' "$LC" | grep -cE '(^|[^a-zA-Z.])path(\.Format| *=|\.Append)')" = 1 ] &&
+  printf '%s\n' "$LC" | grep -qxF '    path = usedTmp ? tmp : cfg;' &&
+  printf '%s\n' "$LC" | grep -qxF '    cfg.Format("%s/pix68k/%s", m_BootDrive, name);' &&
+  printf '%s\n' "$LC" | grep -qxF '    tmp.Format("%s/pix68k/%s", m_BootDrive, tmpName);' &&
+  printf '%s\n' "$LC" | grep -qF 'ReadWithFallback(cfg, tmp, data, size, usedTmp);' &&
+  ok 'pix68k.new を読んだら、そのパスで比べる' || ng 'pix68k.new と pix68k.cfg を区別していない'
+# この版には、確認を開けるところがない
+n=$(calls 'confirm *\(' | grep -vE 'confirm *\( *(false|FALSE|0) *\)' | wc -l)
+[ "$n" -eq 0 ] && ok '確認を開けるところがない' || ng "確認を開けるところが $n か所ある"
+# 足す関数は 2 つだけで、装置に送るのは Pix68kCommand() の 3 か所だけ (門を通るかは ufd_driver_test が試す)
+INC=$ROOT/baremetal/ufd_write.inc
+f=$(grep -oE 'CUSBFloppyDiskDevice::[A-Za-z0-9_]+ *\(' "$INC" | tr -d ' (' | LC_ALL=C sort | tr '\n' ' ')
+[ "$f" = 'CUSBFloppyDiskDevice::Pix68kArmWrite CUSBFloppyDiskDevice::Pix68kCommand ' ] &&
+  ok '足す関数は 2 つだけ' || ng "足す関数: $f"
+n=$(grep -cE 'SubmitBlockingRequest|SubmitAsyncRequest|Transfer \(|Transfer\(|ControlMessage|GetHost' "$INC")
+[ "$n" -eq 4 ] && ok '送るのは Pix68kCommand() の 3 か所だけ' || ng "送るところの数が変わった ($n)"
 
 # 書き換えが当たらない形の入力では失敗すること。$1: 説明、$2: usbfloppydevice.cpp に掛ける sed の式
 broken() {

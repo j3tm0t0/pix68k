@@ -204,6 +204,9 @@ void Fuk::dropQueue() {
     seekBusy_ = 0;
     sisLocal_ = false;
     forceReadySent_ = false;
+    // FDC のシリンダの覚えが消える (見分けからやり直すか、リセットする)
+    memset(lastCyl_, -1, sizeof lastCyl_);
+    resetCount_++;
 }
 
 // SEEK / RECALIBRATE を送ったまま、終わりの通知 ('C') を受け取れなくなった。X68000 は割り込みを待っているので、
@@ -583,6 +586,7 @@ void Fuk::port2Byte(uint8_t b) {
         break;
     case 'D': // ディスクの出し入れ
         fddIrq_ = true;
+        fddEvents_++;
         memset(driveKnown_, 0, sizeof driveKnown_);
         break;
     case 'd':
@@ -833,6 +837,8 @@ void Fuk::dispatch() {
     } else if (op == CMD_SEEK || op == CMD_RECALIBRATE) {
         // 終わると 'C' が届き、X68000 が SENSE INTERRUPT STATUS で引き取る
         seekBusy_ |= (uint8_t)(1u << unit());
+        headLost_ &= (uint8_t)~(1u << unit());
+        lastCyl_[unit()] = op == CMD_SEEK && cmd_[2] < 0x80 ? (int8_t)cmd_[2] : op == CMD_SEEK ? -1 : 0;
         invalidateMsr();
     } else if (op == CMD_SENSE_INTERRUPT) {
         startFetch(2, false);
@@ -951,6 +957,81 @@ void Fuk::cancelWrite() {
     resetDevice();
     push(OP_WRITE, REG_DRIVE_SELECT, lastSelect_);
     push(OP_WRITE, REG_DRIVE_CONTROL, lastControl_);
+}
+
+// ---------------------------------------------------------------- ディスクの読み出し (fuk_reader.h)
+
+bool Fuk::busyForReader() {
+    return reader_ || phase_ != P_IDLE || cmdLen_ != 0 || seekBusy_ != 0 || localSeekPending() || irq() || forceReady_ ||
+           forceReadySent_ || (host_ != nullptr && host_->fukDmaCount() != 0);
+}
+
+bool Fuk::idleForReader() {
+    return !busyForReader() && ls_ == L_READY && qHead_ == qTail_ && out1Pos_ >= out1Len_ && !awaiting_ && rx2State_ == 0 &&
+           !queueOverflow_ && !tailPending();
+}
+
+void Fuk::beginReader(int unit) {
+    reader_ = readerMotor_ = true;
+    readerUnit_ = unit & 3;
+    readerHost_ = host_;
+    readerSis_ = sisLocal_;
+    readerNoDma_ = noDma_;
+    readerNonDma_ = nonDma_;
+    readerReset_ = resetCount_;
+    memcpy(readerCyl_, lastCyl_, sizeof readerCyl_);
+    host_ = nullptr;
+    sisLocal_ = false;
+    // write(7) は使わない (X68000 が最後に書いた値と、FDD の割り込みを変えないように)
+    pushWrite(REG_DRIVE_SELECT, (uint8_t)(0x80 | readerUnit_));
+    pump();
+}
+
+bool Fuk::restoreReaderMotor() {
+    if (!reader_ || !readerMotor_) return false;
+    readerMotor_ = false;
+    pushWrite(REG_DRIVE_SELECT, lastSelect_);
+    pump();
+    return lastSelect_ != (uint8_t)(0x80 | readerUnit_);
+}
+
+void Fuk::endReader(ReaderHead head) {
+    if (!reader_) return;
+    const bool motor = readerMotor_;
+    readerMotor_ = false;
+    reader_ = false;
+    host_ = readerHost_;
+    readerHost_ = nullptr;
+    if (head == ReaderHead::LOST) headLost_ |= (uint8_t)(1u << readerUnit_);
+    const bool lost = resetCount_ != readerReset_ || !ready();
+    const bool stuck = phase_ != P_IDLE || cmdLen_ != 0 || seekBusy_ != 0 || irq();
+    if (lost || stuck) {
+        // 途中で終わった。読み出しのコマンドのリザルトと、こちらで作ったシークの終わりを、X68000 に見せない
+        clearCommand();
+        seekBusy_ = 0;
+        memset(localSeek_, 0, sizeof localSeek_);
+        localIrq_ = false;
+        sisLocal_ = false;
+        noDma_ = readerNoDma_;
+        nonDma_ = lost ? nonDma_ : readerNonDma_;
+        if (lost) return;
+        // FUK が答えない (シークの終わりが来ない、割り込みが下りない)。遅れて届くものを X68000 に見せないよう、リセットする
+        const bool fdd = fddIrq_; // ディスクの出し入れは X68000 に残す
+        resetDevice();
+        fddIrq_ = fdd;
+        push(OP_WRITE, REG_DRIVE_SELECT, lastSelect_);
+        push(OP_WRITE, REG_DRIVE_CONTROL, lastControl_); // 排出のビットは落としてある
+        pump();
+        return;
+    }
+    sisLocal_ = readerSis_;
+    noDma_ = readerNoDma_;
+    nonDma_ = readerNonDma_;
+    memcpy(lastCyl_, readerCyl_, sizeof lastCyl_);
+    if (head == ReaderHead::LOST) lastCyl_[readerUnit_] = -1;
+    else if (head == ReaderHead::RESTORED && readerCyl_[readerUnit_] < 0) lastCyl_[readerUnit_] = 0; // 分からなかったときは、シリンダ 0 に戻してある
+    if (motor) pushWrite(REG_DRIVE_SELECT, lastSelect_);
+    pump();
 }
 
 bool Fuk::irq() const { return localIrq_ || (devIrq_ && !maskDevIrq_); }
@@ -1091,7 +1172,7 @@ void Fuk::write(uint32_t offset, uint8_t v) {
             const int op = v & 0x1f;
             cmdNeed_ = kCmdLen[op];
             cmdLocal_ = !ready();
-            cmdRefused_ = false;
+            cmdRefused_ = cmdHold_ = false;
             // こちらで作ったシークの終わり (つながっていなかった間のもの) が残っていれば、つながったあとでも
             // SENSE INTERRUPT STATUS はこちらで答える
             if (op == CMD_SENSE_INTERRUPT && localSeekPending()) cmdLocal_ = true;
@@ -1129,8 +1210,20 @@ void Fuk::write(uint32_t offset, uint8_t v) {
                 }
             }
         }
+        if (cmdLen_ == 0 && !cmdLocal_ && headLost_ != 0 && (v & 0x1f) == CMD_WRITE_ID) cmdHold_ = true;
         cmd_[cmdLen_++] = v;
-        if (!cmdLocal_) pushWrite(REG_DATA, v);
+        if (cmdHold_) {
+            // ヘッドの位置が分からないドライブの WRITE ID は、FUK に送らずに異常終了にする
+            if (cmdLen_ < 2) break;
+            cmdHold_ = false;
+            if ((headLost_ >> unit()) & 1) {
+                cmdLocal_ = cmdRefused_ = true;
+                stats_.refusedWrites++;
+            } else if (!cmdLocal_) {
+                pushWrite(REG_DATA, cmd_[0]);
+                pushWrite(REG_DATA, v);
+            }
+        } else if (!cmdLocal_) pushWrite(REG_DATA, v);
         if (cmdLen_ >= cmdNeed_) {
             cmdLen_ = 0;
             if (cmdLocal_) localExecute();

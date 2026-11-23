@@ -34,6 +34,21 @@ public:
     bool realtimeOneSector = false; // true: 最初のセクタで終える (リザルトの R もそのセクタ)
     unsigned realtimeChunk = 0;     // 0 でなければ、realtimeStream のデータをこのバイト数ずつまとめ、まとまりの最後のバイトを
                                     // 読んだ時刻に送る (USB のパケットごとに送る装置のまね)
+    // 読み出し (x68k/fuk_reader.h) の試験用
+    std::vector<uint32_t> badSectors;   // 読むと CRC エラーになるセクタ (先頭からの番号)
+    uint8_t badSt2 = 0x20;              // そのときの ST2
+    unsigned badTimes = 0xffffffffu;    // badSectors のエラーを返す残りの回数 (それを過ぎると読める)
+    bool eotAbnormal = false;           // EOT まで読み終えたら、TC のない FDC と同じく異常終了 (EN) で答える
+    uint8_t readIdN = 3;                // READ ID が答えるセクタ長
+    unsigned notReadySenses = 0;        // この回数だけ、SENSE DEVICE STATUS にレディでないと答える (モーターの立ち上がり)
+    bool stickyInt = false;             // SENSE INTERRUPT STATUS で割り込みを下ろさない (readyInt で立てたとき)
+    bool failSeeks = false;             // SEEK / RECALIBRATE が異常終了する
+    bool readyInt = false;              // モーターを回すか止めると、レディの変化の割り込みを出す
+    unsigned ejectAfterReads = 0;       // 0 でなければ、その回数目の Read のあとでディスクを入れ替える ('D')
+    uint8_t lastMotor = 0;              // 最後にドライブ選択に書かれた値
+    std::vector<uint8_t> driveControls; // ドライブ制御に書かれた値
+    unsigned countWrites = 0;           // 転送バイト数を書かれた回数
+    int cylinder() const { return pcn_; }
     bool plugged = true;
     unsigned plugCount = 1;
     bool swapPorts = false;    // true ならリンクのポート 0 が FUK のポート 2
@@ -270,6 +285,21 @@ private:
                 res[5] = eot;
                 pcn_ = c;
             }
+            for (uint32_t k = 0; k < sectors; k++) {
+                const uint32_t lba = offsetOf(c, h, r) / 1024 + k;
+                bool bad = false;
+                for (uint32_t b : badSectors) bad = bad || b == lba;
+                if (!bad || badTimes == 0) continue;
+                badTimes--;
+                sectors = k + 1; // 読めなかったセクタのデータも付く
+                res[0] = (uint8_t)(0x40 | us);
+                res[1] = 0x20;
+                res[2] = badSt2;
+                res[5] = (uint8_t)(r + k);
+                break;
+            }
+            if (eotAbnormal && sectors != 0 && res[0] == us) res[0] = (uint8_t)(0x40 | us), res[1] = 0x80;
+            if (ejectAfterReads != 0 && readCommands == ejectAfterReads) out2('D');
             bool rt = false;
             for (const Realtime& x : realtime)
                 if (sectors != 0 && x.unit == un && x.c == c && x.h == h && x.r == r) rt = true;
@@ -333,6 +363,14 @@ private:
             return;
         case 0x03: return;
         case 0x04:
+            if (notReadySenses != 0) {
+                notReadySenses--;
+                res_[0] = (uint8_t)(0x08 | us);
+                resLen_ = 1;
+                resPos_ = 0;
+                phase_ = RESULT;
+                return;
+            }
             res_[0] = (uint8_t)((hasDisk(un) ? 0x20 : 0) | (hasDisk(un) && pcn_ == 0 ? 0x10 : 0) | 0x08 | us);
             resLen_ = 1;
             resPos_ = 0;
@@ -341,13 +379,19 @@ private:
         case 0x07:
         case 0x0f:
             pcn_ = op == 0x07 ? 0 : cmd_[2];
-            seekSt0_ = (uint8_t)(0x20 | us | (hasDisk(un) ? 0 : 0x48));
+            seekSt0_ = (uint8_t)(0x20 | us | (hasDisk(un) ? 0 : 0x48) | (failSeeks ? 0x50 : 0));
             seekPending_ = true;
             seekDue_ = devNow() + seekUs;
             return;
         case 0x08:
             lower();
-            if (seekDone_) {
+            if (readyPending_) {
+                if (stickyInt && !motor_) raise();
+                else readyPending_ = false;
+                res_[0] = 0xc0;
+                res_[1] = pcn_;
+                resLen_ = 2;
+            } else if (seekDone_) {
                 seekDone_ = false;
                 res_[0] = seekSt0_;
                 res_[1] = pcn_;
@@ -360,7 +404,7 @@ private:
             phase_ = RESULT;
             return;
         case 0x0a: // READ ID: リザルトを用意して割り込み。1 バイト目を読まれたら下ろす
-            result7((uint8_t)(hasDisk(un) ? us : 0x48 | us), 0, pcn_, (uint8_t)((cmd_[1] >> 2) & 1), 1, 3);
+            result7((uint8_t)(hasDisk(un) ? us : 0x48 | us), 0, pcn_, (uint8_t)((cmd_[1] >> 2) & 1), 1, readIdN);
             readIdIrq_ = true;
             raise();
             return;
@@ -413,11 +457,25 @@ private:
             cmd_[cmdLen_++] = v;
             if (cmdLen_ >= cmdNeed_) execute();
             return;
-        case 0x05: driveSel_ = v & 15; return;
-        case 0x07: motor_ = (v & 0x80) != 0; return;
+        case 0x05:
+            driveSel_ = v & 15;
+            driveControls.push_back(v);
+            return;
+        case 0x07:
+            if (readyInt && ((v & 0x80) != 0) != motor_) {
+                readyPending_ = true;
+                raise();
+            }
+            motor_ = (v & 0x80) != 0;
+            lastMotor = v;
+            return;
         case 0x23: forceReady_ = (v & 0x40) != 0; return;
-        case 0x30: count_ = (uint16_t)((count_ & 0xff00) | v); return;
-        case 0x31: count_ = (uint16_t)((count_ & 0x00ff) | v << 8); return;
+        case 0x30:
+            countWrites++;
+            count_ = (uint16_t)((count_ & 0xff00) | v); return;
+        case 0x31:
+            countWrites++;
+            count_ = (uint16_t)((count_ & 0x00ff) | v << 8); return;
         default: return;
         }
     }
@@ -474,6 +532,7 @@ private:
     int p1Pending_ = -1;
     bool p2Data_ = false;
     bool motor_ = false, forceReady_ = false, intLine_ = false, readIdIrq_ = false;
+    bool readyPending_ = false;
     bool seekPending_ = false, seekDone_ = false;
     uint64_t seekDue_ = 0, writeDue_ = 0;
     uint8_t seekSt0_ = 0, pcn_ = 0, driveSel_ = 0;

@@ -1,5 +1,6 @@
 #include "audio_worker.h"
 #include "test_check.h"
+#include "worker_stress.h"
 #include "../bench/scene.h"
 #include "x68k/state.h"
 #include <cstring>
@@ -20,6 +21,8 @@ void compare(x68k::Sound& a, x68k::Sound& b) {
 }
 }
 int main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0); // 見張りが _exit() で終えても、それまでの出力を残す
+    worker_stress::watch();
     x68k::Config config; config.ramSize = 2u << 20; config.cpuHz = 10000000;
     auto a = std::make_unique<x68k::Machine>(config);
     auto b = std::make_unique<x68k::Machine>(config);
@@ -35,6 +38,8 @@ int main() {
     if (!worker) return 1;
     CHECK_EQ(b->sound().outputRate(), 0);
     compare(a->sound(), worker->sound());
+    // ここは時間で打ち切らない (全往復の 1% で、どのステップで食い違うかが負荷で変わらないように)
+    worker_stress::tick();
     for (unsigned i = 0; i < 1000; i++) {
         const uint32_t clocks = 1 + (i * 997) % 4000;
         if (i % 37 == 0) {
@@ -47,7 +52,9 @@ int main() {
         worker->flush();
         compare(a->sound(), worker->sound());
         CHECK_EQ(a->sound().opm().read(1), b->sound().opm().read(1));
+        worker_stress::tick();
     }
+    worker_stress::tick();
     worker->snapshotToMachine();
     a->sound().advance(4321); b->sound().advance(4321); worker->flush();
     compare(a->sound(), worker->sound());
@@ -73,13 +80,14 @@ int main() {
         worker = pix68k_retro::AudioWorker::create(*b, error);
         CHECK_EQ(worker != nullptr, true);
         if (!worker) return 1;
-        for (unsigned i = 0; i < 50000; i++) {
-            if ((i & 255) == 0) usleep(2000);
+        worker_stress::run("audio worker", 50000, [&](unsigned i) {
             b->sound().opmWrite(1, 0x30);
             b->sound().opmWrite(3, (uint8_t)i);
             worker->flush();
-        }
+        });
+        worker_stress::tick();
         usleep(2000); worker.reset();
+        worker_stress::tick();
     }
     // Unsupported adaptive output must fail without changing the live Sound.
     b->sound().setLatency(100);
@@ -87,5 +95,6 @@ int main() {
     CHECK_EQ(worker == nullptr, true);
     CHECK_EQ(b->sound().outputRate(), 48000);
     b->sound().setLatency(0);
+    worker_stress::unwatch();
     return finish();
 }

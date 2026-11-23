@@ -28,7 +28,7 @@ target_compile_options(m68k PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
 
 add_library(x68k STATIC ${PIX68K_CORE_ROOT}/src/x68k/machine.cpp ${PIX68K_CORE_ROOT}/src/x68k/mfp.cpp ${PIX68K_CORE_ROOT}/src/x68k/rtc.cpp ${PIX68K_CORE_ROOT}/src/x68k/video.cpp ${PIX68K_CORE_ROOT}/src/x68k/devices.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/gvram.cpp ${PIX68K_CORE_ROOT}/src/x68k/render.cpp
-  ${PIX68K_CORE_ROOT}/src/x68k/fdd.cpp ${PIX68K_CORE_ROOT}/src/x68k/fdc.cpp ${PIX68K_CORE_ROOT}/src/x68k/fuk.cpp ${PIX68K_CORE_ROOT}/src/x68k/dmac.cpp ${PIX68K_CORE_ROOT}/src/x68k/keyboard.cpp ${PIX68K_CORE_ROOT}/src/x68k/textscreen.cpp ${PIX68K_CORE_ROOT}/src/x68k/sram_file.cpp
+  ${PIX68K_CORE_ROOT}/src/x68k/fdd.cpp ${PIX68K_CORE_ROOT}/src/x68k/fdc.cpp ${PIX68K_CORE_ROOT}/src/x68k/fuk.cpp ${PIX68K_CORE_ROOT}/src/x68k/fuk_reader.cpp ${PIX68K_CORE_ROOT}/src/x68k/dmac.cpp ${PIX68K_CORE_ROOT}/src/x68k/keyboard.cpp ${PIX68K_CORE_ROOT}/src/x68k/textscreen.cpp ${PIX68K_CORE_ROOT}/src/x68k/sram_file.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/scc.cpp ${PIX68K_CORE_ROOT}/src/x68k/mouse.cpp ${PIX68K_CORE_ROOT}/src/x68k/ppi.cpp ${PIX68K_CORE_ROOT}/src/x68k/sasi.cpp ${PIX68K_CORE_ROOT}/src/x68k/spc.cpp ${PIX68K_CORE_ROOT}/src/x68k/cd_drive.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/opm.cpp ${PIX68K_CORE_ROOT}/src/x68k/adpcm.cpp ${PIX68K_CORE_ROOT}/src/x68k/sound.cpp ${PIX68K_CORE_ROOT}/src/x68k/video_replay.cpp ${PIX68K_CORE_ROOT}/src/x68k/sound_replay.cpp
   ${PIX68K_CORE_ROOT}/src/x68k/ts6bga.cpp ${PIX68K_CORE_ROOT}/src/x68k/state.cpp ${PIX68K_CORE_ROOT}/src/x68k/mercury.cpp ${PIX68K_CORE_ROOT}/src/x68k/opn3.cpp ${PIX68K_CORE_ROOT}/src/x68k/neptune.cpp ${PIX68K_CORE_ROOT}/src/x68k/ym3802.cpp)

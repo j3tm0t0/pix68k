@@ -149,7 +149,7 @@ public:
 
     explicit Fuk(FukLink& link, Host* host = nullptr);
     ~Fuk();
-    void setHost(Host* host) { host_ = host; }
+    void setHost(Host* host) { (reader_ ? readerHost_ : host_) = host; }
     // DMA の Read のデータを、最初のバイトを受け取ってから us だけ遅らせて渡し始める (fuk_lead=)。0 なら自動で、
     // 「1 フレーム + その 1/8 (Host::fukFrameNs() から決める) - 最初のバイトが届いてからの時間」を上限に、'R' が全部
     // 届いた時点で決める。遅れなしは指定できない (1 で代用)
@@ -176,6 +176,32 @@ public:
     void setForceReady(bool on);             // FDD の強制レディ (OPM の CT)
     bool irq() const;                        // FDC の割り込み
     bool fddIrq() const { return fddIrq_; }  // FDD の割り込み (ディスクの出し入れ)
+
+    // ---- ディスクの読み出し (x68k/fuk_reader.h の FukReader) から。X68000 を動かしていない間だけ使う (#381) ----
+    // X68000 が FDC を使っている途中 (コマンド、リザルト、SEEK の割り込み、DMAC のチャネル 0、強制レディ) でなく、
+    // FUK とのやり取りも残っていない
+    bool idleForReader();
+    // X68000 が FDC を使っている途中 (X68000 が動かないと終わらない)。Fuk のやり取りは進めない。false でも、FUK の返事や
+    // 送り残しを待っていれば idleForReader() は false (待てば true になる)
+    bool busyForReader();
+    // ドライブ unit (0-3) のモーターを回し、DMAC とのつながりを外す。外している間、Fuk は書き込みのコマンドを
+    // FUK に送らない (転送バイト数が 0 なので、DMA を使わない書き込みとして断る)。idleForReader() のときだけ呼ぶ
+    void beginReader(int unit);
+    // ドライブの選択とモーターを、X68000 が最後に書いた値に戻す (値が変わるなら true)
+    bool restoreReaderMotor();
+    // 外したものを戻す。head は、ヘッドをどうしたか (RESTORED は readerCylinder()、分からなければ 0 に戻した)。
+    // LOST なら、X68000 がそのドライブの SEEK / RECALIBRATE をするまで WRITE ID を断る (READ / WRITE DATA は ID が
+    // 合わなければエラーになるが、WRITE ID はヘッドのいるトラックに書くため)
+    enum class ReaderHead : uint8_t { UNMOVED, RESTORED, LOST };
+    void endReader(ReaderHead head);
+    // X68000 が最後に頼んだシーク先のシリンダ (分からなければ -1)。beginReader() のときの値
+    int readerCylinder() const { return readerCyl_[readerUnit_]; }
+    // つながりが切れるか、FDC をリセットするたびに増える
+    unsigned resetCount() const { return resetCount_; }
+    // 'D' (ディスクの出し入れ) が届くたびに増える
+    unsigned fddEvents() const { return fddEvents_; }
+    uint64_t nowUs() { return link_.nowUs(); }
+
     // 届いたものを処理し、送るものを送る。ラスタごとと、レジスタを読み書きしたときに呼ぶ
     void poll();
     // DMAC から
@@ -308,6 +334,17 @@ private:
     // Write
     uint8_t* wbuf_;        // 'M' とデータ
     uint32_t wNeed_ = 0, wGot_ = 0, wSent_ = 0, wTotal_ = 0;
+    int8_t lastCyl_[4] = {-1, -1, -1, -1};   // 最後に送った SEEK / RECALIBRATE の行き先 (分からなければ -1)
+    uint8_t headLost_ = 0;   // ヘッドが X68000 の思うシリンダにいるか分からないドライブ (ビットごと)
+    bool cmdHold_ = false;   // WRITE ID の 1 バイト目を、ドライブが分かるまで送らずに持っている
+    // FukReader が使っている間の、戻すもの
+    bool reader_ = false, readerMotor_ = false;
+    Host* readerHost_ = nullptr;
+    int readerUnit_ = 0;
+    int8_t readerCyl_[4] = {-1, -1, -1, -1};
+    bool readerSis_ = false, readerNoDma_ = false, readerNonDma_ = false;
+    unsigned readerReset_ = 0;
+    unsigned resetCount_ = 0, fddEvents_ = 0;
     uint8_t lastSelect_ = 0, lastControl_ = 0; // X68000 が最後に書いたドライブ選択とドライブ制御 (リセットのあとに送り直す)
     bool dmaAborted_ = false; // FUK の答え ('R' / 'W') を待っている間に、DMA が異常終了した
     bool wFlushing_ = false;  // 'M' とデータを口に渡し終えたが、装置へ出きったかをまだ確かめていない

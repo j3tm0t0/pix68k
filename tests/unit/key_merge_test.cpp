@@ -45,6 +45,8 @@ struct Pipeline {
     platform::KeyTracker keys;
     X68kSink sink;
     bool menuOpen = false;
+    bool mixerOpen = false; // X68000 を止めないミキサー (キーは設定メニューと同じく X68000 に送らない)
+    int mixerOpens = 0;
     int reboots = 0;
     int menuOpens = 0;
     uint8_t menuEvents[16] = {};
@@ -73,7 +75,7 @@ struct Pipeline {
         lastMods = mods;
         uint8_t outMods = 0, outDown[32], ev[6];
         int n = 0;
-        switch (menu.filterBits(mods, down, menuOpen, outMods, outDown, ev, n)) {
+        switch (menu.filterBits(mods, down, menuOpen || mixerOpen, outMods, outDown, ev, n)) {
         case platform::MenuKeyFilter::OPEN:
             keys.releaseAll(sink);
             menuOpen = true;
@@ -81,6 +83,11 @@ struct Pipeline {
             return;
         case platform::MenuKeyFilter::MENU:
             for (int i = 0; i < n && nMenuEvents < 16; i++) menuEvents[nMenuEvents++] = ev[i];
+            return;
+        case platform::MenuKeyFilter::OPEN_MIXER:
+            keys.releaseAll(sink);
+            mixerOpen = true;
+            mixerOpens++;
             return;
         case platform::MenuKeyFilter::PASS:
             break;
@@ -90,7 +97,7 @@ struct Pipeline {
     // メニューを閉じる (CKernel::CloseMenu() と同じく、いま押しているキーは一度離すまで送らない)
     void closeMenu() {
         menu.closed(lastMods);
-        menuOpen = false;
+        menuOpen = mixerOpen = false;
     }
     int x(uint8_t usage) const { return sink.down[x68k::Keyboard::fromHid(usage)]; }
 };
@@ -374,25 +381,25 @@ void testMenuWithReboot() {
 void testMenuCloseWithKeysHeld() {
     printf("close the menu while keys are held on two keyboards\n");
     Pipeline p;
-    p.report(0, LSHIFT, A);
+    p.report(0, LCTRL, A);
     CHECK_EQ(p.x(A), 1);
     p.report(1, 0, 0x47); // キーボード 2 の Scroll Lock でメニューを開く
     CHECK_EQ(p.menuOpens, 1);
     CHECK_EQ(p.sink.held(), 0); // 押していたキーは離したことにする
     p.report(1, 0, 0x28);       // Enter (キーボード 2) を押したまま閉じる
     p.closeMenu();
-    // キーボード 1 の SHIFT + A と、キーボード 2 の Enter は、離すまで送らない
+    // キーボード 1 の CTRL + A と、キーボード 2 の Enter は、離すまで送らない
     p.report(1, 0, 0x28, B);
     CHECK_EQ(p.x(B), 1);
     CHECK_EQ(p.x(A), 0);
     CHECK_EQ(p.x(0x28), 0);
-    CHECK_EQ(p.x(0xe1), 0);
+    CHECK_EQ(p.x(0xe0), 0);
     p.report(1, 0);
     p.report(0, 0);
     CHECK_EQ(p.sink.held(), 0);
-    p.report(0, LSHIFT, A);
+    p.report(0, LCTRL, A);
     CHECK_EQ(p.x(A), 1);
-    CHECK_EQ(p.x(0xe1), 1);
+    CHECK_EQ(p.x(0xe0), 1);
     p.report(0, 0);
     CHECK_EQ(p.sink.held(), 0);
 }
@@ -550,7 +557,48 @@ void testBitsEdges() {
 
 } // namespace
 
+// Shift + メニューのキーでミキサーを開く。キーを押したまま開き、押したまま閉じる
+void testMixerWithKeysHeld() {
+    printf("open and close the mixer while keys are held\n");
+    Pipeline p;
+    p.report(0, LSHIFT, A);
+    CHECK_EQ(p.x(A), 1);
+    p.report(1, 0, 0x47); // キーボード 2 の Scroll Lock
+    CHECK_EQ(p.mixerOpens, 1);
+    CHECK_EQ(p.menuOpens, 0);
+    CHECK_EQ(p.sink.held(), 0); // 押していたキーと Shift は離したことにする
+    CHECK_EQ(p.nMenuEvents, 0);
+    p.report(1, 0, 0x50); // ←
+    CHECK_EQ(p.nMenuEvents, 1);
+    CHECK_EQ(p.menuEvents[0], 0x50);
+    p.report(0, LSHIFT, A, B); // 開いている間に押した B もミキサーへ
+    CHECK_EQ(p.sink.held(), 0);
+    p.closeMenu();
+    p.report(1, 0);
+    CHECK_EQ(p.sink.held(), 0); // SHIFT、A、B は押したまま
+    p.report(0, 0);
+    CHECK_EQ(p.sink.held(), 0);
+    p.report(0, LSHIFT, A);
+    CHECK_EQ(p.x(A), 1);
+    CHECK_EQ(p.x(0xe1), 1);
+    p.report(0, 0);
+    CHECK_EQ(p.sink.held(), 0);
+}
+
+// Pi 400 は Shift + ラズベリー + M
+void testMixerPi400() {
+    printf("Pi 400: Shift + raspberry + M opens the mixer\n");
+    Pipeline p;
+    p.remap[0].setLayout(platform::KeyLayout::PI400_JP);
+    p.report(0, LSHIFT | 0x08, 0x10);
+    CHECK_EQ(p.mixerOpens, 1);
+    CHECK_EQ(p.menuOpens, 0);
+    CHECK_EQ(p.sink.held(), 0);
+}
+
 int main() {
+    testMixerWithKeysHeld();
+    testMixerPi400();
     testMergeSameKey();
     testRemove();
     testMoreThanSix();

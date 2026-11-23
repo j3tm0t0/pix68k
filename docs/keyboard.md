@@ -55,6 +55,8 @@ X68000 にしかないキーを置ける余りのキーがないので、ラズ�
 
 | X68000 のキー | 普通の USB キーボード | Pi 400 (英語版、日本語版) |
 | --- | --- | --- |
+| 設定メニュー | Scroll Lock、Application、Menu | ラズベリー + M |
+| 音を鳴らしたまま変えるミキサー (X68000 のキーではない) | Shift + Scroll Lock、Application、Menu | Shift + ラズベリー + M |
 | XF1 | 左 Alt、F11、F20 | 左 Alt、F11、ラズベリー + 1 |
 | XF2 | F12、無変換、F21 | F12、ラズベリー + 2 (日本語版は 無変換 も) |
 | XF3 | 変換、F22 | ラズベリー + 3 (日本語版は 変換 も) |
@@ -99,10 +101,20 @@ X68000 にしかないキーを置ける余りのキーがないので、ラズ�
 - 接続したときのログに `keyboard attached (04d9:0007, country 0, layout pi400us, auto, ukbd1, keyboard 1)` のように、VID:PID、`bCountryCode`、選んだキーボードの種類を出す
 - Ctrl + Alt + Delete は Raspberry Pi の再起動になる。X68000 のリセット (ホットリスタート、CTRL + OPT.1 + DEL) は Ctrl + ラズベリー + O + Delete で打つ (ラズベリー + O を押してから Delete。ラズベリーを押していても、OPT.1 を押している間は Delete を INS に置き換えない)
 
+ほかの機種で、Scroll Lock、Application、Menu のどれもないキーボードを使うときは、`pix68k.cfg` に `keyboard=pi400us` (日本語配列は `keyboard=pi400jp`) と書いて起動し直すと、左 Windows (Command) キーがラズベリーのキーの代わりになる。左 Windows + M で設定メニュー、Shift + 左 Windows + M でミキサーを開く (Pi 5 と、Scroll Lock などのないキーボードで `pi400us` を確かめた)。
+
+- つないだすべてのキーボードがこの扱いになる
+- 左 Windows キー単体と Num Lock は X68000 に届かない。OPT.1 は左 Windows + O、CLR は左 Windows + L で打つ (ほかのキーも上の表の Pi 400 の列と同じ)
+- X68000 のリセットは、Ctrl + 左 Windows + Delete ではなく Ctrl + 左 Windows + O + Delete で打つ
+
+実機で確かめたこと:
+
+- 日本語版の Pi 400 (c03130) のキーボードは VID:PID が `04d9:0007` で、`bCountryCode` は 0 だった。自動では英語版 (`pi400us`) と判定されるので、`pix68k.cfg` に `keyboard=pi400jp` と書く (#359)
+- 英語版の Pi 400 で、Num Lock をオンにするとキーボードの中のテンキーを使えた
+
 実機で確かめていないこと:
 
-- Pi 400 のキーボードの VID:PID (`04d9:0007` は [pi400kb](https://github.com/Gadgetoid/pi400kb) の説明による)
-- 日本語版の `bCountryCode` の値
-- Num Lock のキーの位置と、Num Lock のオンとオフでキーボードの中のテンキーが切り替わるか
+- 英語版のキーボードの VID:PID (`04d9:0007` は [pi400kb](https://github.com/Gadgetoid/pi400kb) の説明による)
+- 日本語版の Num Lock とキーボードの中のテンキー
 - Fn + Delete (Insert) 以外の Fn の組み合わせ (Home、Page Up など) で送られる usage ID。
   Fn の組み合わせを使わずに打てるよう、HOME、ROLL UP、ROLL DOWN、INS もラズベリーのキーとの組み合わせに割り当てた

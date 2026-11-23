@@ -23,11 +23,14 @@
 #include "platform/key_type.h"
 #include "platform/net_config.h"
 #include "platform/boot_drive.h"
+#include "config_switch.h"
+#include "platform/config_kernel.h"
 #include "platform/net_files.h"
 #include "platform/osd_message.h"
 #include "platform/floppy_image_save.h"
 #include "platform/net_http.h"
 #include "platform/serial_ring.h"
+#include "platform/sha256.h"
 
 static const char FromNet[] = "net";
 static const char FromHttp[] = "httpd";
@@ -284,6 +287,7 @@ public:
 
 private:
     static constexpr unsigned BUF_SIZE = 32 * 1024; // ファイルの読み書きの単位 (SD カードに 1 回で書く量)。確保はこれに FRAME_BUFFER_SIZE を足す
+    static constexpr unsigned MAX_SHA256 = 16u * 1024 * 1024; // /sha256 で読むファイルの上限
     static constexpr unsigned MAX_TYPE = 4096;      // /type の本体の上限
     void Handle(CSocket* c, const u8 ip[4]);
     bool SendAll(const void* data, unsigned n);
@@ -292,6 +296,10 @@ private:
     bool Receive(unsigned& n);
     bool ReceiveBefore(u64 deadline, unsigned& n); // m_pBuf に受け取る。切れたら false
     void GetFile(const char* path, bool head);
+    bool HashFile(const char* path, char hex[65], unsigned& bytes); // false なら応答を送った
+    void GetSha256(const char* path);
+    void SwitchKernel();
+    const char* KernelInUse(const char* path); // path が、config.txt の kernel= と組の、もう一方の名前でなければ、断る理由
     void ListDir(const char* drivePath, const char* path, bool head);
     void PutFile(const char* path);
     void DeleteFile(const char* path);
@@ -299,10 +307,14 @@ private:
     bool RefuseImage(const char* path, bool upload);
     void GetLog(bool head);
     void GetScreen(bool head, unsigned source = 0);
+    bool FukIdMatches();
     void GetFloppyImage(int drive, bool head);
     void Type();
     void Key();
     void Message();
+    void Mixer(bool head);
+    void MixerSet();
+    void MixerSave();
     bool ReadBody(char* out, unsigned max, unsigned& n);
     bool KeyState(); // 押しているキー (m_KeyMods、m_Keys) を送る
 
@@ -448,9 +460,12 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
     const char* p = m_Req.path;
     const bool files = strncmp(p, "/files", 6) == 0 && (p[6] == 0 || p[6] == '/');
     // /fd0.xdf、/fd1.xdf (USB-FDD から読んだディスクのイメージ) は、ファイルを読むのと同じ扱いにする (トークンが要る)
+    const bool sha256 = strncmp(p, "/sha256/", 8) == 0; // ファイルの中身が分かるので、読むのと同じ扱い
+    const bool mixer = strcmp(p, "/mixer") == 0 || strcmp(p, "/mixer/save") == 0;
     const int fdImage = platform::floppyImagePathDrive(p);
+    const bool fukImage = strcmp(p, "/fuk.xdf") == 0; // FUK から読み出したイメージ (#381)
     const platform::NetOp op = write                  ? platform::NetOp::WRITE
-                               : files || fdImage >= 0 ? platform::NetOp::READ_FILES
+                               : files || sha256 || fdImage >= 0 || fukImage ? platform::NetOp::READ_FILES
                                                        : platform::NetOp::READ;
     // Host: が自分のアドレスか net_name= でなければ、読むだけの要求も断る (DNS リバインディング対策。
     // platform::checkHost())。アドレスは DHCP で変わることがあるので、要求ごとに読む
@@ -467,8 +482,10 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
     }
     // ブラウザが送る書き込み (Origin: が付く) は断る。net_allow= だけでトークンなしの設定だと、ほかのサイトの
     // ページから、プリフライトなしで送れる本体付きの POST で /files、/reboot、/type を叩けてしまうため
-    if (write && m_Req.hasOrigin) {
-        SendText(403, "requests from web pages (with Origin:) cannot write; use curl\n");
+    // ミキサーの口だけは、同じ機械のページ (GET /mixer.html) からトークンを付けて送ったものを受ける
+    if (write && m_Req.hasOrigin && !(mixer && platform::mixerOriginAllowed(m_Req, m_Token))) {
+        SendText(403, mixer ? "writing from a web page needs net_token= in pix68k.cfg and the same host\n"
+                            : "requests from web pages (with Origin:) cannot write; use curl\n");
         goto done;
     }
     switch (platform::checkNetAccess(m_Allow, m_Token, ip, m_Req.token, op)) {
@@ -477,6 +494,11 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
     case platform::NetAccess::DENIED_TOKEN: SendText(403, "bad token (X-Pix68k-Token, net_token=)\n"); goto done;
     case platform::NetAccess::NO_WRITE_RULE:
         SendText(403, "writing is disabled: set net_allow= or net_token= in pix68k.cfg\n");
+        goto done;
+    }
+    // ミキサーの書き込みは、net_allow= だけでは受けない
+    if (write && mixer && m_Token[0] == 0) {
+        SendText(403, "changing the mixer needs net_token= in pix68k.cfg\n");
         goto done;
     }
     if (files) {
@@ -493,13 +515,74 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
         } else {
             SendText(405, "use GET, PUT, POST or DELETE\n");
         }
+    } else if (sha256) {
+        char decoded[256], path[256];
+        if (!platform::urlDecode(p + 7, decoded, sizeof decoded) ||
+            !platform::normalizeFilePath(decoded, path, sizeof path)) {
+            SendText(400, "bad path\n");
+        } else if (m == M::GET) {
+            GetSha256(path);
+        } else {
+            SendText(405, "use GET\n");
+        }
     } else if (fdImage >= 0 && (m == M::GET || m == M::HEAD)) {
         GetFloppyImage(fdImage, m == M::HEAD);
+    } else if (fukImage && (m == M::GET || m == M::HEAD)) {
+        unsigned bytes = 0;
+        const u8* image = m_Env.netFukImage(bytes);
+        if (!FukIdMatches()) {
+            SendText(409, "another disk has been read since (id=)\n");
+        } else if (image == nullptr) {
+            SendText(404, "no image: read a disk with POST /fuk/read?drive=0 and wait for state=done in GET /fuk/status\n");
+        } else {
+            // 次の読み出しを頼めるのはこのタスクだけなので、送る間にイメージは変わらない
+            m_nBytes = bytes;
+            if (SendHead(200, "application/octet-stream", bytes) && m == M::GET) {
+                for (unsigned off = 0; off < bytes; off += BUF_SIZE) {
+                    if (!SendAll(image + off, bytes - off > BUF_SIZE ? BUF_SIZE : bytes - off)) break;
+                    CScheduler::Get()->Yield();
+                }
+            }
+        }
+    } else if (strcmp(p, "/fuk/status") == 0 && (m == M::GET || m == M::HEAD)) {
+        CString text;
+        m_Env.netFukStatus(text);
+        SendText(200, text);
+    } else if (strcmp(p, "/fuk/read") == 0 && m == M::POST) {
+        char drive[4];
+        if (!platform::queryValue(m_Req.query, "drive", drive, sizeof drive) || drive[0] < '0' || drive[0] > '3' ||
+            drive[1] != 0) {
+            SendText(400, "drive= is 0 to 3\n");
+        } else {
+            using R = CHostNetEnv::FukReadReply;
+            unsigned id = 0;
+            CString started;
+            switch (m_Env.netFukRead(drive[0] - '0', id)) {
+            case R::STARTED:
+                started.Format("id=%u\nreading (GET /fuk/status); the X68000 is paused\n", id);
+                SendText(202, started);
+                break;
+            case R::NO_FUK: SendText(404, "FUK is not used (fuk=on in pix68k.cfg)\n"); break;
+            case R::BUSY: SendText(409, "busy (already reading, the settings menu is open or restarting)\n"); break;
+            case R::NO_MEMORY: SendText(503, "not enough memory for the image\n"); break;
+            }
+        }
+    } else if (strcmp(p, "/fuk/cancel") == 0 && m == M::POST) {
+        if (!FukIdMatches()) {
+            SendText(409, "another disk is being read (id=)\n");
+        } else {
+            m_Env.netFukCancel();
+            SendText(202, "cancelling (GET /fuk/status)\n");
+        }
     } else if (strcmp(p, "/log") == 0 && (m == M::GET || m == M::HEAD)) {
         GetLog(m == M::HEAD);
     } else if (strcmp(p, "/thermal") == 0 && (m == M::GET || m == M::HEAD)) {
         CString text;
         m_Env.netThermal(text);
+        SendText(200, text);
+    } else if (strcmp(p, "/version") == 0 && (m == M::GET || m == M::HEAD)) {
+        CString text;
+        m_Env.netVersion(text);
         SendText(200, text);
     } else if (strcmp(p, "/screen.ppm") == 0 && (m == M::GET || m == M::HEAD)) {
         GetScreen(m == M::HEAD);
@@ -533,31 +616,54 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
             SendText(500, "cannot write /pix68k/profile.sel; not rebooting\n");
             break;
         }
+    } else if (strcmp(p, "/config/kernel") == 0 && m == M::POST) {
+        SwitchKernel();
     } else if (strcmp(p, "/type") == 0 && m == M::POST) {
         Type();
     } else if (strcmp(p, "/key") == 0 && m == M::POST) {
         Key();
     } else if (strcmp(p, "/message") == 0 && m == M::POST) {
         Message();
+    } else if (strcmp(p, "/mixer") == 0 && (m == M::GET || m == M::HEAD)) {
+        Mixer(m == M::HEAD);
+    } else if (strcmp(p, "/mixer.html") == 0 && (m == M::GET || m == M::HEAD)) {
+        const char* page = platform::mixerPage();
+        const unsigned n = strlen(page);
+        if (SendHead(200, "text/html; charset=utf-8", n) && m != M::HEAD) SendAll(page, n);
+    } else if (strcmp(p, "/mixer") == 0 && m == M::POST) {
+        MixerSet();
+    } else if (strcmp(p, "/mixer/save") == 0 && m == M::POST) {
+        MixerSave();
     } else if (strcmp(p, "/") == 0 && (m == M::GET || m == M::HEAD)) {
         CString help;
         help = "pix68k\n"
                       "GET  /files/<path>    read a file (a directory gives a list)\n"
-                      "PUT  /files/<path>    replace a file (curl -T FILE URL)\n"
+                      "PUT  /files/<path>    replace a file (curl -T FILE URL); with ?unused=1, only the unused kernel name\n"
                       "DELETE /files/<path>  delete a file (curl -X DELETE URL)\n"
+                      "GET  /sha256/<path>   SHA-256 and size of a file\n"
+                      "GET  /version         version, commit and model\n"
                       "GET  /log             log since boot (last 64KB)\n"
                       "GET  /thermal         temperature, ARM clock, throttling and the fan (Pi 5)\n"
                       "GET  /screen.ppm      the X68000 screen\n"
                       "GET  /fd0.xdf         the disk read from a USB floppy drive, as an XDF image (/fd1.xdf)\n"
+                      "POST /fuk/read?drive=N  read the disk in drive N of FUK (2HD) into memory; the X68000 is paused\n"
+                      "GET  /fuk/status      progress of /fuk/read\n"
+                      "POST /fuk/cancel      stop reading\n"
+                      "GET  /fuk.xdf         the disk read by /fuk/read, as an XDF image\n"
                       "GET  /ts6bga.ppm      the TS-6BGA framebuffer (unscaled)\n"
                       "GET  /screen2.ppm     selected HDMI 2 source (unfiltered, unscaled)\n"
                       "POST /reboot          write back disks and SRAM, then reboot\n"
                       "POST /reboot?profile=NAME   reboot with /pix68k/pix68k-NAME.cfg (empty: pix68k.cfg only)\n"
+                      "POST /config/kernel?from=A&to=B&sha256=S   switch kernel= in config.txt (needs net_token=)\n"
                       "POST /type            type the body as X68000 keys (\\n is Enter)\n"
                       "POST /key?down=XX&mod=YY, /key?up=XX, /key?up   hold / release USB keys\n"
                       "POST /message?sec=N   show the body (UTF-8) at the top left for N s (10; 0 = until cleared);\n"
                       "                      an empty body clears it\n"
-                      "With net_token=, /files (even GET), /reboot, /type, /key and /message need X-Pix68k-Token.\n";
+                      "GET  /mixer.html      change the volumes while the sound plays\n"
+                      "GET  /mixer           volumes and levels (JSON)\n"
+                      "POST /mixer?ch=NAME&db=N   set a volume (-40 to 12, or off; net_token= is required)\n"
+                      "POST /mixer/save      write the volumes (vol_*) to pix68k.cfg (net_token= is required)\n"
+                      "With net_token=, /files and /sha256 (even GET), /reboot, /type, /key, /message and POST /mixer need X-Pix68k-Token.\n";
         if (m_pSysLog != nullptr) {
             CString st;
             st.Format("syslog: %u lines sent, %u failed, %u bytes skipped, %u ICMP unreachable (no syslogd listening?)\n",
@@ -571,6 +677,8 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
         SendText(404, "not found (GET / for the list)\n");
     }
 done:
+    // ページが 1 秒ごとに読むので、ログ (64KB と syslog) には出さない (X68000 が動いていないときの 503 も)
+    if (mixer && !write && (m_Status == 200 || m_Status == 503)) return;
     const unsigned ms = (unsigned)((CTimer::GetClockTicks64() - t0) / (CLOCKHZ / 1000));
     static const char* const kMethods[] = {"GET", "HEAD", "PUT", "POST", "DELETE", "?"};
     m_Logger.Write(FromHttp, LogNotice, "%u.%u.%u.%u %s %s: %d (%u bytes, %u ms)", ip[0], ip[1], ip[2], ip[3],
@@ -628,6 +736,148 @@ void CHttpTask::GetFile(const char* path, bool head) {
     m_Env.netBeginHeavy();
     f_close(&m_File);
     m_Env.netEndHeavy();
+}
+
+// ファイルの SHA-256 と大きさ。計算の間は何も送らないので、相手が切れても気づけず、ほかの要求も待たせる。そのため
+// 大きさを、いちばん大きいカーネルより余裕のある 16MB までにする
+bool CHttpTask::HashFile(const char* path, char hex[65], unsigned& bytes) {
+    if (strcmp(path, "/") == 0) {
+        SendText(400, "a directory\n");
+        return false;
+    }
+    const char* drive = m_Env.netDrive();
+    if (drive == nullptr) {
+        SendText(503, "no boot drive\n");
+        return false;
+    }
+    CString full;
+    full.Format("%s%s", drive, path);
+    m_Env.netBeginHeavy();
+    FRESULT r = f_stat(full, &m_Info);
+    const bool isDir = r == FR_OK && (m_Info.fattrib & AM_DIR) != 0;
+    if (r == FR_OK && !isDir) r = f_open(&m_File, full, FA_READ | FA_OPEN_EXISTING);
+    m_Env.netEndHeavy();
+    if (r == FR_NO_FILE || r == FR_NO_PATH || r == FR_INVALID_NAME) {
+        SendText(404, "no such file\n");
+        return false;
+    }
+    if (r != FR_OK) {
+        SendText(404, "cannot open\n"); // GetFile() と同じ
+        return false;
+    }
+    if (isDir) {
+        SendText(400, "a directory\n");
+        return false;
+    }
+    const FSIZE_t size = f_size(&m_File);
+    const bool tooLarge = size > MAX_SHA256;
+    platform::Sha256 hash;
+    FSIZE_t done = 0;
+    while (!tooLarge && done < size) {
+        UINT got = 0;
+        const UINT want = size - done > BUF_SIZE ? BUF_SIZE : (UINT)(size - done);
+        m_Env.netBeginHeavy();
+        r = f_read(&m_File, m_pBuf, want, &got);
+        if (r == FR_OK) hash.update(m_pBuf, got); // 画面を合成するコアに任せている間に計算する
+        m_Env.netEndHeavy();
+        if (r != FR_OK || got == 0) break;
+        done += got;
+        CScheduler::Get()->Yield();
+    }
+    m_Env.netBeginHeavy();
+    f_close(&m_File);
+    m_Env.netEndHeavy();
+    if (tooLarge) {
+        SendText(413, "too large (16MB max)\n");
+        return false;
+    }
+    if (done != size) {
+        SendText(500, "read error\n");
+        return false;
+    }
+    hash.finishHex(hex);
+    bytes = (unsigned)size;
+    return true;
+}
+
+void CHttpTask::GetSha256(const char* path) {
+    char hex[65];
+    unsigned size = 0;
+    if (!HashFile(path, hex, size)) return;
+    CString text;
+    text.Format("sha256=%s\nsize=%u\n", hex, size);
+    SendText(200, text);
+}
+
+// POST /config/kernel?from=名前&to=名前&sha256=値: config.txt の、この機種の kernel= の値を from から to に替える。
+// 替えられるのは決まった 2 つの名前の間だけで、to のファイルの SHA-256 が sha256= と同じときだけ
+// (platform/config_kernel.h)。ほかの行、ほかのファイルは書かない
+void CHttpTask::SwitchKernel() {
+    if (m_Token[0] == 0) {
+        SendText(403, "net_token= is required for this\n");
+        return;
+    }
+    char from[40], to[40], want[65];
+    if (!platform::queryValue(m_Req.query, "from", from, sizeof from) ||
+        !platform::queryValue(m_Req.query, "to", to, sizeof to) ||
+        !platform::queryValue(m_Req.query, "sha256", want, sizeof want) || strlen(want) != 64) {
+        SendText(400, "from=, to= and sha256= are required\n");
+        return;
+    }
+    const char* other = platform::otherKernelName((unsigned)RASPPI, from);
+    if (other == nullptr || strcmp(other, to) != 0) {
+        SendText(400, "from= and to= must be the two kernel names of this model\n");
+        return;
+    }
+    const char* const* sections = m_Env.netConfigSections();
+    if (sections == nullptr) {
+        SendText(400, "not supported on this model\n");
+        return;
+    }
+    const char* drive = m_Env.netDrive();
+    if (drive == nullptr) {
+        SendText(503, "no boot drive\n");
+        return;
+    }
+    // 書く前に SHA-256 を計算するので、先に断る (SwitchConfigKernel() も断る)
+    if (strcmp(drive, "SD:") != 0) {
+        SendText(403, "only for the SD card\n");
+        return;
+    }
+    if (m_Env.netBusy()) {
+        SendText(503, "the settings menu is open; try again later\n");
+        return;
+    }
+    CString path;
+    path.Format("/%s", to);
+    char hex[65];
+    unsigned size = 0;
+    if (!HashFile(path, hex, size)) return; // 応答は HashFile() が送る
+    if (size == 0 || strcmp(hex, want) != 0) {
+        SendText(409, "the SHA-256 of the file differs from sha256=\n");
+        return;
+    }
+    // HashFile() の間に主ループが動いたので、もう一度見る。ここから書き終わるまで Yield() しない
+    if (m_Env.netBusy()) {
+        SendText(503, "the settings menu is open; try again later\n");
+        return;
+    }
+    static_assert(CONFIG_SWITCH_BUF <= BUF_SIZE, "m_pBuf");
+    const char* error = nullptr;
+    int status = 500;
+    m_Env.netBeginHeavy();
+    SwitchConfigKernel(drive, sections, from, to, m_pBuf, status, error);
+    m_Env.netEndHeavy();
+    CString msg;
+    if (error != nullptr) {
+        msg.Format("%s\n", error);
+        m_Logger.Write(FromHttp, LogWarning, "config.txt kernel=%s -> %s: %s", from, to, error);
+        SendText(status, msg);
+        return;
+    }
+    m_Logger.Write(FromHttp, LogNotice, "config.txt: kernel=%s -> %s", from, to);
+    msg.Format("kernel=%s\n", to);
+    SendText(200, msg);
 }
 
 // ディレクトリの一覧 (1 行に 1 つ。「名前<TAB>大きさ」、ディレクトリは名前の後ろに /)。BUF_SIZE に入る分まで
@@ -745,6 +995,40 @@ void CHttpTask::DeleteFile(const char* path) {
     }
 }
 
+// PUT の unused=1 で使う (更新。2 つの更新が重なったときに、起動に使うカーネルを書き換えないように)。
+// この口の要求は 1 つずつ処理するが、受け取っている間にメニューの「Roll back」が kernel= を替えることがあるので、PUT の初めと、入れ替える直前に見る
+const char* CHttpTask::KernelInUse(const char* path) {
+    static const char* const kUnknown = "cannot tell which kernel is in use\n";
+    const char* const* sections = m_Env.netConfigSections();
+    const char* drive = m_Env.netDrive();
+    if (sections == nullptr || drive == nullptr) return kUnknown;
+    // m_pBuf の先頭には、頭と一緒に届いた本体 (FRAME_BUFFER_SIZE まで) があるので、後ろの半分に読む
+    static_assert(BUF_SIZE / 2 >= FRAME_BUFFER_SIZE && BUF_SIZE / 2 >= platform::CONFIG_TXT_MAX, "m_pBuf");
+    char* const text = (char*)m_pBuf + BUF_SIZE / 2;
+    CString full;
+    full.Format("%s/config.txt", drive);
+    UINT got = 0;
+    m_Env.netBeginHeavy();
+    bool ok = f_open(&m_File, full, FA_READ | FA_OPEN_EXISTING) == FR_OK;
+    if (ok) {
+        const FSIZE_t n = f_size(&m_File);
+        ok = n <= platform::CONFIG_TXT_MAX && f_read(&m_File, text, (UINT)n, &got) == FR_OK && got == n;
+        f_close(&m_File);
+    }
+    m_Env.netEndHeavy();
+    if (!ok) return kUnknown;
+    const platform::ConfigKernel k = platform::findConfigKernel(text, got, sections);
+    if (k.error != nullptr) return kUnknown;
+    // 書いてよいのは、組のもう一方の名前だけ (同じファイルを指す別の書き方を、名前の比較で漏らさないように)
+    char used[40];
+    if (k.length >= sizeof used) return kUnknown;
+    memcpy(used, text + k.offset, k.length);
+    used[k.length] = 0;
+    const char* other = platform::otherKernelName((unsigned)RASPPI, used);
+    if (other == nullptr || strcmp(path + 1, other) != 0) return "unused=: not the other kernel name of config.txt\n";
+    return nullptr;
+}
+
 void CHttpTask::PutFile(const char* path) {
     const char* drive = m_Env.netDrive();
     if (m_Req.contentLength < 0) {
@@ -769,6 +1053,13 @@ void CHttpTask::PutFile(const char* path) {
     if (m_Env.netBusy()) {
         SendText(503, "the settings menu is open; try again later\n");
         return;
+    }
+    if (platform::queryHas(m_Req.query, "unused")) {
+        const char* why = KernelInUse(path);
+        if (why != nullptr) {
+            SendText(409, why);
+            return;
+        }
     }
     char full[300], part[310], old[310];
     CString f;
@@ -891,6 +1182,10 @@ void CHttpTask::PutFile(const char* path) {
         // 受け取っている間に、同じ名前のディレクトリが作られた (commitUpload() も断るが、400 で答える)
         ok = false, status = 400;
         why = "a directory with this name was created during the upload";
+    } else if (ok && platform::queryHas(m_Req.query, "unused") && KernelInUse(path) != nullptr) {
+        // 受け取っている間に、メニューの「Roll back」で、このファイルが起動に使うカーネルになった (か、config.txt を読めない)
+        ok = false, status = 409;
+        why = "this is no longer the unused kernel of config.txt, or config.txt cannot be read";
     } else if (ok) {
         const platform::ImageCheck c = TouchesImage(path, true);
         if (c == platform::ImageCheck::IN_USE) {
@@ -975,6 +1270,18 @@ void CHttpTask::GetScreen(bool head, unsigned source) {
 // GET /fd<N>.xdf: USB-FDD から読んだディスクを XDF のイメージとして返す (#287)。ファイルから入れたディスクは返さない
 // (そちらは /files で読める)。写しを取ってから送る (送る間にメニューで取り出されても、解放されたバッファを読まない)。
 // 写しのバッファ (約 1.2MB) は一度確保したら使い回す (Circle は 512KB を超えるブロックを解放しても使い回さない)
+// /fuk/cancel と /fuk.xdf の id= (付けなければ確かめない) が、最後に頼まれた読み出しの番号か
+bool CHttpTask::FukIdMatches() {
+    if (!platform::queryHas(m_Req.query, "id")) return true;
+    char text[16], now[16];
+    if (!platform::queryValue(m_Req.query, "id", text, sizeof text)) return false;
+    CString s;
+    s.Format("%u", m_Env.netFukId());
+    strncpy(now, s, sizeof now - 1);
+    now[sizeof now - 1] = 0;
+    return strcmp(text, now) == 0;
+}
+
 void CHttpTask::GetFloppyImage(int drive, bool head) {
     // 入っているかと大きさだけを先に聞く (写さない)。どう答えるかは platform::floppyImageReply():
     // なければ 404、HEAD は長さだけ、写しのバッファはヒープの空きを確かめてから確保する (足りなければ 503)。
@@ -1174,6 +1481,51 @@ void CHttpTask::Message() {
     else if (req.sec == 0) msg = "shown until cleared\n";
     else msg.Format("shown for %u s\n", req.sec);
     SendText(200, msg);
+}
+
+void CHttpTask::Mixer(bool head) {
+    char json[platform::MIXER_JSON_SIZE];
+    if (!m_Env.netMixerJson(json, sizeof json)) {
+        SendText(503, "the X68000 is not running\n");
+        return;
+    }
+    const unsigned n = strlen(json);
+    if (SendHead(200, "application/json", n) && !head) SendAll(json, n);
+}
+
+void CHttpTask::MixerSet() {
+    platform::MixerWebRequest req;
+    if (!platform::parseMixerRequest(m_Req.query, req)) {
+        SendText(400, req.error);
+    } else if (m_Env.netBusy()) {
+        SendText(409, "the settings menu is open\n"); // メニューは自分の値の写しを持つ
+    } else if (!m_Env.netMixerSet(req.group, req.dB)) {
+        SendText(503, "the X68000 is not running\n");
+    } else {
+        SendText(200, "ok\n");
+    }
+}
+
+// 書くのは主ループ (CKernel::ServiceMixer())。終わるまで待つ
+void CHttpTask::MixerSave() {
+    platform::WebSave* save = m_Env.netMixerSave();
+    if (m_Env.netBusy()) {
+        SendText(409, "the settings menu is open\n");
+        return;
+    }
+    if (save == nullptr) {
+        SendText(503, "the X68000 is not running\n");
+        return;
+    }
+    save->request();
+    const u64 t0 = CTimer::GetClockTicks64();
+    while (!save->done() && CTimer::GetClockTicks64() - t0 < 5 * (u64)CLOCKHZ) CScheduler::Get()->MsSleep(10);
+    const bool done = save->done(), ok = save->ok(), busy = save->busy();
+    save->cancel();
+    if (!done) SendText(503, "the save did not start\n");
+    else if (busy) SendText(409, "the settings menu is open, or the X68000 is stopped for a restart\n");
+    else if (!ok) SendText(500, "cannot write the volumes\n");
+    else SendText(200, "saved\n");
 }
 
 // ---- CHostNet ----

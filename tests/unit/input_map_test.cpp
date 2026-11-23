@@ -703,7 +703,61 @@ void testPadLayout() {
 
 } // namespace
 
+void testMouseButtonMask() {
+    printf("MouseButtonMask\n");
+    platform::MouseButtonMask m;
+    CHECK_EQ((int)m.report(1, false), 1);
+    // 左を押したまま開き、開いている間に右も押し、左を離し、右を押したまま閉じる
+    m.report(1, true);
+    m.report(3, true);
+    m.report(2, true);
+    m.closed();
+    CHECK_EQ((int)m.report(2, false), 0); // 動かしただけのレポート。右は離すまで送らない
+    CHECK_EQ((int)m.report(3, false), 1); // 新しく押した左は送る
+    CHECK_EQ((int)m.report(1, false), 1);
+    CHECK_EQ((int)m.report(3, false), 3); // 離して押し直した右は送る
+    // 開いている間に離していれば、閉じたあとはすぐに送る
+    m.report(0, true);
+    m.closed();
+    CHECK_EQ((int)m.report(2, false), 2);
+    // 開いている間にレポートが来なくても、押したままなら隠す
+    m.closed();
+    CHECK_EQ((int)m.report(2, false), 0);
+    m.reset();
+    CHECK_EQ((int)m.report(2, false), 2);
+}
+
+// ゲームパッドの方向とボタンを押したまま、キーボードで開いて閉じる (ミキサーはゲームパッドからは開かない)
+void testPadHeldAcrossMixer() {
+    printf("gamepad held while the mixer opens and closes\n");
+    typedef InputSink S;
+    platform::PadMenuInput pad;
+    uint8_t out, ev[platform::PadMenuInput::MAX_EVENTS];
+    int n;
+    CHECK_EQ((int)pad.update(true, 0, S::JOY_LEFT | S::JOY_A, false, out, ev, n), (int)platform::PadMenuInput::PASS);
+    CHECK_EQ((int)out, (int)(S::JOY_LEFT | S::JOY_A));
+    // 開いている間: 前から押していたものは渡さず、新しく押した上だけを渡す
+    CHECK_EQ((int)pad.update(true, 0, S::JOY_LEFT | S::JOY_A | S::JOY_UP, true, out, ev, n), (int)platform::PadMenuInput::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], platform::menu_key::UP);
+    CHECK_EQ((int)out, 0);
+    CHECK_EQ(pad.holds(platform::menu_key::LEFT), false);
+    pad.closed();
+    // 閉じたあと: 押したままのものは送らず、離して押し直せば送る
+    pad.update(true, 0, S::JOY_LEFT | S::JOY_A | S::JOY_UP, false, out, ev, n);
+    CHECK_EQ((int)out, 0);
+    pad.update(true, 0, S::JOY_LEFT, false, out, ev, n);
+    CHECK_EQ((int)out, 0);
+    pad.update(true, 0, S::JOY_LEFT | S::JOY_A, false, out, ev, n);
+    CHECK_EQ((int)out, (int)S::JOY_A);
+    pad.update(true, 0, 0, false, out, ev, n);
+    pad.update(true, 0, S::JOY_LEFT, false, out, ev, n);
+    CHECK_EQ((int)out, (int)S::JOY_LEFT);
+}
+
 int main() {
+    testMouseButtonMask();
+    testPadHeldAcrossMixer();
     testMouseTracker();
     testHidReportDescriptorInfo();
     testHidHatRange();

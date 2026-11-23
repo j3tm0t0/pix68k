@@ -42,6 +42,7 @@
 # 書き換えを断ること、トークンがなければ書けないこと、/log、/thermal、/screen.ppm、/type、/key、syslog (ホストの UDP の
 # $HOSTNET_SYSLOG_PORT で受ける) を確かめ、最後に /reboot で再起動を頼む。NEPTUNE=1 と同時には使えない
 # (ネットワークの口は動かさない。そのことをログで確かめる)。SCREEN_PPM_COPY=out.ppm なら、DIR のあとに取った /screen.ppm を写す。
+# HOSTNET=1 は CI では動かしていない (ホストの決まったポートを使い、同じ機械の別の runner とぶつかるため)。手元で実行する。
 # RS232C=1 を HOSTNET=1 と指定すると、pix68k.cfg に rs232c=tcp:2324 を書き、ゲストの 2324 番をホストの 127.0.0.1:$RS232C_PORT
 # (既定 12324) に転送する。ホストからつなぎ、モニタから打った「echo pix68kout>aux」の文字列が届くことと、ホストから送った
 # 文字列と Ctrl+Z が「COPY AUX CON」で画面に出ることを確かめる (RS-232C のドライバを組み込んだ起動ディスクが要る)。
@@ -367,6 +368,44 @@ if s is not None and b"pix68kout" in got.lower():
     tail -n "+$MARK" "$SERIAL" | grep -a 'httpd:' | sed 's/^/  /' || true
     check "$(code -H "$TOK" "$URL/files/pix68k/up.bin")" 200 'GET 4MB'
     cmp -s "$WORK/body" "$WORK/up.bin" && echo 'ok: 4MB read back' || { echo 'NG: 4MB differs'; fail=1; }
+    # 書いたファイルの SHA-256 (読み戻さずに確かめる口) と版
+    check "$(code "$URL/sha256/pix68k/up.bin")" 403 'GET /sha256 without the token'
+    check "$(code -H "$TOK" "$URL/sha256/pix68k/up.bin")" 200 'GET /sha256'
+    SUM=$( (sha256sum "$WORK/up.bin" 2>/dev/null || shasum -a 256 "$WORK/up.bin") | cut -d' ' -f1)
+    [ "$(cat "$WORK/body")" = "sha256=$SUM
+size=4194304" ] && echo 'ok: SHA-256 of 4MB' || { echo 'NG: SHA-256'; cat "$WORK/body"; fail=1; }
+    check "$(code -H "$TOK" "$URL/sha256/pix68k/nofile.bin")" 404 'GET /sha256 of a missing file'
+    check "$(code -H "$TOK" "$URL/sha256/pix68k")" 400 'GET /sha256 of a directory'
+    check "$(code -H "$TOK" "$URL/sha256/")" 400 'GET /sha256 of the root'
+    check "$(code -H "$TOK" --path-as-is "$URL/sha256/pix68k/../x")" 400 'GET /sha256 with ..'
+    # config.txt の kernel= の値だけを替える口
+    printf '# test\narm_64bit=1\n[pi4]\nkernel=kernel8-rpi4.img\n[pi3]\nkernel=kernel8.img\n[all]\n' > "$WORK/cfg.txt"
+    printf '# test\narm_64bit=1\n[pi4]\nkernel=kernel8-rpi4.img\n[pi3]\nkernel=pix68k8.img\n[all]\n' > "$WORK/cfg2.txt"
+    check "$(code -H "$TOK" -T "$WORK/cfg.txt" "$URL/files/config.txt")" 201 'PUT config.txt'
+    check "$(code -H "$TOK" -T "$WORK/up2.txt" "$URL/files/pix68k8.img")" 201 'PUT pix68k8.img'
+    check "$(code -H "$TOK" -T "$WORK/up2.txt" "$URL/files/kernel8.img")" 201 'PUT kernel8.img'
+    check "$(code -H "$TOK" -T "$WORK/up2.txt" "$URL/files/Kernel8.img?unused=1")" 409 'PUT the kernel in use with unused=1'
+    check "$(code -H "$TOK" -T "$WORK/up2.txt" "$URL/files/kernel8.img.?unused=1")" 409 'PUT another spelling of the kernel in use'
+    check "$(code -H "$TOK" -T "$WORK/up2.txt" "$URL/files/pix68k8.img?unused=1")" 201 'PUT the other kernel with unused=1'
+    KSUM=$( (sha256sum "$WORK/up2.txt" 2>/dev/null || shasum -a 256 "$WORK/up2.txt") | cut -d' ' -f1)
+    SW="$URL/config/kernel?from=kernel8.img&to=pix68k8.img&sha256=$KSUM"
+    check "$(code -X POST "$SW")" 403 'POST /config/kernel without the token'
+    check "$(code -H "$TOK" "$SW")" 404 'GET /config/kernel'
+    check "$(code -H "$TOK" -X POST "$URL/config/kernel?from=kernel8.img&to=pix68k8.img&sha256=$SUM")" 409 'POST /config/kernel, wrong SHA-256'
+    check "$(code -H "$TOK" -X POST "$URL/config/kernel?from=kernel8.img&to=cmdline.txt&sha256=$KSUM")" 400 'POST /config/kernel, other file'
+    check "$(code -H "$TOK" -X POST "$URL/config/kernel?from=kernel8-rpi4.img&to=pix68k8-rpi4.img&sha256=$KSUM")" 400 'POST /config/kernel, other model'
+    check "$(code -H "$TOK" -X POST "$URL/config/kernel?from=pix68k8.img&to=kernel8.img&sha256=$KSUM")" 409 'POST /config/kernel, not the current kernel'
+    check "$(code -H "$TOK" "$URL/files/config.txt")" 200 'GET config.txt'
+    cmp -s "$WORK/body" "$WORK/cfg.txt" && echo 'ok: config.txt is unchanged' || { echo 'NG: config.txt changed'; fail=1; }
+    check "$(code -H "$TOK" -X POST "$SW")" 200 'POST /config/kernel'
+    check "$(code -H "$TOK" "$URL/files/config.txt")" 200 'GET config.txt'
+    cmp -s "$WORK/body" "$WORK/cfg2.txt" && echo 'ok: only kernel= changed' || { echo 'NG: config.txt'; cat "$WORK/body"; fail=1; }
+    check "$(code -H "$TOK" -X POST "$URL/config/kernel?from=pix68k8.img&to=kernel8.img&sha256=$KSUM")" 200 'POST /config/kernel, back'
+    check "$(code -H "$TOK" "$URL/files/config.txt")" 200 'GET config.txt'
+    cmp -s "$WORK/body" "$WORK/cfg.txt" && echo 'ok: kernel= is back' || { echo 'NG: config.txt'; cat "$WORK/body"; fail=1; }
+    check "$(code "$URL/version")" 200 'GET /version'
+    grep -q '^version=.' "$WORK/body" && grep -q '^raspi=3$' "$WORK/body" && grep -q '^drive=SD:$' "$WORK/body" &&
+      echo 'ok: /version' || { echo 'NG: /version'; cat "$WORK/body"; fail=1; }
     check "$(code -H "$TOK" --data-binary @"$WORK/up2.txt" "$URL/files/pix68k/up.bin")" 201 'POST replaces the file'
     check "$(code -H "$TOK" "$URL/files/pix68k/up.bin")" 200 'GET replaced'
     cmp -s "$WORK/body" "$WORK/up2.txt" && echo 'ok: replaced content' || { echo 'NG: replaced content'; fail=1; }
@@ -565,11 +604,11 @@ print("%d pixels changed after clearing, %dx%d x%d" % (diff, w, h, k))
     keys end up up ret
     wait_for 'settings saved to' "$MARK" || fail=1
     keys down ret
-    wait_for 'restarting (settings changed in the menu)' "$MARK" || fail=1
+    wait_for 'restarting (requested in the settings menu)' "$MARK" || fail=1
     sleep 10
     # 再起動したあとのログ。再起動は速く (QEMU で 0.1 秒ほどで pix68k.cfg を読む)、上の wait_for が見つけたときには
     # 次の起動のログが出ていることがあるので、行数ではなく restarting の行より後を見る
-    awk 'found; /restarting \(settings changed in the menu\)/ { found = 1 }' "$WORK/serial.txt" > "$WORK/after_restart.txt"
+    awk 'found; /restarting \(requested in the settings menu\)/ { found = 1 }' "$WORK/serial.txt" > "$WORK/after_restart.txt"
     if grep -aqF 'boot time: reading pix68k.cfg' "$WORK/after_restart.txt"; then
       echo "ok: restarted"
       if grep -aqF 'fd0: SD:' "$WORK/after_restart.txt"; then

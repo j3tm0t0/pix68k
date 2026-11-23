@@ -59,6 +59,14 @@ public:
     int sectorIndex(const Sector* s) const { return s && s >= sectors_ && s < sectors_ + used_ ? (int)(s - sectors_) : -1; }
     const Sector* sectorAt(int i) const { return i >= 0 && i < used_ ? sectors_ + i : nullptr; }
     size_t size() const { return size_; }
+    // ---- ブートセクタ (先頭のトラックの R = 1。1024 バイトまで) の書き換えの検出 (platform/boot_warn.h) ----
+    // 書く前に呼ぶ: セクタ s がブートセクタで、data (nullptr なら全部 fill) が今の中身と違えば覚える
+    void noteWrite(const Sector* s, const uint8_t* data, uint32_t len, uint8_t fill = 0);
+    // 覚えていれば true を返して忘れる。書くコア (コア 1) と別のコアから呼んでよい
+    bool takeBootChanged() {
+        if (!__atomic_load_n(&bootChanged_, __ATOMIC_ACQUIRE)) return false;
+        return __atomic_exchange_n(&bootChanged_, 0u, __ATOMIC_ACQ_REL) != 0;
+    }
 
     // ---- 書き戻し (DirtySource) ----
     DirtyMap& dirtyMap() override { return dirty_; }
@@ -78,6 +86,7 @@ private:
     uint8_t* data_ = nullptr;
     size_t size_ = 0;
     bool writeProtect_ = false;
+    unsigned bootChanged_ = 0; // 動作には使わない (ステートにも入れない)
     DirtyMap dirty_;
     Sector* sectors_ = nullptr; // 全トラックのセクタの表
     int capacity_ = 0, used_ = 0;

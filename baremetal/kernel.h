@@ -37,16 +37,21 @@
 #include "platform/frame_scale.h"
 #include "platform/snapshot_wait.h"
 #include "platform/input_map.h"
+#include "platform/pad_map.h"
+#include "platform/pad_setup.h"
 #include "platform/key_merge.h"
 #include "platform/key_remap.h"
 #include "platform/key_tracker.h"
 #include "platform/key_type.h"
 #include "platform/menu.h"
+#include "platform/mixer.h"
 #include "platform/osd.h"
 #include "platform/osd_bars.h"
+#include "platform/boot_warn.h"
 #include "platform/osd_message.h"
 #include "platform/reboot_keys.h"
 #include "platform/settings_file.h"
+#include "platform/update_rollback.h"
 #include "platform/sample_clock.h"
 #include "platform/sound_info.h"
 #include "platform/uart_midi.h"
@@ -122,6 +127,7 @@ private:
 class CFukUsb;
 namespace x68k {
 class Fuk;
+class FukReader;
 }
 
 class CCoreRunner : public CMultiCoreSupport {
@@ -145,7 +151,7 @@ public:
 
 // 設定メニュー (platform/menu.h) とネットワークの口 (host_net.h) から頼まれたことも、このクラスが行う
 // (machine_menu.cpp、machine_run.cpp)
-class CKernel : public platform::MenuHost, public CHostNetEnv {
+class CKernel : public platform::MenuHost, public platform::MixerControl, public CHostNetEnv {
 public:
     CKernel();
     ~CKernel();
@@ -180,6 +186,7 @@ private:
     void ApplySettings();
     bool SaveConfig(const platform::Settings& s);
     // 起動の組み合わせ (platform/boot_profile.h。machine_run.cpp)
+    void LoadPadMaps();
     FRESULT LoadConfigText(const char* name, const char* tmpName, platform::ConfigText& text, CString& path);
     bool LoadSavedConfigText(const char* name, const char* tmpName, platform::ConfigText& text);
     void ChooseProfile();
@@ -287,6 +294,12 @@ private:
     }
     unsigned ServiceDisks(u64 now, bool io = true);
     u8* ReadWholeFile(const char* path, unsigned& size);
+    void FindRollback();
+    bool RollBack(platform::MenuText& msg, bool cancelChoice = false); // cancelChoice: 断った POST /reboot?profile= を先に取り消す
+    bool m_HasRollback = false;         // 更新で残した前の版に戻せる (update_menu.cpp)
+    platform::RollbackPlan m_Rollback;
+    u8* m_pRollbackBuf = nullptr;
+    void EnableUsbFloppyWrite(bool readOk, const char* path, const platform::ConfigText& base);
     void LoadOpnRhythm();
     static FRESULT ReadFileChecked(const char* path, u8*& data, unsigned& size);
     static FRESULT WriteFileReplacing(const char* path, const char* tmp, const void* data, unsigned size);
@@ -295,6 +308,9 @@ private:
     bool LoadDisk(int drive, const char* name);
     void StartFuk(Emulator* emu); // fuk=on: FUK を探し、見つかれば内蔵の FDC の代わりに使う (#295)
     void ServiceFuk();            // 主ループから: 抜き差しを見て、ログに出す
+    void ServiceFukRead();        // 主ループから: FUK のディスクの読み出し (#381)。読む間は X68000 を止める
+    bool PauseForFukRead();
+    void FinishFukRead();
     void ReportFuk();             // FUK とのやり取りの数をログに出す
     bool LoadRealFloppy(int drive, int unit); // fd<N>=usb-fdd:<unit> (unit は 0 から。USB-FDD の実物のディスクを読む。#286)
     bool m_RealFloppy[2] = {false, false};    // m_pDisks[drive] は USB-FDD から読んだディスク (書き出せる。#287)
@@ -305,6 +321,8 @@ private:
     void LoadScsi();
     void LoadSram();
     bool SaveSram(const u8* data);
+    bool m_SramBootWarn = false; // 読んだ SRAM の起動装置が SRAM だった (WarnSramBoot())
+    platform::BootWarnSeen m_BootWarnSeen;
     void ShowFrame(const Emulator::Frame& frame, bool stopped = false);
     void DumpText();
     void ReportSpeed();
@@ -349,6 +367,16 @@ private:
     bool InputPending() const;
     // 設定メニュー (machine_menu.cpp)
     void ServiceMenu();
+    void ServiceMixer();     // 音を鳴らしたまま変えるミキサー (#364。machine_menu.cpp)
+    bool PublishPanel(const platform::MixerView& v);
+    void PublishMixer();
+    void ClosedMixer();
+    void ServicePadSetup();  // ゲームパッドのボタンの並びを決める画面 (#379。machine_menu.cpp)
+    void ClosedPadSetup();
+    void ServicePadOffer(); // 並びの分からないゲームパッドの長押しだけで設定を始める
+    void CollectPads(platform::PadSetup::Pad pads[platform::PadSetup::PADS]);
+    void ReleaseInput();
+    const char* SavePadMap(const platform::PadMap& map, int slot);
     void OpenMenu();
     void CloseMenu();
     void DrawMenu();
@@ -361,6 +389,8 @@ private:
     void resetMachine() override;
     bool hasRealFloppy(int drive) const override { return m_RealFloppy[drive]; }
     bool saveFloppyImage(int drive, platform::MenuText& msg) override;
+    const char* rollbackVersion() const override { return m_HasRollback ? m_Rollback.version : nullptr; }
+    bool rollBack(platform::MenuText& msg) override;
     bool saveState(int slot, platform::MenuText& msg) override;
     bool loadState(int slot, platform::MenuText& msg) override;
     bool saveSettings(const platform::Settings& s, platform::MenuText& msg) override;
@@ -384,12 +414,19 @@ private:
     bool netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) override;
     unsigned netFloppyImage(int drive, u8* buf, unsigned capacity) override;
     bool netCanAllocate(unsigned bytes) override;
+    FukReadReply netFukRead(int drive, unsigned& id) override;
+    unsigned netFukId() override { return m_FukReadId; }
+    void netFukCancel() override;
+    void netFukStatus(CString& out) override;
+    const u8* netFukImage(unsigned& bytes) override;
     void ShowTsFrame();
     void netRequestReboot() override;
     platform::ProfileRequest netBootProfile(const char* name) override;
     bool netKeyReport(u8 modifiers, const u8 keys[6]) override;
     unsigned netLog(char* out) override { return m_LogRing.Snapshot(out); }
     void netThermal(CString& out) override;
+    void netVersion(CString& out) override;
+    const char* const* netConfigSections() override;
     unsigned netLogRead(u64& pos, char* out, unsigned max, u64& lost) override {
         return m_LogRing.ReadFrom(pos, out, max, lost);
     }
@@ -433,12 +470,26 @@ private:
         if (m_pEmulator != nullptr) m_pEmulator->setVolume((x68k::Sound::Volume)group, dB);
     }
     bool soundInfo(SoundInfo& info) override; // machine_run.cpp
+    // MixerControl (platform/mixer.h)。コア 0 の主ループから呼ぶ
+    int mixerVolume(int group) const override { return m_Settings.volume[group]; }
+    void setMixerVolume(int group, int dB) override { volumeChanged(group, dB); }
+    x68k::Sound::Levels takeMixerLevels() override; // machine_run.cpp
+    platform::SoundSources mixerSources() const override { return platform::soundSources(m_Settings, m_MidiFault); }
+    bool saveMixerVolumes() override;
+    bool netMixerJson(char* out, unsigned size) override; // machine_menu.cpp
+    bool netMixerSet(int group, int dB) override;
+    platform::WebSave* netMixerSave() override { return m_pEmulator != nullptr ? &m_WebSave : nullptr; }
+    void ServiceWebMixer();
     bool hasOsdBars() const override { return true; }
+    bool hasPadSetup() const override { return true; }
+    void startPadSetup() override { m_PadSetupWanted = true; }
     void osdBarsChanged(int on) override { __atomic_store_n(&m_Settings.osdBars, on, __ATOMIC_RELAXED); }
     void UpdateOsd();
     static int OsdPiModel();
     void ExpireOsd();
     void ServiceMessage();
+    void WarnSramBoot();         // 起動装置が SRAM なら知らせる (boot_warn=。platform/boot_warn.h)
+    void WarnBootSector(int drive); // FD のブートセクタが書き換えられていれば知らせる
     void SendGamePad(int slot);
     void ResetFromGamePad();
     void ClosedPadMenu();
@@ -512,6 +563,8 @@ private:
     unsigned m_PadIndex[2] = {0, 0};     // 状態の通知の nDeviceIndex (upadN の N - 1)
     bool m_PadKnown[2] = {false, false}; // Circle が配置を知っているゲームパッドか
     const platform::PadLayout* m_PadLayout[2] = {nullptr, nullptr}; // VID:PID で並びの分かるゲームパッド (platform::findPadLayout())
+    platform::PadMapTable m_PadMaps;     // pads.txt (LoadPadMaps()。USB のゲームパッドを探す前に読む。そのあと変えるのは SavePadMap() だけ)
+    const platform::PadMap* m_PadMap[2] = {nullptr, nullptr}; // pads.txt にあるゲームパッド (ほかの並びより優先する)
     int m_LastPadHat[2] = {-2, -2};      // pad_log=on: 前にログに出したハットの生の値
     bool m_PadLog = false;               // pix68k.cfg の pad_log=
     unsigned m_LastPadButtons[2] = {0, 0};
@@ -531,15 +584,27 @@ private:
     // FUK (fuk=on で、起動のときに見つかったときだけ。x68k/fuk.h、fuk_usb.h)
     CFukUsb* m_pFukUsb = nullptr;
     x68k::Fuk* m_pFuk = nullptr;
+    x68k::FukReader* m_pFukReader = nullptr;
+    u8* m_pFukImage = nullptr;       // 読み出した XDF のイメージ (初めて頼まれたときに確保し、使い回す)
+    int m_FukReadRequest = -1;       // POST /fuk/read で頼まれたドライブ (-1 なし)
+    unsigned m_FukReadId = 0;        // 読み出しの番号
+    bool m_FukReading = false;       // 読み出している (X68000 は止めたまま)
+    char m_FukSha256[65] = "";       // 読み終えたイメージの SHA-256
+    bool m_FukReadPauseFailed = false, m_FukReadCancelled = false;
     unsigned m_FukChanges = 0;   // ログに出した Fuk::linkChanges()
     unsigned m_FukReadsLogged = 0; // ログに出した Fuk::Stats::reads
+    int m_MidiFault = platform::OSD_MIDI_OK; // MIDI の音源を用意できなかったか (画面の隅とミキサーに出す。#362)
     x68k::MidiOut* m_pMidiOut = nullptr; // MIDI ボードの音源 (midi=on のときだけ。SoundFont、MT-32 か UART)
     CUartMidiOut* m_pUartMidi = nullptr; // midi_out=uart のときの m_pMidiOut
     platform::Mt32Synth* m_pMt32 = nullptr; // midi_out=mt32 のときの m_pMidiOut (捨てたメッセージの数をログに出す)
     // 音の大きさ (TakeSoundLevels()、ReportSoundLevels()、soundInfo()。どれもコア 0)。取った値は、ミキサーの画面に出す
-    // 直近 10 秒 (m_SoundWindow) と、次の 10 秒ごとのログに出す分 (m_SoundLog) の両方に足す
+    // 直近 10 秒 (m_SoundWindow)、次の 10 秒ごとのログに出す分 (m_SoundLog)、音を鳴らしたまま変えるミキサーに出す分
+    // (m_MixerLevels)、Web のミキサーに出す分 (m_WebLevels) のすべてに足す
     platform::SoundWindow m_SoundWindow;
+    platform::WebLevels m_WebLevels;
     x68k::Sound::Levels m_SoundLog = {};
+    x68k::Sound::Levels m_MixerLevels = {}; // 音を鳴らしたまま変えるミキサーがまだ見ていない分 (takeMixerLevels())
+    platform::WebSave m_WebSave; // Web のミキサーから頼まれた保存
     uint32_t m_Mt32DroppedLogged[2] = {0, 0}; // ログに出したときの droppedMessages() と droppedSysex()
     CSerialDevice* m_pMidiSerial = nullptr; // midi_out=uart で、ログと別の UART を使うとき
     unsigned m_UartMidiDevice = 0;          // midi_out=uart で使う UART (CSerialDevice の番号)
@@ -644,6 +709,27 @@ private:
     volatile bool m_MenuActive = false;   // メニューを開いている (開くところ、閉じるところを含む)
     u8 m_MenuKeyRing[32] = {};
     volatile unsigned m_MenuKeyHead = 0, m_MenuKeyTail = 0;
+    // 音を鳴らしたまま変えるミキサー (#364)。X68000 は止めない。USB の割り込みが m_MixerActive を立て (m_MenuActive が
+    // 下りているときだけ)、主ループ (ServiceMixer()) が開く。下ろすのは主ループだけ (割り込みを止めて)。
+    // m_MenuActive と m_MixerActive は同時には立たない。キーの受け渡し (m_MenuKeyRing、m_MenuLastKey、m_MenuRepeat) は共用する
+    volatile bool m_MixerActive = false;
+    // ゲームパッドのボタンの並びを決める画面 (platform/pad_setup.h)。X68000 は止めない。設定メニューで選び、メニューを閉じる
+    // ところで主ループが立てる (m_MenuActive と同時に下ろすので、入力が X68000 に行く隙間はない)。下ろすのも主ループ
+    volatile bool m_PadSetupActive = false;
+    bool m_PadSetupWanted = false;        // メニューで選んだ (まだメニューを閉じていない)
+    platform::PadSetup m_PadSetup;
+    platform::PadSetupOffer m_PadOffer;
+    int m_PadSetupSlot = -1;              // 長押しで始めた枠 (-1 なら、設定メニューから)
+    bool m_PadOfferMsg = false;           // いま左上に出しているのが、長押しの案内
+    platform::PadRaw m_PadRaw[2];         // 最後のレポートの生の値 (USB の割り込みが書き、主ループが割り込みを止めて読む)
+    bool m_PadRawValid[2] = {false, false};
+    bool m_PadDirection[2] = {false, false}; // そのレポートで、X68000 に送る上下左右のどれかを押していた
+    u64 m_PadSetupTicks = 0;              // 最後に画面の文字を作った時刻
+    bool InputToMenu() const { return m_MenuActive || m_MixerActive || m_PadSetupActive; } // 入力を X68000 に送らない
+    platform::MouseButtonMask m_MouseMask; // USB の割り込みか、割り込みを止めて触る
+    platform::Mixer m_Mixer{*this};
+    u64 m_MixerTicks = 0;                 // 最後に Mixer::tick() を呼んだ時刻
+    platform::MixerView m_MixerPublished; // 写す役のコアに最後に渡した中身
     u8 m_MenuLastKey = 0;                 // 最後にメニューに渡したキー (押し続けたときの繰り返し用)
     volatile u8 m_LastMods = 0;           // 最後のレポートの修飾キー (すべてのキーボードを合わせたもの)
     const Emulator::Frame* m_pLastFrame = nullptr; // 最後に出した X68000 の画面 (メニューの下に描き直す)
@@ -660,7 +746,7 @@ private:
     alignas(16) uint32_t m_ScaleLine[4096];      // 拡大した 1 行 (platform/frame_scale.h の presentScaled())
     alignas(16) uint32_t m_ScaleLine2[4096];     // もう 1 行 (platform/crt_effect.h の presentCrt() がにじませるときに使う)
     // 画面の出し方 (video_scale=、video_filter=。platform/crt_effect.h)
-    int m_Video = platform::VIDEO_SCALE_INTEGER << 16; // video_scale << 16 | video_filter (コア 0 が書き、写す役のコアが読む)
+    int m_Video = platform::kDefaultVideoScale << 16; // video_scale << 16 | video_filter (コア 0 が書き、写す役のコアが読む)
     bool m_VideoAll = false;                // pix68k_crt_all=1 (Pi 3 でもどの組み合わせも選べる。VideoAllowed())
     platform::CrtMap m_CrtMap;              // 表 (写す役のコアだけが触る。画面の大きさか組み合わせが変わると作り直す)
     int m_CrtLast = 0;                      // 前に写したときの写し方 (m_CrtShown と同じ形。変わったらすべての行を写す。写す役のコアだけが触る)
@@ -691,12 +777,15 @@ private:
     // 画面の左上のメッセージ (POST /message。platform/osd_message.h)。字形はコア 0 が作って s_MsgBox (machine_run.cpp)
     // に置き、写す役のコアが ShowFrame() で s_MsgShown に写す。ここの 3 つは写す役のコアだけが触る
     platform::MessageState m_MsgState;      // いま出ているもの
+    platform::MixerState m_MixerState;      // 画面の左下のミキサー (platform/mixer.h) の、いま出ているもの
+    unsigned m_MixerSeqLoaded = 0;          // 写した MixerBox の版の番号
     unsigned m_MsgSeqLoaded = 0;            // s_MsgShown に写した版の番号
     u64 m_MsgDeadline = 0;                  // s_MsgShown を消す時刻 (CTimer::GetClockTicks64()。0 なら消すまで出す)
     // コア 0 だけが触る: 消す時刻 (X68000 が止まっている間に、時刻が来たら最後の画面を写し直すため。0 ならない) と、
     // 新しいメッセージを置いたので止まっている間でも写し直す
     u64 m_MsgExpireTicks = 0;
     bool m_MsgRedraw = false;
+    u64 m_MsgUntil = 0; // 最後のメッセージを消す時刻 (0 なら消すまで出す)
     static constexpr int ScaleLinePixels = 4096;
     // 前に写した X68000 の画面の写し。変わっていない行はフレームバッファに書かない (platform/frame_scale.h)。
     // フレームバッファを ShowFrame() 以外で書いたとき (メニュー) は valid を false にする

@@ -100,6 +100,16 @@ public:
         return true;
     }
     bool has020() const override { return cpu020; }
+    const char* prevVersion = nullptr;
+    int rollBacks = 0;
+    bool rollBackOk = true, rollBackGone = true;
+    const char* rollbackVersion() const override { return prevVersion; }
+    bool rollBack(MenuText& msg) override {
+        rollBacks++;
+        msg.add(rollBackOk ? "rolled back" : "has changed");
+        if (!rollBackOk && rollBackGone) prevVersion = nullptr;
+        return rollBackOk;
+    }
     // 実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクが入っているドライブ
     bool realFloppy[2] = {false, false};
     int imageSaves = 0, lastImageDrive = -1;
@@ -123,6 +133,74 @@ bool moveTo(Menu& m, const char* label) {
     printf("  no item %s\n", label);
     failures++;
     return false;
+}
+
+// 前の版に戻す。はじめは No
+void testRollback() {
+    printf("rollback\n");
+    FakeHost host;
+    Menu m(host);
+    m.open(Settings(), Settings());
+    for (int i = 0; i < 40; i++) {
+        CHECK_EQ(strcmp(m.currentLabel(), "Roll back") != 0, true); // 戻せる版がなければ出ない
+        m.key(mk::DOWN);
+    }
+    host.prevVersion = "v0.2.4";
+    m.open(Settings(), Settings());
+    CHECK_EQ(moveTo(m, "Roll back"), true);
+    m.key(mk::RIGHT); // ←→ では何もしない
+    CHECK_EQ(strcmp(m.currentLabel(), "Roll back"), 0);
+    m.key(mk::ENTER);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::ENTER);
+    CHECK_EQ(strcmp(m.currentLabel(), "Roll back"), 0);
+    m.key(mk::ENTER);
+    m.key(mk::DOWN);
+    m.key(mk::RIGHT);
+    m.key(mk::ESC);
+    CHECK_EQ(host.rollBacks, 0);
+    CHECK_EQ(m.isOpen(), true);
+    host.rollBackOk = false;
+    m.key(mk::ENTER);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0); // 毎回 No から
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.rollBacks, 1);
+    CHECK_EQ(m.isOpen(), true);
+    CHECK_EQ(m.restartRequested(), false);
+    CHECK_EQ(strcmp(m.currentLabel(), "FD0"), 0); // 隣の Restart に重ならない
+    // 項目が残る失敗 (SHA-256 の違い、書き戻せない) なら、カーソルは Roll back のまま
+    host.rollBackGone = false;
+    host.prevVersion = "v0.2.4";
+    moveTo(m, "Roll back");
+    m.key(mk::ENTER);
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.rollBacks, 2);
+    CHECK_EQ(strcmp(m.currentLabel(), "Roll back"), 0);
+    CHECK_EQ(m.isOpen(), true);
+    host.discard.arm(MENU_ACTION_ROLLBACK); // 書き戻せずに断った: 続けて選ぶと confirmed()
+    m.key(mk::ENTER);
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.discard.confirmed(), true);
+    host.discard.arm(MENU_ACTION_ROLLBACK); // No を選ぶと忘れる
+    m.key(mk::ENTER);
+    m.key(mk::ENTER);
+    m.key(mk::ENTER);
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.discard.confirmed(), false);
+    host.rollBacks = 1;
+    host.rollBackOk = true;
+    moveTo(m, "Roll back");
+    m.key(mk::ENTER);
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.rollBacks, 2);
+    CHECK_EQ(m.isOpen(), false);
+    CHECK_EQ(m.restartRequested(), true);
+    CHECK_EQ(host.restarts, 0); // pix68k.cfg は書かない
 }
 
 void testNavigate() {
@@ -786,6 +864,7 @@ void testScale() {
         } bh;
         Menu mb(bh);
         running = Settings();
+        running.videoScale = VIDEO_SCALE_INTEGER;
         running.videoFilter = CRT_SCANLINE;
         mb.open(running, saved);
         if (openDisplay(mb)) {
@@ -835,6 +914,7 @@ void testScale() {
         bh.noDe = true;
         bh.pi3 = true;
         running = Settings();
+        running.videoScale = VIDEO_SCALE_INTEGER;
         running.videoFilter = CRT_SCANLINE | CRT_BEZEL_DE;
         mb.open(running, saved);
         if (moveTo(mb, "Display"))
@@ -868,6 +948,7 @@ void testScale() {
         bh.pi3 = false;
         // hasBezel() が false の環境 (ホスト版) では出さず、Display の行にも枠の名前を出さない (枠なしで写している)
         running = Settings();
+        running.videoScale = VIDEO_SCALE_INTEGER;
         running.videoFilter = CRT_SCANLINE | CRT_BEZEL_DB;
         ms.open(running, saved);
         if (moveTo(ms, "Display")) CHECK_EQ(strcmp(ms.currentValue(buf, sizeof buf), "integer + scanline"), 0);
@@ -891,6 +972,52 @@ void testScale() {
     ms.key(mk::UP);
     ms.key(mk::UP);
     CHECK_EQ(strcmp(ms.currentLabel(), "Save settings"), 0);
+}
+
+// Gamepad setup は hasPadSetup() のとき (ベアメタル版) だけ出し、選ぶと閉じてから始める。主のページが 32 行になり、
+// 960x540 (31 行) では、選んでいる行が入るようにずらして出す
+void testPadSetup() {
+    printf("gamepad setup\n");
+    Settings s;
+    {
+        FakeHost h;
+        Menu m(h);
+        m.open(s, s);
+        int found = 0;
+        for (int i = 0; i < 40; i++, m.key(mk::DOWN)) found += strcmp(m.currentLabel(), "Gamepad setup") == 0;
+        CHECK_EQ(found, 0);
+    }
+    struct PadHost : FakeHost {
+        int starts = 0;
+        bool hasVideo() const override { return true; }
+        bool hasMixer() const override { return true; }
+        bool hasOsdBars() const override { return true; }
+        bool hasPadSetup() const override { return true; }
+        void startPadSetup() override { starts++; }
+    } h;
+    Menu m(h);
+    m.open(s, s);
+    // どの行を選んでいても、その行 (青) がすべての高さで見える
+    static uint32_t buf[960 * 540];
+    static const char* const kEnds[] = {"FD0", "Gamepad setup", "Close"};
+    for (const char* label : kEnds) {
+        CHECK_EQ(moveTo(m, label), 1);
+        for (size_t i = 0; i < sizeof buf / 4; i++) buf[i] = 0;
+        m.draw(buf, 960, 960, 540);
+        int sel = 0, rows = 0;
+        for (int y = 0; y < 540; y++) {
+            int n = 0;
+            for (int x = 0; x < 960; x++) n += buf[y * 960 + x] == 0x2050b0u;
+            sel += n;
+            rows += n > 0;
+        }
+        CHECK_EQ(sel > 0, 1);
+        CHECK_EQ(rows, 16); // 1 行の全体
+    }
+    CHECK_EQ(moveTo(m, "Gamepad setup"), 1);
+    m.key(mk::ENTER);
+    CHECK_EQ(h.starts, 1);
+    CHECK_EQ(m.isOpen(), 0);
 }
 
 // 画面の右下の使用率のバー (osd_bars=) の項目は、hasOsdBars() のとき (ベアメタル版) だけ出す。既定は off で、
@@ -1088,6 +1215,25 @@ void testOsdSound() {
     CHECK_EQ(st.soundSources, (unsigned)platform::OSD_SND_ALL);
     CHECK_EQ(st.soundActive, (unsigned)(platform::OSD_SND_PCM | platform::OSD_SND_MIDI));
     CHECK_EQ(st.midiOut, 4);
+    CHECK_EQ(st.midiFault, (int)platform::OSD_MIDI_OK);
+    // 用意できなかったとき (#362)。いちばん長い行も 48 バイトに入る
+    char line[48];
+    platform::soundSourcesLine(src, line, sizeof line);
+    CHECK_EQ(strcmp(line, "OPM ADPCM MERC(PCM+OPN3) MIDI:SC-55 CD"), 0);
+    src.midiFault = platform::OSD_MIDI_NO_FILE;
+    platform::osdSound(st, src, lv);
+    CHECK_EQ(st.midiFault, (int)platform::OSD_MIDI_NO_FILE);
+    platform::soundSourcesLine(src, line, sizeof line);
+    CHECK_EQ(strcmp(line, "OPM ADPCM MERC(PCM+OPN3) MIDI:SC-55 (no ROM) CD"), 0);
+    src.midiOut = 2; // none (鳴らさない設定) には理由を出さない
+    platform::soundSourcesLine(src, line, sizeof line);
+    CHECK_EQ(strcmp(line, "OPM ADPCM MERC(PCM+OPN3) MIDI:none CD"), 0);
+    src.midiOut = 4;
+    src.midiFault = platform::OSD_MIDI_OK;
+    platform::Settings ms;
+    ms.midiOut = 3;
+    CHECK_EQ(platform::soundSources(ms, platform::OSD_MIDI_FAILED).midiFault, (int)platform::OSD_MIDI_FAILED);
+    CHECK_EQ(platform::soundSources(ms).midiFault, (int)platform::OSD_MIDI_OK);
     lv = {};
     lv.swing[S::SWING_OPN] = 100;
     lv.swing[S::SWING_CD] = 100;
@@ -1912,9 +2058,11 @@ int main() {
     testOsdSound();
     testSoundPercent();
     testOsd();
+    testPadSetup();
     testOsdBars();
     testDiscardConfirm();
     testNavigate();
+    testRollback();
     testDisks();
     testJapaneseNames();
     testActions();

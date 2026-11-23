@@ -59,7 +59,7 @@ rm -rf "$STAGE" "$ZIP"
 
 # 1. ベアメタル版のビルド
 for n in 2 3 4 5; do
-  tools/build_baremetal.sh "$n"
+  PIX68K_VERSION=$VERSION tools/build_baremetal.sh "$n"
 done
 mkdir -p "$STAGE/pix68k" "$STAGE/overlays" "$STAGE/licenses"
 cp build/baremetal-raspi2/app/kernel7.img "$STAGE/"
@@ -149,20 +149,23 @@ fi
 #    pix68k が動かない機種 (Zero 2 W) の節は入れない。
 #    [pi2] は 32 ビットのカーネル (kernel7.img、0x8000 に読む)。Pi 2 のカーネルは、1920x1080 ではフレームバッファを 960x540 にして
 #    2 倍の拡大を GPU に任せる (baremetal/kernel.cpp の InitScreen()。#302)。scaling_kernel=8 は、その拡大を最近傍にする
-#    (実機のモニタで、文字の輪郭がにじまないことを確かめた)。disable_overscan=1 がないと、Pi 2 のファームウェアは画面の縁を
-#    48 画素ずつ空け、表示の大きさが 2 で割り切れても 768x512 が入らなくなる
+#    (実機のモニタで、文字の輪郭がにじまないことを確かめた)。
+#    disable_overscan=1 はどの機種にも書く (#365)。ないと、Pi のファームウェアは画面の縁を 48 画素ずつ空けることがあり、
+#    1920x1080 のフレームバッファが 1824x984 になって、X68000 の画面が小さく出る (integer では 2 倍の 1536x1024 が入らず 1 倍になる)。
+#    Pi 2 はさらに、半分の 912x492 に 768x512 が入らないので、GPU の 2 倍の拡大をやめて 1 倍になる。Pi 5 は、行を消しても変わらない
 cat > "$STAGE/config.txt" <<'EOF'
 # pix68k の config.txt (Circle の boot/config64.txt をもとにしたもの)
 arm_64bit=1
 kernel_address=0x80000
 initial_turbo=0
+# 画面の縁を空けない (端が欠けるテレビでの戻し方は機種で違う。docs/baremetal.md の「ファームウェアの設定」)
+disable_overscan=1
 
 # Raspberry Pi 2 Model B (32 ビット。X68000 の 68000 の機種だけ)
 [pi2]
 arm_64bit=0
 kernel_address=0x8000
 kernel=kernel7.img
-disable_overscan=1
 scaling_kernel=8
 
 [pi3]

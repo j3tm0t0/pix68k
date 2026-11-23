@@ -43,6 +43,15 @@ func exitCode(err error) int {
 	return exitError
 }
 
+// Pi が 2xx 以外で答えた (終了コードは cliError)
+type replyError struct {
+	*cliError
+	status int
+	body   string
+}
+
+func (e *replyError) Unwrap() error { return e.cliError }
+
 // 口が 2xx 以外を返したときの誤り。本文 (口の英語の説明) をそのまま添える
 type httpError struct {
 	host   string
@@ -178,7 +187,7 @@ func (c *Client) do(ctx context.Context, r reqSpec) (*http.Response, context.Can
 		resp.Body.Close()
 		cancel()
 		p := u.Path
-		return nil, nil, &cliError{statusExit(resp.StatusCode), (&httpError{c.target.Host, r.method, p, resp.StatusCode, string(b)}).Error()}
+		return nil, nil, &replyError{&cliError{statusExit(resp.StatusCode), (&httpError{c.target.Host, r.method, p, resp.StatusCode, string(b)}).Error()}, resp.StatusCode, string(b)}
 	}
 	return resp, cancel, nil
 }

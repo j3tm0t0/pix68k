@@ -94,7 +94,7 @@ func (a *app) cmdStatus(ctx context.Context, c *Client, args []string) error {
 	for _, f := range []struct{ marker, name string }{
 		{"/files/", "files"}, {"/log", "log"}, {"/thermal", "thermal"}, {"/screen.ppm", "screen"},
 		{"/reboot", "reboot"}, {"/reboot?profile=", "reboot-profile"}, {"/type", "type"}, {"/key", "key"},
-		{"/message", "message"},
+		{"/message", "message"}, {"/version", "version"}, {"/sha256/", "sha256"},
 	} {
 		if bytes.Contains(help, []byte(f.marker)) {
 			feats = append(feats, f.name)

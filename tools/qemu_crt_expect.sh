@@ -21,8 +21,9 @@
 #
 # video_resolve <scale> <crt> <scanline> <video_filter> <video_scale>
 #   最後の値を「video_scale の名前 video_filter のビット」で出す (ビットは scanline 1、curve 2、mask 4)。空は書かない行
+#   (video_scale も scale もなければ既定の aspect。QEMU は raspi3b なので Pi 2 の integer は見ない)
 video_resolve() {
-  _vs=integer _vf=0
+  _vs=aspect _vf=0
   case "${1:-}" in off) _vs=off ;; auto) _vs=integer ;; esac
   case "${3:-}" in on) _vf=1 ;; off) _vf=0 ;; esac
   if [ -n "${4:-}" ]; then

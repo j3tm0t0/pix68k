@@ -653,7 +653,7 @@ inline uint32_t* crtRenderRow(const CrtMap& m, const uint32_t* src, int srcPitch
 
 // src (1 行 srcPitch 画素) を、m の効果を掛けて fb (1 行 fbPitch バイト) に写す。s は computeFrameScale() の結果で、
 // m は (s.srcW, s.srcH, s.dstW, s.dstH) で作った表。lineA と lineB は s.dstW + 3 画素以上のふつうのメモリ。
-// ov、ov2、ov3、cache は presentScaled() と同じ (cache があれば、使う元の行が前に写したときと同じ行は書かない)。
+// ov、ov2、ov3、ov4、cache は presentScaled() と同じ (cache があれば、使う元の行が前に写したときと同じ行は書かない)。
 // 書く画素は、どの行も crtRenderRow() と同じ。
 // bezel があれば (モニタの枠。platform/bezel.h)、各行の左の bezel->left[y] 画素と、bezel->right[y] から右は、写した行の
 // 代わりに枠の絵を書く (重ねる絵よりも枠が前)
@@ -668,12 +668,13 @@ template <class Store = DeviceStore>
 inline void presentCrt(const uint32_t* src, int srcPitch, uint8_t* fb, size_t fbPitch, const FrameScale& s,
                        const CrtMap& m, uint32_t* lineA, uint32_t* lineB, const FrameOverlay* ov = nullptr,
                        FrameRowCache* cache = nullptr, const FrameOverlay* ov2 = nullptr,
-                       const CrtBezel* bezel = nullptr, const FrameOverlay* ov3 = nullptr) {
+                       const CrtBezel* bezel = nullptr, const FrameOverlay* ov3 = nullptr,
+                       const FrameOverlay* ov4 = nullptr) {
     if (!m.matches(m.preset, s.srcW, s.srcH, s.dstW, s.dstH)) return;
     if (bezel != nullptr && bezel->pixels == nullptr) bezel = nullptr;
     using Span = frame_scale_detail::OverlaySpan;
     Span spans[frame_scale_detail::MAX_OVERLAYS];
-    const FrameOverlay* const ovs[frame_scale_detail::MAX_OVERLAYS] = {ov, ov2, ov3};
+    const FrameOverlay* const ovs[frame_scale_detail::MAX_OVERLAYS] = {ov, ov2, ov3, ov4};
     const int nspans = frame_scale_detail::overlaySpans(ovs, frame_scale_detail::MAX_OVERLAYS, s, spans);
     if (cache != nullptr && (cache->pixels == nullptr || s.srcX + s.srcW > cache->pitch || s.srcY + s.srcH > cache->rows))
         cache = nullptr;

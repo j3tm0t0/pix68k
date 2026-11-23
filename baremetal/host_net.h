@@ -10,6 +10,9 @@
 //                                        platform/net_files.h)。X68000 が使っているディスクのイメージは断る (409)。
 //                                        /pix68k の直下に置くときは、/pix68k がなければ作る (ほかのディレクトリは
 //                                        作らず 404)
+//              GET  /sha256/<パス>       ファイルの SHA-256 と大きさ (書いたファイルを確かめる。/files と同じトークン)
+//              GET  /version             版、コミット、機種
+//              POST /config/kernel       config.txt の kernel= の値だけを替える (platform/config_kernel.h)
 //              GET  /log                 起動からのログ (最新 64KB。UART と同じ内容)
 //              GET  /ts6bga.ppm         TS-6BGA の仮想VRAM (PPM)
 //              GET  /screen2.ppm        第2 HDMI の選択中ソース (PPM)
@@ -42,6 +45,7 @@
 #include <circle/string.h>
 #include <circle/types.h>
 
+#include "platform/mixer_web.h"
 #include "platform/boot_profile.h"
 #include "platform/net_files.h"
 #include "platform/serial_ring.h"
@@ -97,6 +101,15 @@ public:
     // buf に写して大きさを返す (GET /fd0.xdf、/fd1.xdf。#287)。入っていない、capacity が足りないなら 0。
     // buf が nullptr なら、写さずに大きさだけを返す (HEAD)
     virtual unsigned netFloppyImage(int drive, u8* buf, unsigned capacity) = 0;
+    // FUK のディスクの読み出し (#381)。頼むだけで、読むのは主ループ (X68000 を止めて)
+    enum class FukReadReply { STARTED, NO_FUK, BUSY, NO_MEMORY };
+    // id は読み出しの番号 (頼むたびに変わる)。ほかの人が頼んだ読み出しと取り違えないように使う
+    virtual FukReadReply netFukRead(int drive, unsigned& id) = 0;
+    virtual unsigned netFukId() = 0;                        // 最後に頼まれた読み出しの番号 (まだなければ 0)
+    virtual void netFukCancel() = 0;
+    virtual void netFukStatus(CString& out) = 0;            // 名前=値 を 1 行ずつ
+    // 読み終えたイメージ。なければ nullptr。次に netFukRead() を頼むまで変わらない
+    virtual const u8* netFukImage(unsigned& bytes) = 0;
     // bytes バイトのバッファを確保してよいか (ヒープの空きを見る)
     virtual bool netCanAllocate(unsigned bytes) = 0;
     virtual void netRequestReboot() = 0;                    // 少し後に再起動する (応答を送り終えるため)
@@ -107,11 +120,18 @@ public:
     virtual unsigned netLog(char* out) = 0;                 // CLogRing::Snapshot()
     virtual unsigned netLogRead(u64& pos, char* out, unsigned max, u64& lost) = 0; // CLogRing::ReadFrom()
     virtual void netThermal(CString& out) = 0;              // 温度、クロック、ファン (名前=値 を 1 行ずつ)
+    virtual void netVersion(CString& out) = 0;              // 版、コミット、機種など (名前=値 を 1 行ずつ)
+    // config.txt で、この機種に当てはまる機種の見出し ("pi4"、"pi400" など。nullptr で終わる)。分からない機種なら nullptr
+    virtual const char* const* netConfigSections() = 0;
     // RS-232C の相手のリング (rs232c=tcp:PORT のとき、X68000 を動かす前に作ってつないだもの)。なければ nullptr
     virtual NetSerialLink* netSerialLink() = 0;
     // 画面の左上に text (エスケープを戻した UTF-8、n バイト) を sec 秒 (0 なら消すまで) 出す。n が 0 なら消す
     // (platform/osd_message.h)。メモリを確保できなければ false
     virtual bool netMessage(const char* text, unsigned n, unsigned sec) = 0;
+    // 音を鳴らしたまま変えるミキサー (platform/mixer_web.h。#364)。X68000 がまだ動いていなければ false
+    virtual bool netMixerJson(char* out, unsigned size) = 0;
+    virtual bool netMixerSet(int group, int dB) = 0;
+    virtual platform::WebSave* netMixerSave() = 0; // 主ループへの保存の頼み
 };
 
 class CHttpTask;

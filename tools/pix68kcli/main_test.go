@@ -71,7 +71,7 @@ func (f *fakeServer) runCtx(ctx context.Context, stdin string, env map[string]st
 	if _, ok := env["XDG_CONFIG_HOME"]; !ok {
 		env["XDG_CONFIG_HOME"] = f.t.TempDir() // 設定ファイルはない
 	}
-	a := &app{&out, &errb, strings.NewReader(stdin), func(k string) string { return env[k] }}
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(stdin), getenv: func(k string) string { return env[k] }}
 	full := append([]string{"--host", f.host()}, args...)
 	code := a.run(ctx, full)
 	return code, out.String(), errb.String()
@@ -441,7 +441,7 @@ func TestConnectFailure(t *testing.T) {
 	f.srv.Close()
 	var out, errb bytes.Buffer
 	dir := t.TempDir() // 手元の ~/.config を読まない
-	a := &app{&out, &errb, strings.NewReader(""), func(k string) string {
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string {
 		if k == "XDG_CONFIG_HOME" {
 			return dir
 		}
@@ -532,7 +532,7 @@ func TestConfigFile(t *testing.T) {
 	os.WriteFile(cfg, []byte(fmt.Sprintf(`{"default":"pi3","hosts":{"pi3":{"host":%q,"token_file":%q}}}`, f.host(), tok)), 0o600)
 	var out, errb bytes.Buffer
 	env := map[string]string{}
-	a := &app{&out, &errb, strings.NewReader(""), func(k string) string { return env[k] }}
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string { return env[k] }}
 	// default を使う
 	if code := a.run(context.Background(), []string{"--config", cfg, "files", "ls"}); code != 0 {
 		t.Fatal(code, errb.String())
@@ -578,7 +578,7 @@ func TestConfigFile(t *testing.T) {
 func TestNoHost(t *testing.T) {
 	var out, errb bytes.Buffer
 	dir := t.TempDir()
-	a := &app{&out, &errb, strings.NewReader(""), func(k string) string {
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string {
 		if k == "PIX68KCLI_CONFIG" {
 			return ""
 		}
@@ -805,7 +805,7 @@ func TestTokenPriority(t *testing.T) {
 		{cfg2, map[string]string{}, nil, "from-cfg"},
 	} {
 		var out, errb bytes.Buffer
-		a := &app{&out, &errb, strings.NewReader(""), func(k string) string { return c.env[k] }}
+		a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string { return c.env[k] }}
 		f.reqs = nil
 		args := append(append([]string{"--config", c.cfg}, c.args...), "files", "ls")
 		if code := a.run(context.Background(), args); code != 0 {
@@ -818,7 +818,7 @@ func TestTokenPriority(t *testing.T) {
 	// 宛先: --host > PIX68K_HOST > default
 	other := newFake(t, ok("y\n"))
 	var out, errb bytes.Buffer
-	a := &app{&out, &errb, strings.NewReader(""), func(k string) string {
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string {
 		if k == "PIX68K_HOST" {
 			return other.host()
 		}
@@ -935,7 +935,7 @@ func TestBlankEnvToken(t *testing.T) {
 	cfg := filepath.Join(dir, "c.json")
 	os.WriteFile(cfg, []byte(fmt.Sprintf(`{"default":"p","hosts":{"p":{"host":%q,"token":%q}}}`, f.host(), testToken)), 0o600)
 	var out, errb bytes.Buffer
-	a := &app{&out, &errb, strings.NewReader(""), func(k string) string {
+	a := &app{stdout: &out, stderr: &errb, stdin: strings.NewReader(""), getenv: func(k string) string {
 		if k == "PIX68K_TOKEN" {
 			return "  \n"
 		}

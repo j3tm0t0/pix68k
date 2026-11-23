@@ -27,6 +27,8 @@ else
   PREFIX=${PREFIX64:-aarch64-elf-}
 fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# USB-FDD の実物のディスクに書く関数 (#386) は Pi 4 / Pi 5 だけに入れる (使うには pix68k.cfg の experimental_usb_fdd_write= が要る)
+case $N in 4|5) UFD_WRITE=1 ;; *) UFD_WRITE= ;; esac
 OUT=$ROOT/build/baremetal-raspi$N${QEMU:+-qemu}
 mkdir -p "$OUT"
 # 前のビルドのイメージを先に消す。途中のどこで失敗しても (Circle の設定、ライブラリ、アプリ、最後の _end の検査)、
@@ -44,7 +46,7 @@ rsync -a --delete --exclude .git \
   --exclude /lib/dmachannel.cpp --exclude /lib/dma4channel.cpp --exclude /lib/sound/dmasoundbuffers.cpp \
   --exclude /lib/usb/xhcirootport.cpp --exclude /lib/usb/usbstandardhub.cpp --exclude /lib/usb/xhcicommandmanager.cpp \
   --exclude /include/circle/usb/xhcicommandmanager.h --exclude /lib/usb/xhciusbdevice.cpp --exclude /lib/usb/usbdevice.cpp \
-  --exclude /lib/bcm54213.cpp \
+  --exclude /lib/bcm54213.cpp --exclude /include/circle/usb/pix68k_ufi_gate.h \
   "$ROOT/external/circle/" "$OUT/circle/"
 cd "$OUT/circle"
 # FatFs の設定は tools/ffconf_patch.sh で書き換える (fast seek、UTF-8 のファイル名など。理由はそちらに書いた)。
@@ -114,7 +116,11 @@ UFDCPP=lib/usb/usbfloppydevice.cpp
 UFDH=include/circle/usb/usbfloppydevice.h
 XHCIEP=lib/usb/xhciendpoint.cpp
 sh "$ROOT/tools/circle_ufd_patch.sh" "$ROOT/external/circle/$UFDCPP" "$UFDCPP.tmp" "$ROOT/external/circle/$UFDH" "$UFDH.tmp" \
-  "$ROOT/external/circle/$XHCIEP" "$XHCIEP.tmp"
+  "$ROOT/external/circle/$XHCIEP" "$XHCIEP.tmp" ${UFD_WRITE:+"$ROOT/baremetal/ufd_write.inc"}
+UFDGATE=include/circle/usb/pix68k_ufi_gate.h
+if [ -n "$UFD_WRITE" ]; then
+  cmp -s "$ROOT/src/platform/ufi_gate.h" "$UFDGATE" || cp "$ROOT/src/platform/ufi_gate.h" "$UFDGATE"
+fi
 for f in "$UFDCPP" "$UFDH" "$XHCIEP"; do
   if cmp -s "$f.tmp" "$f"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; fi
 done
@@ -196,7 +202,7 @@ if [ "$N" = 2 ] && [ -n "$LINUX_GCC" ]; then
   exit 1
 fi
 # 設定 (shim の場所を含む) が変わったときだけ作り直す
-CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1 ufd1024=1 dmaresync=3 hotplug308=2 fuk295=1${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
+CONFIG="$OPTS shim=$SHIM depth=32 fastseek=1 nocalibrate=1 msdelayhook=1 qemudwc2nak=1 qemuudpclosed=1 ufd1024=1 dmaresync=3 hotplug308=2 fuk295=1${UFD_WRITE:+ ufdwrite=1}${LINUX_GCC:+ nooutlineatomics=1 nounwind=1 nopie=1}"
 if [ ! -f .pix68k-config ] || [ "$(cat .pix68k-config)" != "$CONFIG" ]; then
   # 設定をやり直している間は .pix68k-config を置かない。途中で失敗したとき、次のビルドが前の設定のまま
   # configure を飛ばさないようにする (書くのは、この if の最後まで成功したとき)
@@ -246,6 +252,12 @@ for d in $ADDONS; do make -C "$d" -j8 >/dev/null; done
 
 # アプリは毎回写し直す (--delete で app/ の生成物も消えるので、毎回すべてビルドし直す。3 ファイルなので数秒)
 rsync -a --delete "$ROOT/baremetal/" "$OUT/app/"
+# 起動時のログと GET /version に出す版とコミット (baremetal/kernel.cpp が読む)。版は PIX68K_VERSION (tools/make_release.sh が
+# 渡す)、なければ git describe。git が使えなければ unknown。文字列に書けない文字は _ にする
+VER=${PIX68K_VERSION:-$(git -C "$ROOT" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)}
+COMMIT=$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null || echo unknown)
+VER=$(printf %s "$VER" | tr -c 'A-Za-z0-9._+-' _)
+printf '#define PIX68K_VERSION "%s"\n#define PIX68K_COMMIT "%s"\n' "$VER" "$COMMIT" > "$OUT/app/build_info.h"
 # 68030 / 68060 のコアは Pi 3 / Pi 4 / Pi 5 のすべてに入れる。PIX68K_CPU020=0 を付けて実行すると入れない (68000 だけ)
 # Pi 2 版にはどちらも入れず、数値演算プロセッサボードも入れない (このファイルの先頭の説明を参照)
 if [ "$N" = 2 ]; then

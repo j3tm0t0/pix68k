@@ -175,6 +175,8 @@ int CKernel::RunBootMenu(const platform::ProfileList& list, int initial) {
     if (m_pBootCgrom == nullptr) m_pBootCgrom = ReadRom("CGROM.DAT", x68k::Machine::CG_SIZE);
     platform::BootMenu menu;
     menu.open(&list, initial, NowMs(), (uint32_t)m_Settings.profileWait * 1000);
+    FindRollback();
+    menu.setRollback(rollbackVersion());
     DrawBootMenu(menu);
     m_MenuKeyHead = m_MenuKeyTail = 0;
     memset(m_BootMenuHeld, 0, sizeof m_BootMenuHeld);
@@ -189,7 +191,7 @@ int CKernel::RunBootMenu(const platform::ProfileList& list, int initial) {
     platform::PadStartFilter pads[2] = {platform::PadStartFilter(CLOCKHZ * 3 / 10),
                                         platform::PadStartFilter(CLOCKHZ * 3 / 10)};
     for (auto& p : pads) p.start(CTimer::GetClockTicks64());
-    int shownSeconds = -2, shownCursor = -1, row = -1;
+    int shownSeconds = -2, shownCursor = -1, shownAsk = 0, row = -1;
     while (row < 0) {
         UpdateUsbDevices();
         KeepAlive();
@@ -209,8 +211,25 @@ int CKernel::RunBootMenu(const platform::ProfileList& list, int initial) {
             for (int i = 0; i < n && row < 0; i++) row = menu.key(keys[i]);
         }
         const uint32_t now = NowMs();
+        if (row == platform::BootMenu::ROW_ROLLBACK) {
+            // 前の版に戻す (update_menu.cpp)。だめなら理由を出してメニューに戻る
+            char buf[64];
+            platform::MenuText msg(buf, sizeof buf);
+            if (RollBack(msg)) {
+                m_Logger.Write(FromProfile, LogNotice, "restarting (%s)", buf);
+                if (m_DeploySeconds != 0) FinishDeploy(false);
+                reboot();
+            }
+            menu.setRollback(rollbackVersion());
+            menu.setNote(buf);
+            shownCursor = -1;
+            row = -1;
+        }
         if (row < 0) row = menu.tick(now);
-        if (row < 0 && (menu.secondsLeft(now) != shownSeconds || menu.cursor() != shownCursor)) {
+        // 確かめている間と、戻せなかった理由を出している間は、カーソルが動かなくても描き直す
+        const int ask = menu.asking() ? (menu.yes() ? 2 : 1) : menu.hasNote() ? 3 : 0;
+        if (row < 0 && (menu.secondsLeft(now) != shownSeconds || menu.cursor() != shownCursor || ask != shownAsk)) {
+            shownAsk = ask;
             shownSeconds = menu.secondsLeft(now);
             shownCursor = menu.cursor();
             DrawBootMenu(menu);
@@ -296,9 +315,9 @@ void CKernel::StartAutoType() {
     m_Logger.Write(FromProfile, LogNotice, "autotype: %u characters in %d s", (unsigned)n, m_Settings.autotypeWait);
 }
 
-// 主ループから呼ぶ。設定メニューを開いている間は打たない
+// 主ループから呼ぶ。設定メニューかミキサーを開いている間は打たない
 void CKernel::ServiceAutoType() {
-    if (!m_AutoTyper.active() || m_MenuActive) return;
+    if (!m_AutoTyper.active() || InputToMenu()) return;
     const uint32_t now = NowMs();
     u8 mods, usage;
     while (m_AutoTyper.poll(now, mods, usage)) {

@@ -14,6 +14,7 @@ void FloppyImage::unload() {
     data_ = nullptr;
     size_ = 0;
     dirty_.clearAll();
+    __atomic_store_n(&bootChanged_, 0u, __ATOMIC_RELAXED);
     for (int t = 0; t < MAX_TRACKS; t++) {
         trackFirst_[t] = 0;
         trackCount_[t] = 0;
@@ -228,6 +229,21 @@ void FloppyImage::setMark(const Sector* sector, bool deleted) {
         h[8] = 0x00;
     }
     markDirty(&s);
+}
+
+void FloppyImage::noteWrite(const Sector* s, const uint8_t* bytes, uint32_t len, uint8_t fill) {
+    // 先頭のトラックの R = 1 のセクタだけを見る。1 セクタ 512 バイトの FAT のディスクでは R = 2 が FAT の先頭のことがあり、
+    // R = 2 まで見るとファイルを書くだけで知らせてしまう
+    const int count = sectorCount(0);
+    if (count == 0 || s < sectors_ + trackFirst_[0] || s >= sectors_ + trackFirst_[0] + count || s->r != 1) return;
+    if (len > s->size) len = s->size;
+    if (len > 1024) len = 1024;
+    const uint8_t* now = data(s);
+    for (uint32_t i = 0; i < len; i++) {
+        if (now[i] == (bytes ? bytes[i] : fill)) continue;
+        __atomic_store_n(&bootChanged_, 1u, __ATOMIC_RELEASE);
+        return;
+    }
 }
 
 int FloppyImage::sectorCount(int track) const {

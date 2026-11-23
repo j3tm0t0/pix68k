@@ -26,10 +26,12 @@
 #     30 秒まで待つ転送の待ちのループでは、g_pPix68kXHCIWaitHook があれば呼ぶ (pix68k がウォッチドッグを延ばす)
 #   - 送るコマンドの制限: Command() の入口で、INQUIRY、TEST UNIT READY、REQUEST SENSE、READ CAPACITY、READ(10) 以外と、
 #     装置へデータを送る (データアウトの) 要求を断る。書き込みやフォーマットにあたるコマンドは、どこから呼ばれても送らない
+# 7 つ目の引数 (baremetal/ufd_write.inc) があれば (Pi 4 / Pi 5。#386)、上の書き換えを
+# 全部したあとで、その中身を .cpp の終わりに足し、.h にメンバを足す。元の関数は読み取り専用のままで、書けるのは足した関数だけ
 # 関数の頭に行を足すところは、関数の名前の行のすぐ次が "{" だけの行であることを確かめる (Circle の書き方が変わって
 # "{" が別のところに移ったら、次の関数に足してしまわずに失敗する)。
 set -eu
-[ $# -eq 6 ] || { echo "usage: $0 <usbfloppydevice.cpp> <out.cpp> <usbfloppydevice.h> <out.h> <xhciendpoint.cpp> <out.cpp>" >&2; exit 2; }
+[ $# -eq 6 ] || [ $# -eq 7 ] || { echo "usage: $0 <usbfloppydevice.cpp> <out.cpp> <usbfloppydevice.h> <out.h> <xhciendpoint.cpp> <out.cpp> [ufd_write.inc]" >&2; exit 2; }
 awk '
   # 関数の名前の行の次の行: "{" だけでなければ失敗。そうなら "{" のあとに ins を足す
   want != "" {
@@ -150,3 +152,37 @@ awk '
   { echo "$5: the lines to patch were not found (From, the 3*HZ timeout)" >&2; exit 1; }
 # 書き込みの命令 (SCSI_OP_WRITE) を使うのは TryWrite() だけで、その前に return が入っていること
 [ "$(grep -c 'OperationCode[[:space:]]*= SCSI_OP_WRITE;' "$2")" = 1 ] || { echo "$2: SCSI_OP_WRITE is used in more than one place" >&2; exit 1; }
+[ $# -eq 7 ] || exit 0
+cat "$7" >> "$2"
+awk '
+  $0 == "#include <circle/types.h>" { print; print "#include \"pix68k_ufi_gate.h\"\t// pix68k (#386)"; n1++; next }
+  $0 == "\tu64 GetSize (void) const;" {
+    print
+    print "\t// pix68k (#386)"
+    print "\tboolean Pix68kArmWrite (u32 nBlock, u32 nCount);"
+    print "\tint Pix68kCommand (const u8 *pCmdBlk, void *pBuffer, size_t nBufLen, boolean bIn, u8 *pStatus, int *pBytes);"
+    n2++; next
+  }
+  $0 == "\tunsigned m_nBlockCount;" {
+    print
+    print "\tplatform::UfiGate m_Pix68kGate;\t// pix68k (#386)"
+    print "\tboolean m_bPix68kBroken = FALSE;"
+    print "\tboolean m_bPix68kArmed = FALSE;"
+    print "\tu8 *m_pPix68kBuffer = 0;"
+    print "\tu8 *m_pPix68kSmall = 0;"
+    n3++; next
+  }
+  { print }
+  END { if (n1 != 1 || n2 != 1 || n3 != 1) exit 1 }' "$4" > "$4.w" ||
+  { echo "$3: the lines to patch were not found (types.h, GetSize, m_nBlockCount)" >&2; exit 1; }
+mv "$4.w" "$4"
+# 転送を断られた (STALL、完了コード 6) ことを、ほかの失敗と見分けられるようにする (制御転送だけ。
+# ほかの転送の USBErrorUnknown を見ているドライバがあるため)
+awk '
+  $0 == "\t\tCLogger::Get ()->Write (From, LogWarning, \"Transfer error %u on endpoint %u\"," {
+    print "\t\tif (uchCompletionCode == 6 && pURB->GetEndpoint ()->GetType () == EndpointTypeControl) pURB->SetUSBError (USBErrorStall);\t// pix68k (#386): 6 = Stall Error (xHCI)"
+    n++
+  }
+  { print }
+  END { if (n != 1) exit 1 }' "$6" > "$6.w" || { echo "$5: the line to patch was not found (Transfer error)" >&2; exit 1; }
+mv "$6.w" "$6"

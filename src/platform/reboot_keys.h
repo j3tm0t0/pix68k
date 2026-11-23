@@ -82,6 +82,7 @@ public:
     void press() { __atomic_store_n(&pressed_, true, __ATOMIC_RELEASE); }
     // 押されていたら true を返し、受け取ったことにする (コア 0 の主ループ)
     bool take() { return __atomic_exchange_n(&pressed_, false, __ATOMIC_ACQ_REL); }
+    bool pressed() const { return __atomic_load_n(&pressed_, __ATOMIC_ACQUIRE); }
     // 書けなかった。true なら書かずに再起動してよい。false なら断った (now を覚え、それまでの押下を捨てた)
     bool refused(uint64_t now) {
         if (armed_ && now - armedAt_ <= window_) return true;

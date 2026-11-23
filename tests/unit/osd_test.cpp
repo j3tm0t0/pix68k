@@ -1559,6 +1559,52 @@ void testSoundRows() {
     s.midiOut = 1;
     formatOsdRows(text, packOsd(s), 9);
     CHECK_EQ(strncmp(text + 6 * OSD_V_COLS, "      MIDI:UART", OSD_V_COLS), 0);
+    // MIDI の音源を用意できなかったとき (#362): 鳴ったことになっていても灰色で、理由を出す。どちらの並びでも切れない
+    {
+        static const struct {
+            int out, fault;
+            const char *wide, *narrow;
+        } kRows[] = {
+            {3, OSD_MIDI_NO_FILE, " MT-32 (no ROM)", "MIDI:no ROM"}, {4, OSD_MIDI_NO_FILE, " SC-55 (no ROM)", "MIDI:no ROM"},
+            {0, OSD_MIDI_NO_FILE, "   SF2 (no SF2)", "MIDI:no SF2"}, {3, OSD_MIDI_FAILED, " MT-32 (failed)", "MIDI:failed"},
+            {1, OSD_MIDI_FAILED, "  UART (failed)", "MIDI:failed"},  {1, OSD_MIDI_NO_FILE, "  UART (failed)", "MIDI:failed"},
+            {2, OSD_MIDI_NO_FILE, "      MIDI:none", "  MIDI:none"}, {3, OSD_MIDI_OK, "     MIDI:MT-32", " MIDI:MT-32"},
+        };
+        for (const auto& c : kRows) {
+            OsdStats f = s;
+            f.midiOut = c.out;
+            f.midiFault = c.fault;
+            f.soundActive = c.out != 2 && c.fault != OSD_MIDI_OK ? OSD_SND_ALL : 0;
+            const OsdValue fv = packOsd(f);
+            CHECK_EQ(unpackOsd(fv).midiFault, c.fault);
+            CHECK_EQ(osdRows(fv), 9); // 行の数は変わらない
+            for (int cols : {OSD_V_COLS, (int)OSD_V_ITEM}) {
+                formatOsdRows(text, fv, cols == OSD_V_COLS ? osdRows(fv) : osdRowsNarrow(fv), cols);
+                char row[OSD_V_COLS + 1];
+                for (int i = 0; i < cols; i++) {
+                    const unsigned char ch = (unsigned char)text[6 * cols + i];
+                    row[i] = (char)(ch & ~OSD_DIM_BIT);
+                    if (row[i] != ' ') CHECK_EQ((ch & OSD_DIM_BIT) != 0, true);
+                }
+                row[cols] = 0;
+                CHECK_EQ(strcmp(row, cols == OSD_V_COLS ? c.wide : c.narrow), 0);
+            }
+        }
+        OsdStats f = s;
+        f.midiOut = 3;
+        const OsdValue ok = packOsd(f);
+        f.midiFault = OSD_MIDI_NO_FILE;
+        CHECK_EQ(packOsd(f) != ok, true); // 用意できなかったことが分かれば描き直す
+        CHECK_EQ(unpackOsd(packOsd(f)).ipv4, s.ipv4);
+        f.soundSources = OSD_SND_OPM | OSD_SND_ADPCM; // MIDI ボードがなければ、値に入れない
+        CHECK_EQ(unpackOsd(packOsd(f)).midiFault, (int)OSD_MIDI_OK);
+        f.soundSources = OSD_SND_ALL;
+        f.midiFault = 9; // 範囲の外は入れない
+        CHECK_EQ(unpackOsd(packOsd(f)).midiFault, (int)OSD_MIDI_OK);
+        OsdValue bad = ok;
+        bad.c |= 3ull << 47;
+        CHECK_EQ(unpackOsd(bad).midiFault, (int)OSD_MIDI_FAILED);
+    }
     // 横 1 行には出さない
     char line[OSD_CHARS_MAX + 1], line0[OSD_CHARS_MAX + 1];
     formatOsd(line, v, OSD_CHARS);

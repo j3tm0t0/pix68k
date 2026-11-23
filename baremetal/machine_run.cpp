@@ -133,6 +133,7 @@
 
 #include "event_wait.h"
 #include "kernel.h"
+#include "platform/sha256.h"
 #include "platform/cue_sheet.h"
 #include "platform/disk_cache_size.h"
 #include "platform/disk_sync.h"
@@ -140,9 +141,12 @@
 #include "platform/floppy_image_save.h"
 #include "platform/net_config.h"
 #include "platform/net_files.h"
+#include "platform/ufd_write_config.h"
 #include "platform/real_floppy.h"
 #include "fuk_usb.h"
 #include "x68k/fuk.h"
+#include "platform/ufi_gate.h"
+#include "x68k/fuk_reader.h"
 #include "platform/setting_warning.h"
 #include "platform/mt32_synth.h"
 #include "platform/opn_rhythm.h"
@@ -181,6 +185,14 @@ struct MessageMem {
     alignas(16) uint32_t image[platform::MSG_IMAGE_PIXELS];
 };
 MessageMem* s_pMsg = nullptr;
+// 画面の左下のミキサー (platform/mixer.h) に使うメモリ (517KB)。初めて開いたときにコア 0 がヒープに確保し、一度確保したら放さない。
+// box はコア 0 が書き、写す役のコアが読む。view (写した中身) と image (絵) は写す役のコアだけが触る
+struct MixerMem {
+    platform::MixerBox box;
+    platform::MixerView view;
+    alignas(16) uint32_t image[platform::MIXER_IMAGE_PIXELS];
+};
+MixerMem* s_pMixer = nullptr;
 // ハードディスクのイメージは全体をメモリに読むので、大きさに上限を置く。
 // SASI のいちばん大きいドライブ (40MB、$27930 レコード = 41,627,648 バイト) が入る大きさにする
 const unsigned kMaxHardDiskBytes = 48u * 1024 * 1024;
@@ -604,6 +616,29 @@ FRESULT CKernel::LoadConfigText(const char* name, const char* tmpName, platform:
     return r == FR_OK && !loaded ? FR_NOT_ENOUGH_CORE : r;
 }
 
+// /pix68k/pads.txt (ゲームパッドのボタンの並び。platform/pad_map.h) を読む。なければ何もしない。
+// 書き直しの途中で止まって pads.new だけがあるときは、それを読む (これから入れる設定の画面が pads.new を使う)
+void CKernel::LoadPadMaps() {
+    CString txt, tmp;
+    txt.Format("%s/pix68k/pads.txt", m_BootDrive);
+    tmp.Format("%s/pix68k/pads.new", m_BootDrive);
+    u8* data = nullptr;
+    unsigned size = 0;
+    bool usedTmp = false;
+    const FRESULT r = ReadWithFallback(txt, tmp, data, size, usedTmp);
+    if (r == FR_NO_FILE || r == FR_NO_PATH) return;
+    const char* path = usedTmp ? (const char*)tmp : (const char*)txt;
+    if (r != FR_OK) {
+        m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d)", path, (int)r);
+        return;
+    }
+    m_PadMaps.load((const char*)data, size, [this, path](int line, const char* why) {
+        m_Logger.Write(FromMachine, LogWarning, "%s: line %d ignored: %s", path, line, why);
+    });
+    delete[] data;
+    m_Logger.Write(FromMachine, LogNotice, "%s: %d gamepad layout(s)", path, m_PadMaps.count());
+}
+
 // /pix68k/pix68k.cfg を読む。項目の表は platform/settings.h。
 // 書き直しの途中で止まって pix68k.cfg がなく pix68k.new だけがあるとき (SaveConfig() を参照) は、pix68k.new を読む。
 // /pix68k に起動の組み合わせ (pix68k-<名前>.cfg) があれば、選ばせてから (ChooseProfile())、pix68k.cfg の共通の項目と
@@ -612,6 +647,7 @@ void CKernel::ReadConfig() {
     platform::ConfigText base;
     CString path;
     FRESULT r = LoadConfigText("pix68k.cfg", "pix68k.new", base, path);
+    EnableUsbFloppyWrite(r == FR_OK, path, base);
     if (r == FR_OK) {
         m_Logger.Write(FromMachine, LogNotice, "%s", (const char*)path);
     } else if (r != FR_NO_FILE && r != FR_NO_PATH) {
@@ -634,6 +670,7 @@ void CKernel::ReadConfig() {
     // メニューのキーボードとゲームパッドは pix68k.cfg の keyboard= と hat= で読む
     ApplySettings();
     const int keyboard = m_Settings.keyboard, hat = m_Settings.hat;
+    LoadPadMaps(); // 組み合わせのメニューのために、USB のゲームパッドを探す前に読む
     ChooseProfile();
     const platform::ConfigText* fdText = &base;
     platform::ConfigText prof;
@@ -663,6 +700,29 @@ void CKernel::ReadConfig() {
     m_FileSettings = m_Settings;
     ApplySettings();
     ReapplyInputSettings(keyboard, hat);
+}
+
+// experimental_usb_fdd_write=usb-fdd:N: そのドライブの書き込みの命令を許す (#386。既定では閉じている。まだ書く手順はない)。
+// path は読んだファイル、base はその中身
+void CKernel::EnableUsbFloppyWrite(bool readOk, const char* path, const platform::ConfigText& base) {
+    CString cfg;
+    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);
+    char value[platform::ConfigText::MAX_LINE];
+    const int unit = platform::usbFddWriteUnitFrom(readOk, path, cfg, base, value, sizeof value);
+    if (unit == -1) return;
+    if (unit < 0) {
+        m_Logger.Write(FromMachine, LogWarning, "experimental_usb_fdd_write=%s: use usb-fdd:0 to usb-fdd:%d; not enabled", value,
+                       platform::REAL_FLOPPY_UNITS - 1);
+        return;
+    }
+#if RASPPI >= 4
+    platform::UfiGate::enable(unit);
+    m_Logger.Write(FromMachine, LogWarning,
+                   "EXPERIMENTAL: experimental_usb_fdd_write=usb-fdd:%d (this version has only the command layer and never writes)",
+                   unit);
+#else
+    m_Logger.Write(FromMachine, LogWarning, "experimental_usb_fdd_write=%s: needs a Pi 4 or Pi 5; not enabled", value);
+#endif
 }
 
 // 最高速モード (max_speed=on) の、今の CPU の速さ (既定のクロックの何 %) と、それをクロックに直した値をログに出す
@@ -1010,6 +1070,165 @@ void CKernel::ServiceFuk() {
                        "After a USB transfer error, unplug the device and plug it in again");
 }
 
+// ---- FUK のディスクの読み出し (#381。x68k/fuk_reader.h) ----
+// HTTP のタスク (コア 0) が頼み、主ループが X68000 を止めて読む。止めている間は Machine も Fuk もコア 0 が触ってよい
+// (emulator.h、fuk_usb.h)。読んでいる間に設定メニューを開けるが、閉じても X68000 は止めたまま (CloseMenu())。
+// メニューで X68000 をリセットすれば、FDC もリセットされるので、読み出しは失敗で終わる
+
+CHostNetEnv::FukReadReply CKernel::netFukRead(int drive, unsigned& id) {
+    if (m_pFuk == nullptr || m_pEmulator == nullptr) return FukReadReply::NO_FUK;
+    if (m_FukReading || m_FukReadRequest >= 0 || m_MenuActive || m_DeployHeld || m_RebootRequested ||
+        m_NetRebootAt != 0 || m_RebootRequest.pressed() || m_pEmulator->paused())
+        return FukReadReply::BUSY;
+    if (m_pFukImage == nullptr) {
+        if (!netCanAllocate(x68k::FukReader::IMAGE_BYTES)) return FukReadReply::NO_MEMORY;
+        m_pFukImage = new u8[x68k::FukReader::IMAGE_BYTES];
+        if (m_pFukImage == nullptr) return FukReadReply::NO_MEMORY;
+    }
+    if (m_pFukReader == nullptr) m_pFukReader = new x68k::FukReader(*m_pFuk);
+    m_FukReadPauseFailed = m_FukReadCancelled = false;
+    m_FukReadRequest = drive;
+    // 起動し直したあとの番号が、前の番号と同じにならないようにする (時計の下のほうを使う)
+    id = (unsigned)(CTimer::GetClockTicks64() & 0x7fffffff);
+    if (id == 0 || id == m_FukReadId) id = m_FukReadId + 1;
+    m_FukReadId = id;
+    return FukReadReply::STARTED;
+}
+
+void CKernel::netFukCancel() {
+    if (m_FukReadRequest >= 0) { // まだ始めていない
+        m_FukReadRequest = -1;
+        m_FukReadCancelled = true;
+    }
+    if (m_FukReading) m_pFukReader->cancel();
+}
+
+void CKernel::netFukStatus(CString& out) {
+    const char* state = m_pFuk == nullptr ? "none" : "idle";
+    char text[200] = "idle";
+    int tracks = 0;
+    unsigned retries = 0;
+    if (m_FukReadRequest >= 0) {
+        state = "reading";
+        strcpy(text, "starting");
+    } else if (m_FukReadCancelled) {
+        state = "failed";
+        strcpy(text, "cancelled");
+    } else if (m_FukReadPauseFailed) {
+        state = "failed";
+        strcpy(text, "the X68000 did not pause");
+    } else if (m_pFukReader != nullptr && m_pFukReader->state() != x68k::FukReader::IDLE) {
+        using R = x68k::FukReader;
+        const R::State s = m_pFukReader->state();
+        state = s == R::RUNNING ? "reading" : s == R::DONE ? "done" : "failed";
+        m_pFukReader->describe(text, sizeof text);
+        tracks = m_pFukReader->tracksDone();
+        retries = m_pFukReader->retries();
+    }
+    out.Format("state=%s\nid=%u\ntracks=%d\ntotal=%d\nretries=%u\nmessage=%s\n", state, m_FukReadId, tracks, x68k::FukReader::TRACKS, retries, text);
+    unsigned bytes = 0;
+    if (netFukImage(bytes) != nullptr) {
+        out.Append("sha256=");
+        out.Append(m_FukSha256);
+        out.Append("\n");
+    }
+}
+
+const u8* CKernel::netFukImage(unsigned& bytes) {
+    if (m_FukReading || m_FukReadRequest >= 0 || m_FukReadPauseFailed || m_FukReadCancelled || m_pFukReader == nullptr ||
+        m_pFukReader->state() != x68k::FukReader::DONE)
+        return nullptr;
+    bytes = x68k::FukReader::IMAGE_BYTES;
+    return m_pFukImage;
+}
+
+// 押しているキー、マウス、ゲームパッドを離したことにしてから (OpenMenu() と同じ)、X68000 を止める。読んでいる間の入力は捨てる
+bool CKernel::PauseForFukRead() {
+    Emulator* emu = m_pEmulator;
+    const u64 t0 = CTimer::GetClockTicks64();
+    EnterCritical();
+    m_Keys.releaseAll([emu](uint8_t u, bool d) { return emu->keyEvent(u, d); });
+    m_Mouse.releaseAll([emu](int x, int y, uint8_t b) { return emu->mouseEvent(x, y, b); });
+    LeaveCritical();
+    for (;;) {
+        EnterCritical();
+        m_Keys.resync([emu](uint8_t u, bool d) { return emu->keyEvent(u, d); });
+        m_Mouse.flush([emu](int x, int y, uint8_t b) { return emu->mouseEvent(x, y, b); });
+        for (int s = 0; s < 2; s++)
+            if (m_PadSent[s] != 0 && emu->joystickEvent(s, 0)) m_PadSent[s] = 0;
+        const bool done = !m_Keys.pending() && !m_Mouse.pending() && m_PadSent[0] == 0 && m_PadSent[1] == 0;
+        if (done) emu->setDiscardInput(true);
+        LeaveCritical();
+        if (done) break;
+        if (CTimer::GetClockTicks64() - t0 > 2 * CLOCKHZ) return false;
+        asm volatile("sev");
+    }
+    emu->requestPause(true);
+    while (!emu->paused()) {
+        asm volatile("sev");
+        if (CTimer::GetClockTicks64() - t0 > 5 * CLOCKHZ) {
+            emu->requestPause(false);
+            emu->setDiscardInput(false);
+            return false;
+        }
+    }
+    SilenceMidiUart(0);
+    return true;
+}
+
+void CKernel::FinishFukRead() {
+    char text[200];
+    m_pFukReader->describe(text, sizeof text);
+    m_Logger.Write(FromMachine, m_pFukReader->state() == x68k::FukReader::DONE ? LogNotice : LogWarning,
+                   "FUK read: %s (%d / %d tracks, %u retries)", text, m_pFukReader->tracksDone(),
+                   x68k::FukReader::TRACKS, m_pFukReader->retries());
+    if (m_pFukReader->state() == x68k::FukReader::DONE) { // 取り出した側が照合する
+        platform::Sha256 hash;
+        hash.update(m_pFukImage, x68k::FukReader::IMAGE_BYTES);
+        hash.finishHex(m_FukSha256);
+    }
+    m_FukReading = false;
+    netMessage("", 0, 0);
+    // メニューを開いている間は、閉じたときに動かし直す。deploy の再起動待ちと、Restart を選んだあと
+    // (ディスクのファイルは閉じてある) なら止めたまま
+    if (m_DeployHeld || m_RebootRequested) return;
+    EnterCritical();
+    m_pEmulator->setDiscardInput(false);
+    LeaveCritical();
+    if (m_MenuActive) return;
+    PublishOsd(platform::OsdValue());
+    m_OsdTicks = 0;
+    m_pEmulator->requestPause(false);
+    const u64 t0 = CTimer::GetClockTicks64();
+    while (m_pEmulator->paused() && CTimer::GetClockTicks64() - t0 < CLOCKHZ) asm volatile("sev");
+}
+
+void CKernel::ServiceFukRead() {
+    if (m_FukReadRequest >= 0) {
+        if (m_MenuActive) return; // メニューを開くところ。閉じてから始める
+        const int drive = m_FukReadRequest;
+        m_FukReadRequest = -1;
+        if (m_DeployHeld || !PauseForFukRead()) {
+            m_Logger.Write(FromMachine, LogWarning, "FUK read: cannot pause the X68000");
+            m_FukReadPauseFailed = true;
+            return;
+        }
+        m_Logger.Write(FromMachine, LogNotice, "FUK read: drive %d (X68000 paused)", drive);
+        static const char kMessage[] = "FUK: reading the disk (X68000 paused)";
+        netMessage(kMessage, sizeof kMessage - 1, 0);
+        m_FukReading = true;
+        m_pFukReader->start(drive, m_pFukImage, false);
+    }
+    if (!m_FukReading) return;
+    const u64 t0 = CTimer::GetClockTicks64();
+    do {
+        if (m_pFukReader->poll() != x68k::FukReader::RUNNING) {
+            FinishFukRead();
+            return;
+        }
+    } while (CTimer::GetClockTicks64() - t0 < CLOCKHZ / 500); // 2 ms
+}
+
 // FUK とのやり取りの数 (前のログから読み出しが増えたときだけ出す)。コア 1 が 4 ms に 1 回ほど見せる写しを読む
 void CKernel::ReportFuk() {
     if (m_pFuk == nullptr) return;
@@ -1306,6 +1525,7 @@ unsigned CKernel::netFloppyImage(int drive, u8* buf, unsigned capacity) {
 // discard なら、書けなくても取り出す (メニューで利用者が選んだとき。書けなかった内容は捨てる)
 bool CKernel::EjectDisk(int drive, bool discard) {
     if (m_pDisks[drive] == nullptr) return true;
+    WarnBootSector(drive); // 取り出すとイメージがなくなるので、先に見る
     if (m_pDiskWriter != nullptr && m_pDiskWriter->sync.attached(drive)) {
         if (!m_pDiskWriter->sync.flushPaused(drive)) {
             if (!discard) return false;
@@ -1873,6 +2093,12 @@ void CKernel::LoadSram() {
         memcpy(m_pEmulator->machine().sram(), data[n], x68k::Machine::SRAM_SIZE);
         m_Logger.Write(FromMachine, LogNotice, "SRAM: %s/pix68k/%s (generation %u)", m_BootDrive, SramName(m_Config, n),
                        (unsigned)(m_SramSlots.nextGeneration() - 1));
+        uint32_t address;
+        if (m_Settings.bootWarn && platform::sramBootsFromSram(data[n], address)) {
+            m_SramBootWarn = true;
+            m_Logger.Write(FromMachine, LogWarning, "SRAM: the boot device is SRAM ($ED0018 = $B000, address $%08X) (boot_warn)",
+                           (unsigned)address);
+        }
     } else {
         m_Logger.Write(FromMachine, LogNotice, "SRAM: no valid %s/pix68k/%s; it will be created when SRAM is written",
                        m_BootDrive, SramName(m_Config, 0));
@@ -2192,6 +2418,7 @@ TShutdownMode CKernel::RunMachine() {
     // 主な確保 (X68000 のメモリ、ディスクのイメージ、MIDI の音源の ROM と SoundFont) を終えたあとのヒープの使った量
     // (それぞれの大きさは、読んだときのログに出ている)
     ReportHeap(FromMachine, "after loading");
+    WarnSramBoot();
     for (;;) {
         ShowTsFrame();
         // 装置をつないだり外したりしたあとは、UpdatePlugAndPlay() が装置を登録するまで 0.1 秒ほど戻らない。
@@ -2231,24 +2458,34 @@ TShutdownMode CKernel::RunMachine() {
         DrainNullAudio();
         ShowNextFrame();
         ExpireOsd();
+        ServiceMixer();
+        ServicePadSetup();
+        ServicePadOffer();
+        ServiceWebMixer();
+        for (int d = 0; d < 2; d++) WarnBootSector(d);
         ServiceMessage();
-        ServiceAutoType();
+        if (!m_FukReading) ServiceAutoType();
         ServiceMenu();
+        // 設定メニューの Restart も、読み出しをやめ、戻し終えてから
+        if (m_RebootRequested && (m_FukReading || m_FukReadRequest >= 0)) netFukCancel();
+        ServiceFukRead();
         // ゲームパッドの Start + Select。設定メニューを開いている間と、deploy の再起動を待たせている間 (X68000 を止めている) は捨てる
-        if (__atomic_exchange_n(&m_PadResetRequested, false, __ATOMIC_ACQ_REL) && !m_MenuActive && !m_DeployHeld)
+        if (__atomic_exchange_n(&m_PadResetRequested, false, __ATOMIC_ACQ_REL) && !InputToMenu() && !m_DeployHeld && !m_FukReading)
             ResetFromGamePad();
-        if (m_RebootRequested) {
-            m_Logger.Write(FromMachine, LogNotice, "restarting (settings changed in the menu)");
+        if (m_RebootRequested && !m_FukReading) {
+            m_Logger.Write(FromMachine, LogNotice, "restarting (requested in the settings menu)");
             return ShutdownReboot;
         }
-        if (m_RebootRequest.take()) {
+        // FUK のディスクを読み出している間に頼まれた再起動は、読み出しをやめ、モーターなどを戻し終えてから受け取る
+        if ((m_FukReading || m_FukReadRequest >= 0) && (m_RebootRequest.pressed() || m_NetRebootAt != 0)) netFukCancel();
+        if (!m_FukReading && m_RebootRequest.take()) {
             if (RebootFromKeyboard()) {
                 m_Logger.Write(FromMachine, LogNotice, "restarting (Ctrl+Alt+Delete)");
                 return ShutdownReboot;
             }
         }
         // ネットワークから頼まれた再起動 (POST /reboot)。Ctrl + Alt + Delete と同じく、ディスクと SRAM を書いてから
-        if (NetRebootDue()) {
+        if (!m_FukReading && NetRebootDue()) {
             if (RebootWritingBack("network reboot", m_NetReboot)) {
                 m_Logger.Write(FromMachine, LogNotice, "restarting (requested over the network)");
                 return ShutdownReboot;
@@ -2279,7 +2516,7 @@ TShutdownMode CKernel::RunMachine() {
         // ミキサーの画面の直近 10 秒 (TakeSoundLevels()) は、X68000 が動いていた時間の 1 秒ごとに進める
         // (platform::SoundRunClock。X68000 を止めている間 (メニュー、deploy の再起動待ち、ほかの理由でコア 1 が止まって
         // いるとき) と、止めていた次の回の時間は数えない)
-        const bool soundPaused = m_MenuActive || m_DeployHeld || m_pEmulator->paused();
+        const bool soundPaused = m_MenuActive || m_DeployHeld || m_FukReading || m_pEmulator->paused();
         if (soundClock.update(now, soundPaused, CLOCKHZ)) {
             TakeSoundLevels();
             m_SoundWindow.tick();
@@ -2313,7 +2550,9 @@ TShutdownMode CKernel::RunMachine() {
             // X68000 は止めたまま 1 秒ごとに書き直し、入力は捨てる (止めたコア 1 の入力のキューが一杯にならないように)。
             // メニューは開ける (閉じても X68000 は止めたまま)。抜けるのは、書けたとき (そのまま再起動する) か、
             // メニューの Restart を 2 回選んで書き戻さずに再起動したとき
-            if (now - start >= (u64)m_DeploySeconds * CLOCKHZ && !m_MenuActive && now - lastDeployTry >= CLOCKHZ) {
+            const bool deployDue = now - start >= (u64)m_DeploySeconds * CLOCKHZ;
+            if (deployDue && (m_FukReading || m_FukReadRequest >= 0)) netFukCancel(); // 読み出しをやめてから
+            if (deployDue && !m_FukReading && !m_MenuActive && now - lastDeployTry >= CLOCKHZ) {
                 lastDeployTry = now;
                 if (const u8* sram = m_pEmulator->pendingSram()) SaveSram(sram);
                 if (PauseAndFlushDisks()) {
@@ -2640,6 +2879,7 @@ bool CKernel::WaitSnapshotFrame(void* ctx) {
 // キューの書き手を 1 つにするため、USB の割り込みを止める
 bool CKernel::netKeyReport(u8 modifiers, const u8 keys[6]) {
     if (m_pEmulator == nullptr) return false;
+    if (m_FukReading) return false; // X68000 を止めていて、キーは捨てる
     EnterCritical();
     const bool ok = m_KeyMerge.set(VirtualKeyboard, modifiers, keys);
     if (ok) DispatchKeys();
@@ -2979,6 +3219,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
         m_OsdState.invalidate();
         m_BarsState.invalidate();
         m_MsgState.invalidate();
+        m_MixerState.invalidate();
         m_RowCache.valid = false; // 写しを作り直す (すべての行を写す)
         m_ScreenModeChanged = true; // ログはコア 0 が出す (LogShownScreen())。合成するコアからはログに書かない
         m_ShownWidth = frame.width;
@@ -2992,6 +3233,13 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     // 写してから描くまでの間に重ねる場所に X68000 の画面が出てちらつく)。メニューを開いている間は出さない
     const int osdMode = __atomic_load_n(&m_Settings.osd, __ATOMIC_RELAXED);
     const bool osdOn = osdMode != 0 && !m_MenuActive;
+    // 画面の左下のミキサー (platform/mixer.h)。コア 0 が新しい中身を置いていたら写す。小さい画面で、右上の数字、右下のバー、
+    // 左上のメッセージに重なるときは、開いている間それらを出さない
+    MixerMem* const xm = __atomic_load_n(&s_pMixer, __ATOMIC_ACQUIRE);
+    if (xm != nullptr && xm->box.version() != m_MixerSeqLoaded) xm->box.load(xm->view, m_MixerSeqLoaded);
+    const bool mixerOn = xm != nullptr && xm->view.open && !m_MenuActive;
+    const platform::OsdRect mixerRect =
+        mixerOn ? platform::placeMixer(sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH) : platform::OsdRect();
     const platform::OsdValue osdValue = LoadOsd();
     // 置く場所は、X68000 の画面の右の余白 (縦に並べる) か、なければ上の余白の横 1 行。どちらも X68000 の画面に重なるときは、
     // 縦に並べたものを右上に重ねる (platform::chooseOsd())。枠は写す範囲 (scale): video_scale=aspect、full は表ができたら
@@ -3001,7 +3249,7 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
                                                           platform::osdRowsNarrow(osdValue), platform::osdRows(osdValue, false));
     // 置く場所がなければ、UpdateOsd() は温度を読まない (コア 0 が読む)
     __atomic_store_n(&m_OsdPlaced, osdRect.w > 0, __ATOMIC_RELAXED);
-    const platform::OsdState::Step osd = m_OsdState.update(osdOn, osdValue, osdRect);
+    const platform::OsdState::Step osd = m_OsdState.update(osdOn && !platform::mixerCovers(mixerRect, osdRect), osdValue, osdRect);
     // 画面の右下の使用率のバー (platform/osd_bars.h)。osd_bars=on で、右上の数字を出しているときだけ出す (数字を消すとき、メニューを
     // 開いたときと X68000 が止まったときは、バーも消える)。置く場所は右上の数字と同じ列の下の端で、右上の数字に
     // ぶつかれば出さない。値は LoadOsd() のあとに読む (コア 0 は右上の数字より先に置く)
@@ -3010,7 +3258,8 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     const platform::OsdRect barsRect =
         platform::placeOsdBars(osdMode, sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH,
                                m_OsdState.shown ? m_OsdState.rect : platform::OsdRect());
-    const platform::OsdState::Step bars = m_BarsState.update(m_OsdState.shown && __atomic_load_n(&m_Settings.osdBars, __ATOMIC_RELAXED) != 0,
+    const platform::OsdState::Step bars = m_BarsState.update(m_OsdState.shown && __atomic_load_n(&m_Settings.osdBars, __ATOMIC_RELAXED) != 0 &&
+                                                                 !platform::mixerCovers(mixerRect, barsRect),
                                                              barsValue, barsRect);
     // 画面の左上のメッセージ (POST /message)。コア 0 が新しい字形を置いていたら写し、消す時刻を過ぎたら出さない。
     // 右上の数字と同じ行に並ぶときは、数字にかからないよう右を切る。描き方は右上の数字と同じ
@@ -3028,7 +3277,10 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
             platform::messageLimitX(sw, sh, m_OsdState.shown ? m_OsdState.rect : platform::OsdRect(), mm->shown, ms);
         msgRect = platform::placeMessage(sw, sh, scale.dstX, scale.dstY, scale.dstW, scale.dstH, mm->shown, ms, limitX);
     }
-    const platform::OsdState::Step msg = m_MsgState.update(msgOn, m_MsgSeqLoaded, msgRect);
+    const platform::OsdState::Step msg =
+        m_MsgState.update(msgOn && !platform::mixerCovers(mixerRect, msgRect), m_MsgSeqLoaded, msgRect);
+    const platform::MixerState::Step mixer =
+        m_MixerState.update(mixerOn, xm != nullptr ? xm->view : platform::MixerView(), mixerRect);
     // 消すのを先にすべて済ませてから描く (消す場所が、もう一方の新しい場所に重なることがあるため)
     // 枠を写しているときは、消した場所を枠の絵に戻す
     const platform::BezelImage* const shownBezel = m_BezelShown != 0 ? &m_Bezel[m_BezelShown - 1] : nullptr;
@@ -3051,6 +3303,17 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
         erase(bars.eraseRect);
         ForceRows(bars.eraseRect.y, bars.eraseRect.y + bars.eraseRect.h);
     }
+    if (mixer.erase) {
+        erase(mixer.eraseRect);
+        ForceRows(mixer.eraseRect.y, mixer.eraseRect.y + mixer.eraseRect.h);
+    }
+    // ミキサーは、変わった行だけを描いて写す
+    for (int i = 0; i < platform::MIXER_ROWS; i++) {
+        if (!(mixer.rows >> i & 1)) continue;
+        platform::renderMixerRow(xm->image, mixerRect, xm->view, i);
+        const int rowH = 16 * mixerRect.scale;
+        if (mixerRect.overlay) ForceRows(mixerRect.y + i * rowH, mixerRect.y + (i + 1) * rowH);
+    }
     // 重ねる数字やメッセージを描き直したら、重なる行を写す
     if (osd.draw && osdRect.overlay) ForceRows(osdRect.y, osdRect.y + osdRect.h);
     if (msg.draw && msgRect.overlay) ForceRows(msgRect.y, msgRect.y + msgRect.h);
@@ -3058,7 +3321,14 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     if (osd.draw) platform::renderOsd(s_OsdImage, osdRect, osdValue);
     if (bars.draw) platform::renderOsdBars(s_BarsImage, barsRect, barsValue.a);
     if (msg.draw) platform::renderMessage(mm->image, msgRect, mm->shown);
-    platform::FrameOverlay ov, ovMsg, ovBars;
+    platform::FrameOverlay ov, ovMsg, ovBars, ovMixer;
+    if (m_MixerState.overlaid()) {
+        ovMixer.pixels = xm->image;
+        ovMixer.x = mixerRect.x;
+        ovMixer.y = mixerRect.y;
+        ovMixer.w = mixerRect.w;
+        ovMixer.h = mixerRect.h;
+    }
     if (m_OsdState.overlaid()) {
         ov.pixels = s_OsdImage;
         ov.x = osdRect.x;
@@ -3091,12 +3361,13 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
         platform::presentCrt(frame.pixels, Emulator::PITCH, base, pitch, scale, m_CrtMap, m_ScaleLine, m_ScaleLine2,
                              m_OsdState.overlaid() ? &ov : nullptr, m_RowCache.pixels != nullptr ? &m_RowCache : nullptr,
                              m_MsgState.overlaid() ? &ovMsg : nullptr, shownBezel != nullptr ? &cb : nullptr,
-                             m_BarsState.overlaid() ? &ovBars : nullptr);
+                             m_BarsState.overlaid() ? &ovBars : nullptr, m_MixerState.overlaid() ? &ovMixer : nullptr);
     else
         platform::presentScaled(frame.pixels, Emulator::PITCH, base, pitch, scale, m_ScaleLine,
                                 m_OsdState.overlaid() ? &ov : nullptr,
                                 m_RowCache.pixels != nullptr ? &m_RowCache : nullptr, scanline,
-                                m_MsgState.overlaid() ? &ovMsg : nullptr, m_BarsState.overlaid() ? &ovBars : nullptr);
+                                m_MsgState.overlaid() ? &ovMsg : nullptr, m_BarsState.overlaid() ? &ovBars : nullptr,
+                                m_MixerState.overlaid() ? &ovMixer : nullptr);
     // 写した行と省いた行の数 (ログ用。コア 0 が読む)
     __atomic_store_n(&m_RowsCopied, m_RowCache.copied, __ATOMIC_RELAXED);
     __atomic_store_n(&m_RowsSkipped, m_RowCache.skipped, __ATOMIC_RELAXED);
@@ -3111,6 +3382,17 @@ void CKernel::ShowFrame(const Emulator::Frame& frame, bool stopped) {
     if (osd.draw) drawImage(osdRect, s_OsdImage);
     if (msg.draw) drawImage(msgRect, mm->image);
     if (bars.draw) drawImage(barsRect, s_BarsImage);
+    // ミキサーがすべて写した範囲の中なら、写したときに書いてあるので、もう一度は書かない (枠の絵を写していなければ)
+    const bool mixerInside = shownBezel == nullptr && mixerRect.x >= scale.dstX && mixerRect.y >= scale.dstY &&
+                             mixerRect.x + mixerRect.w <= scale.dstX + scale.dstW &&
+                             mixerRect.y + mixerRect.h <= scale.dstY + scale.dstH;
+    for (int i = 0; i < platform::MIXER_ROWS && !mixerInside; i++) {
+        if (!(mixer.rows >> i & 1)) continue;
+        platform::OsdRect row = mixerRect;
+        row.h = 16 * mixerRect.scale;
+        row.y += i * row.h;
+        drawImage(row, xm->image + (size_t)i * row.h * row.w);
+    }
     const u64 us = (CTimer::GetClockTicks64() - t0) * 1000000 / CLOCKHZ;
     // コア 0 が読む (ログ)。書くのは写す役を持っているコアだけ
     __atomic_store_n(&m_CopyTotalUs, m_CopyTotalUs + us, __ATOMIC_RELAXED);
@@ -3147,6 +3429,34 @@ int CKernel::OsdPiModel() {
     case MachineModelCM5Lite: return platform::OSD_PI_CM5LITE;
     default: return platform::OSD_PI_OTHER;
     }
+}
+
+// 左下の表示 (ミキサーか、ゲームパッドの設定) の中身が変わっていたら、写す役のコアに渡す (コア 0 の主ループ)。
+// メモリが足りなければ false
+bool CKernel::PublishPanel(const platform::MixerView& v) {
+    if (memcmp(&v, &m_MixerPublished, sizeof v) == 0) return true;
+    MixerMem* xm = s_pMixer;
+    if (xm == nullptr) {
+        size_t freeBytes;
+        if (!HeapHasRoom(sizeof(MixerMem), freeBytes)) {
+            WhileComposerPresents([&] { m_Logger.Write(FromMachine, LogWarning, "mixer / gamepad setup: not enough memory"); });
+            return false;
+        }
+        xm = new MixerMem;
+    }
+    xm->box.publish(v);
+    m_MixerPublished = v;
+    // 中身を作り終えてから写す役のコアに見せる
+    __atomic_store_n(&s_pMixer, xm, __ATOMIC_RELEASE);
+    return true;
+}
+
+void CKernel::PublishMixer() {
+    if (PublishPanel(m_Mixer.view())) return;
+    m_Mixer.close();
+    EnterCritical();
+    ClosedMixer();
+    LeaveCritical();
 }
 
 void CKernel::UpdateOsd() {
@@ -3232,7 +3542,7 @@ void CKernel::UpdateOsd() {
         // UpdateOsd() はコア 0 で動くので、ネットワークのタスクと同じコアで読む
         if (m_pHostNet != nullptr) s.ipv4 = m_pHostNet->IPv4();
         // 音源の行 (縦に並べるときの数字の下。#310)。鳴ったかは、ミキサーの画面と同じ値の、前に見てから閉じた 1 秒の区間で見る
-        platform::osdSound(s, platform::soundSources(m_Settings), m_SoundWindow.takeUnread());
+        platform::osdSound(s, platform::soundSources(m_Settings, m_MidiFault), m_SoundWindow.takeUnread());
         // 1 枚も合成していなければ (X68000 が止まっている) 出さない (ExpireOsd())
         PublishOsd(published != m_OsdFrames[0] ? platform::packOsd(s) : platform::OsdValue());
     }
@@ -3270,6 +3580,7 @@ void CKernel::ExpireOsd() {
 // POST /message (CHttpTask、コア 0) から呼ぶ。字を並べて字形にし、写す役のコアに渡す。消す時刻は ShowFrame() が見る。
 // メモリを確保できなければ false
 bool CKernel::netMessage(const char* text, unsigned n, unsigned sec) {
+    m_PadOfferMsg = false;
     MessageMem* mm = s_pMsg;
     if (mm == nullptr) {
         if (n == 0) return true; // まだ何も出していないので、消すものもない
@@ -3283,9 +3594,35 @@ bool CKernel::netMessage(const char* text, unsigned n, unsigned sec) {
     platform::rasterMessage(mm->layout, cg, cg != nullptr ? x68k::Machine::CG_SIZE : 0, mm->build);
     const u64 until = mm->build.lines != 0 && sec != 0 ? CTimer::GetClockTicks64() + (u64)sec * CLOCKHZ : 0;
     mm->box.publish(mm->build, until);
-    m_MsgExpireTicks = until;
+    m_MsgExpireTicks = m_MsgUntil = until;
     m_MsgRedraw = true;
     return true;
+}
+
+void CKernel::WarnSramBoot() {
+    if (m_SramBootWarn) netMessage(platform::kBootWarnSram, sizeof platform::kBootWarnSram - 1, platform::BOOT_WARN_SEC);
+}
+
+// 主ループと、ディスクを取り出す前 (EjectDisk()) に呼ぶ
+void CKernel::WarnBootSector(int drive) {
+    if (m_pDisks[drive] == nullptr) return;
+    // メニューを開いている途中 (X68000 がまだ止まっていない) は、写す役を任せられないので、後に回す
+    if (m_MenuActive && !m_pEmulator->paused()) return;
+    if (!m_pDisks[drive]->takeBootChanged() || !m_Settings.bootWarn) return;
+    bool first = false;
+    WhileComposerPresents([&] {
+        // 短い名前や . や大文字と小文字の違いで開き直しても、同じファイルとみなす (イメージは起動したドライブにある)
+        char id[300];
+        CBootDriveNames fs{m_BootDrive, {}};
+        const bool ok = platform::canonicalPath(fs, m_InUsePath[drive], id, sizeof id);
+        first = m_BootWarnSeen.first(ok ? id : (const char*)m_InUsePath[drive], true);
+        if (first)
+            m_Logger.Write(FromMachine, LogWarning, "fd%d: the boot sector of %s was changed (boot_warn)", drive,
+                           (const char*)m_InUsePath[drive]);
+    });
+    if (!first) return;
+    const char* text = platform::kBootWarnFd[drive];
+    netMessage(text, (unsigned)strlen(text), platform::BOOT_WARN_SEC);
 }
 
 // 主ループから呼ぶ。動いている間は次に写すフレームでメッセージが出る (消える) が、X68000 が止まっている間は
@@ -3426,6 +3763,7 @@ void CKernel::StartMidi() {
     Emulator* emu = m_pEmulator;
     if (!emu->machine().setMidiBoard(true)) {
         m_Logger.Write(FromMidi, LogWarning, "MIDI board: out of memory");
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     m_Logger.Write(FromMidi, LogNotice, "MIDI board (CZ-6BM1, YM3802) at $EAFA00");
@@ -3447,6 +3785,7 @@ void CKernel::StartMidi() {
     }
     if (m_Settings.midiSf2[0] == 0) {
         m_Logger.Write(FromMidi, LogWarning, "midi_sf2= is not set; MIDI is not played");
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (!emu->soundOutputEnabled()) {
@@ -3459,6 +3798,7 @@ void CKernel::StartMidi() {
     FILINFO info;
     if (f_stat(path, &info) != FR_OK) {
         m_Logger.Write(FromMidi, LogWarning, "%s: not found; MIDI is not played", (const char*)path);
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     // 標本は float に直して持つ (ファイルの大きさの 2 倍ほど)。ここでは目安で断り、読むときに確保する量を数える
@@ -3467,6 +3807,7 @@ void CKernel::StartMidi() {
     if (!HeapHasRoom((size_t)info.fsize * 2, freeBytes)) {
         m_Logger.Write(FromMidi, LogWarning, "%s: %u MB is too large for the free heap (%u MB); MIDI is not played",
                        (const char*)path, (unsigned)(info.fsize >> 20), (unsigned)(freeBytes >> 20));
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     // 読むのは X68000 を動かし始めてから (LoadMidiSoundFont())。それまで MIDI ボードが送ったバイトは捨てる
@@ -3573,16 +3914,20 @@ void CKernel::LoadMidiSoundFont() {
     if (r != FR_OK) {
         m_Logger.Write(FromMidi, LogWarning, "%s: cannot read (FRESULT %d); MIDI is not played", (const char*)path,
                        (int)r);
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (synth == nullptr) {
-        if (overLimit)
+        if (overLimit) {
             m_Logger.Write(FromMidi, LogWarning,
                            "%s: needs more than %u MB of the free heap; MIDI is not played", (const char*)path,
                            (unsigned)(limitBytes >> 20));
-        else
+            m_MidiFault = platform::OSD_MIDI_FAILED;
+        } else {
             m_Logger.Write(FromMidi, LogWarning, "%s: cannot load the SoundFont (%u MB allocated); MIDI is not played",
                            (const char*)path, (unsigned)(usedBytes >> 20));
+            m_MidiFault = platform::OSD_MIDI_NO_FILE;
+        }
         return;
     }
     const u64 t1 = CTimer::GetClockTicks64();
@@ -3619,6 +3964,7 @@ void CKernel::StartMidiUart() {
         m_Logger.Write(FromMidi, LogWarning,
                        "midi_uart=%u is not available on this Pi (Pi 3: 0; Pi 4: 0, 2-5; Pi 5: 0-4, 10); MIDI is not played",
                        dev);
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     CString pin;
@@ -3634,6 +3980,7 @@ void CKernel::StartMidiUart() {
         CTimer::SimpleMsDelay(5); // UART の FIFO に残ったログ (16 文字、115200bps で 1.4ms) を送り終えるのを待つ
         if (!m_Serial.Initialize(31250)) {
             m_Logger.Write(FromMidi, LogWarning, "cannot set the UART to 31250 bps; MIDI is not played");
+            m_MidiFault = platform::OSD_MIDI_FAILED;
             return;
         }
         serial = &m_Serial;
@@ -3641,6 +3988,7 @@ void CKernel::StartMidiUart() {
         serial = new CSerialDevice(nullptr, FALSE, dev); // 割り込みを使わない (FIFO の空きは時刻から計算する)
         if (serial == nullptr || !serial->Initialize(31250)) {
             m_Logger.Write(FromMidi, LogWarning, "cannot set UART %u to 31250 bps; MIDI is not played", dev);
+            m_MidiFault = platform::OSD_MIDI_FAILED;
             delete serial;
             return;
         }
@@ -3669,7 +4017,10 @@ void CKernel::StartMidiUart() {
                        actual);
     m_UartMidiDevice = dev;
     m_pUartMidi = new CUartMidiOut(serial, family);
-    if (m_pUartMidi == nullptr) return;
+    if (m_pUartMidi == nullptr) {
+        m_MidiFault = platform::OSD_MIDI_FAILED;
+        return;
+    }
     m_pMidiOut = m_pUartMidi;
     m_pEmulator->setMidiOut(m_pUartMidi);
 }
@@ -3717,6 +4068,7 @@ void CKernel::StartMidiMt32() {
     static const char FromMidi[] = "midi";
     if (m_Settings.midiMt32Ctrl[0] == 0 || m_Settings.midiMt32Pcm[0] == 0) {
         m_Logger.Write(FromMidi, LogWarning, "midi_out=mt32 needs midi_mt32_ctrl= and midi_mt32_pcm=; MIDI is not played");
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (!m_pEmulator->soundOutputEnabled()) {
@@ -3732,6 +4084,7 @@ void CKernel::StartMidiMt32() {
         FILINFO info;
         if (f_stat(path[i], &info) != FR_OK) {
             m_Logger.Write(FromMidi, LogWarning, "%s: not found; MIDI is not played", (const char*)path[i]);
+            m_MidiFault = platform::OSD_MIDI_NO_FILE;
             return;
         }
         size[i] = info.fsize;
@@ -3739,6 +4092,7 @@ void CKernel::StartMidiMt32() {
         if (!ok) {
             m_Logger.Write(FromMidi, LogWarning, "%s: %u bytes is not the size of an MT-32 / CM-32L %s ROM; MIDI is not played",
                            (const char*)path[i], (unsigned)size[i], i == 0 ? "CONTROL" : "PCM");
+            m_MidiFault = platform::OSD_MIDI_NO_FILE;
             return;
         }
     }
@@ -3746,6 +4100,7 @@ void CKernel::StartMidiMt32() {
     if (!HeapHasRoom((size_t)platform::Mt32Synth::heapBytes(size[0], size[1]), freeBytes)) {
         m_Logger.Write(FromMidi, LogWarning, "MT-32: not enough free heap (%u MB); MIDI is not played",
                        (unsigned)(freeBytes >> 20));
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     // 読むのは X68000 を動かし始めてから (LoadMidiMt32())。それまで MIDI ボードが送ったバイトは捨てる
@@ -3791,6 +4146,7 @@ void CKernel::LoadMidiMt32() {
         netEndHeavy();
         m_Logger.Write(FromMidi, LogWarning, "MT-32: not enough free heap (%u MB); MIDI is not played",
                        (unsigned)(freeBytes >> 20));
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     for (int i = 0; i < 2 && r == FR_OK; i++) {
@@ -3837,11 +4193,13 @@ void CKernel::LoadMidiMt32() {
     if (r != FR_OK) {
         m_Logger.Write(FromMidi, LogWarning, "%s: cannot read (FRESULT %d); MIDI is not played",
                        (const char*)path[bad < 0 ? 0 : bad], (int)r);
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (synth == nullptr) {
         m_Logger.Write(FromMidi, LogWarning, "MT-32: %s and %s: %s; MIDI is not played", (const char*)path[0],
                        (const char*)path[1], platform::Mt32Synth::resultText(result));
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     const u64 t1 = CTimer::GetClockTicks64();
@@ -3857,9 +4215,11 @@ void CKernel::StartMidiSc55() {
 #if RASPPI <= 3
     m_Logger.Write(FromMidi, LogWarning, "midi_out=sc55: the SC-55 emulation is too slow for this Pi (needs Pi 4 or later); "
                                          "MIDI is not played");
+    m_MidiFault = platform::OSD_MIDI_FAILED;
 #else
     if (m_Settings.midiSc55[0] == 0) {
         m_Logger.Write(FromMidi, LogWarning, "midi_out=sc55 needs midi_sc55=; MIDI is not played");
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (!m_pEmulator->soundOutputEnabled()) {
@@ -3878,6 +4238,7 @@ void CKernel::StartMidiSc55() {
     DIR dir;
     if (f_opendir(&dir, dirPath) != FR_OK) {
         m_Logger.Write(FromMidi, LogWarning, "%s: not found; MIDI is not played", (const char*)dirPath);
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     FILINFO info;
@@ -3895,12 +4256,14 @@ void CKernel::StartMidiSc55() {
         m_Logger.Write(FromMidi, LogWarning, "%s: no %s (%s, %u bytes); MIDI is not played", (const char*)dirPath,
                        platform::Sc55Synth::romFileName(missing), platform::Sc55Synth::romPartName(missing),
                        platform::Sc55Synth::romSize(missing));
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     size_t freeBytes = 0;
     if (!HeapHasRoom((size_t)platform::Sc55Synth::heapBytes() + sizeof(platform::Sc55Synth), freeBytes)) {
         m_Logger.Write(FromMidi, LogWarning, "SC-55: not enough free heap (%u MB); MIDI is not played",
                        (unsigned)(freeBytes >> 20));
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     // 読むのは X68000 を動かし始めてから (LoadMidiSc55())。それまで MIDI ボードが送ったバイトは捨てる
@@ -3930,6 +4293,7 @@ void CKernel::LoadMidiSc55() {
     while (!m_pEmulator->soundCoreDecided() && CTimer::GetClockTicks64() - w0 < 3 * CLOCKHZ) ServiceDuringUsbScan();
     if (!m_pEmulator->soundCoreActive()) {
         m_Logger.Write(FromMidi, LogWarning, "SC-55: needs sound synthesis on core 3 (sound_core=on); MIDI is not played");
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     const u64 t0 = CTimer::GetClockTicks64();
@@ -3989,15 +4353,18 @@ void CKernel::LoadMidiSc55() {
     if (r != FR_OK) {
         m_Logger.Write(FromMidi, LogWarning, "%s: cannot read (FRESULT %d); MIDI is not played",
                        (const char*)path[bad < 0 ? 0 : bad], (int)r);
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     if (!room) {
         m_Logger.Write(FromMidi, LogWarning, "SC-55: not enough free heap (%u MB); MIDI is not played",
                        (unsigned)(freeBytes >> 20));
+        m_MidiFault = platform::OSD_MIDI_FAILED;
         return;
     }
     if (synth == nullptr) {
         m_Logger.Write(FromMidi, LogWarning, "SC-55: %s; MIDI is not played", platform::Sc55Synth::resultText(result));
+        m_MidiFault = platform::OSD_MIDI_NO_FILE;
         return;
     }
     const u64 t1 = CTimer::GetClockTicks64();
@@ -4141,13 +4508,23 @@ void CKernel::TakeSoundLevels() {
     const x68k::Sound::Levels lv = m_pEmulator->takeAudioLevels();
     m_SoundWindow.add(lv);
     x68k::Sound::mergeLevels(m_SoundLog, lv);
+    x68k::Sound::mergeLevels(m_MixerLevels, lv);
+    m_WebLevels.add(lv);
+}
+
+// 音を鳴らしたまま変えるミキサーに出す値: 前に取ってからの分 (ほかの呼び出しが取った分も入る)
+x68k::Sound::Levels CKernel::takeMixerLevels() {
+    TakeSoundLevels();
+    const x68k::Sound::Levels lv = m_MixerLevels;
+    m_MixerLevels = {};
+    return lv;
 }
 
 // ミキサーの画面 (設定メニューの Sound mixer) に出す値: X68000 が動いていた直近の 10 秒ほど (platform::SoundWindow)
 bool CKernel::soundInfo(SoundInfo& info) {
     if (m_pEmulator == nullptr) return false;
     TakeSoundLevels();
-    platform::fillSoundInfo(info, m_SoundWindow.recent(), platform::soundSources(m_Settings));
+    platform::fillSoundInfo(info, m_SoundWindow.recent(), platform::soundSources(m_Settings, m_MidiFault));
     return true;
 }
 
@@ -4262,6 +4639,62 @@ void CKernel::DispatchKeys() {
     else if (m_BootMenuActive) BootMenuKeys(mods, down); // 起動の組み合わせのメニュー (boot_menu.cpp)
 }
 
+// キーもマウスもゲームパッドも離したことにする (割り込みか、割り込みを止めたコア 0 から呼ぶ)。送れなかった分は、主ループの
+// ResendKeys() と ResendInput() が送り直す
+void CKernel::ReleaseInput() {
+    Emulator* emu = m_pEmulator;
+    m_Keys.releaseAll([emu](uint8_t u, bool d) { return emu->keyEvent(u, d); });
+    m_Mouse.releaseAll([emu](int x, int y, uint8_t b) { return emu->mouseEvent(x, y, b); });
+    for (int s = 0; s < 2; s++) {
+        m_PadWant[s] = 0;
+        SendGamePad(s);
+    }
+}
+
+// 並びの分からないゲームパッドの、ボタンの長押しだけで設定を始める (platform::PadSetupOffer)。主ループから毎回呼ぶ
+void CKernel::ServicePadOffer() {
+    if (m_pEmulator == nullptr) return;
+    bool unknown[2], watch = false;
+    for (int s = 0; s < 2; s++) {
+        CUSBGamePadDevice* pad = m_pGamePad[s];
+        unknown[s] = pad != nullptr && m_PadMap[s] == nullptr && !m_PadKnown[s] && m_PadLayout[s] == nullptr;
+        watch = watch || (unknown[s] && m_PadOffer.wants(s, (uint32_t)m_PadAttachTicks[s] | 1u));
+    }
+    const u64 ticks = CTimer::GetClockTicks64();
+    bool offering = false;
+    if (watch) {
+        platform::PadSetup::Pad pads[platform::PadSetup::PADS];
+        CollectPads(pads);
+        const bool blocked = InputToMenu() || m_DeployHeld || m_pEmulator->paused();
+        const int slot = m_PadOffer.update(pads, unknown, blocked, (uint32_t)(ticks / (CLOCKHZ / 1000)));
+        if (slot >= 0) {
+            EnterCritical();
+            const bool start = !InputToMenu(); // 見たあとに、割り込みがメニューを開くと決めたかもしれない
+            if (start) {
+                m_PadOffer.started(slot);
+                ReleaseInput();
+                m_MenuKeyHead = m_MenuKeyTail = 0;
+                m_PadSetupSlot = slot;
+                m_PadSetupActive = true;
+            }
+            LeaveCritical();
+            if (start)
+                WhileComposerPresents(
+                    [&] { m_Logger.Write(FromMachine, LogNotice, "joystick %d: button held; gamepad setup", slot + 1); });
+        } else {
+            offering = m_PadOffer.offering();
+        }
+    }
+    // 案内。ほかのメッセージ (POST /message など) を出している間は出さない
+    if (offering && !m_PadOfferMsg) {
+        const bool busy = s_pMsg != nullptr && s_pMsg->build.lines != 0 && (m_MsgUntil == 0 || ticks < m_MsgUntil);
+        static const char kText[] = "GAMEPAD\nhold any\nbutton 3 s\nto set up";
+        if (!busy && netMessage(kText, sizeof kText - 1, 30)) m_PadOfferMsg = true;
+    } else if (!offering && m_PadOfferMsg) {
+        netMessage("", 0, 0);
+    }
+}
+
 // 押しているキー (修飾キーのビットと usage ごとの 1 ビット) を前回と比べ、押した / 離したキーを X68000 に送る。
 // キューが満杯で送れなかった分は m_Keys が覚えていて、次のレポートか ResendKeys() で送る
 void CKernel::SendKeyReport(u8 mods, const u8 down[32]) {
@@ -4270,10 +4703,19 @@ void CKernel::SendKeyReport(u8 mods, const u8 down[32]) {
     // 設定メニューのキーと、メニューを開いている間のキーは X68000 に送らない (machine_menu.cpp)
     u8 outMods = 0, outDown[32], events[6];
     int nEvents = 0;
-    switch (m_MenuKeys.filterBits(mods, down, m_MenuActive, outMods, outDown, events, nEvents)) {
+    switch (m_MenuKeys.filterBits(mods, down, InputToMenu(), outMods, outDown, events, nEvents)) {
     case platform::MenuKeyFilter::OPEN:
         m_Keys.releaseAll([emu](uint8_t u, bool d) { return emu->keyEvent(u, d); });
         m_MenuActive = true; // 主ループがコア 1 を止めてから開く
+        return;
+    case platform::MenuKeyFilter::OPEN_MIXER:
+        // X68000 が止まっている間 (deploy の再起動待ちなど) は開かない。何も送らない
+        if (m_DeployHeld || m_pEmulator->paused()) return;
+        m_MenuKeyHead = m_MenuKeyTail = 0;
+        // 主ループが開く (ServiceMixer())。X68000 は止めない。キーもマウスもゲームパッドも離したことにする (送れなかった分は
+        // 主ループの ResendKeys() と ResendInput() が送り直す)
+        ReleaseInput();
+        m_MixerActive = true;
         return;
     case platform::MenuKeyFilter::MENU:
         for (int i = 0; i < nEvents; i++) PushMenuKey(events[i]);
@@ -4317,7 +4759,7 @@ bool CKernel::RebootWritingBack(const char* who, platform::RebootRequest& reques
                            "(%s again within 60 s to restart without writing back)",
                            who, what, &request == &m_RebootRequest ? "press Ctrl+Alt+Delete" : "POST /reboot");
             // メニューを開いている間と、deploy の再起動を待たせている間は止めたまま
-            if (!m_MenuActive && !m_DeployHeld) {
+            if (!m_MenuActive && !m_DeployHeld && !m_FukReading) {
                 emu->requestPause(false);
                 const u64 t1 = CTimer::GetClockTicks64();
                 while (emu->paused() && CTimer::GetClockTicks64() - t1 < CLOCKHZ) asm volatile("sev");
@@ -4330,7 +4772,7 @@ bool CKernel::RebootWritingBack(const char* who, platform::RebootRequest& reques
     // (ディスクを閉じ、アンマウントする FinishDeploy() の前に)。戻せなければ、断った組み合わせで起動しないよう
     // 再起動しない
     if (&request != &m_NetReboot && !CancelProfileChoiceForRestart(who)) {
-        if (!m_MenuActive && !m_DeployHeld) {
+        if (!m_MenuActive && !m_DeployHeld && !m_FukReading) {
             emu->requestPause(false);
             const u64 t1 = CTimer::GetClockTicks64();
             while (emu->paused() && CTimer::GetClockTicks64() - t1 < CLOCKHZ) asm volatile("sev");

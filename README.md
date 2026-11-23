@@ -17,7 +17,7 @@ The documentation is in Japanese. License: GPLv3.
   - Raspberry Pi 2 Model B (BCM2836 の版を実機で確かめている。32 ビットのカーネルで、X68000 の 68000 の機種だけ。X68030、060turbo、数値演算プロセッサボードは使えない。[baremetal.md](docs/baremetal.md) の「Raspberry Pi 2」)
   - Raspberry Pi 3 Model B+ (実機で確かめている)。Raspberry Pi 3 Model B も同じカーネルで動かすが、実機では確かめていない
   - Raspberry Pi 4 Model B (実機で確かめている)
-  - Raspberry Pi 400 (Raspberry Pi 4 Model B と同じカーネルで動かす。実機では、起動、HDMI の画面、Ethernet を確かめた)
+  - Raspberry Pi 400 (Raspberry Pi 4 Model B と同じカーネルで動かす。まだ正式には対応していない。実機では、起動、HDMI の画面、Ethernet を確かめた。ゲームの動作は一部しか確かめていない)
   - Raspberry Pi 5 (実機で確かめている)
   - QEMU の raspi3b でも動く (試験用)
 - 機種: X68000 (68000、10MHz / 16MHz)、X68030 (68030 25MHz と 68882)、060turbo (X68030 に 68060 50MHz / 75MHz を載せた構成)
@@ -109,6 +109,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `sc0`〜`sc6` | ファイル名 | なし | SCSI のハードディスクのイメージ (HDS)。外付け SCSI ボードがなければ X68030 / 060turbo の内蔵 SCSI | ○ |
 | `cd` | ファイル名 | なし | CD-ROM のイメージ (ISO か CUE) | ○ |
 | `cd_id` | `0`〜`6` | `6` | CD-ROM をつなぐ SCSI ID | ○ |
+| `boot_warn` | `on`、`off` | `on` | SRAM の起動装置が SRAM のとき (起動時) と、FD のブートセクタが書き換えられたときに、ログと画面の左上で知らせる ([disks-and-scsi.md](docs/disks-and-scsi.md)) | ○ |
 | `write_back` | `on`、`off` | `on` | X68000 が書いた内容をイメージのファイルに書き戻す | - |
 | `write_protect` | `fd0 fd1 hd0 sc0`〜`sc6` | なし | 書き込み禁止にするディスクを「,」か空白で区切って並べる | - |
 | `fpu_board` | `off`、`on`、`2` | `off` | 数値演算プロセッサボード。`2` で 2 枚 ([expansion.md](docs/expansion.md)) | ○ |
@@ -138,7 +139,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `keyboard` | `auto`、`usb`、`pi400us`、`pi400jp` | `auto` | キーボードの種類。`auto` は VID:PID から決める ([keyboard.md](docs/keyboard.md)) | - |
 | `hat` | `auto`、`0`、`1` | `auto` | ゲームパッドのハットの値の範囲を 0-7 / 1-8 に固定する | - |
 | `pad_log` | `on`、`off` | `off` | ゲームパッドのボタンとハットの生の値が変わるたびにログに出す (配置の分からないゲームパッドの並びを調べるため。調べ終えたら `off` に戻す) | - |
-| `video_scale` | `off`、`integer`、`aspect`、`full` | ベアメタル版 `integer`、ホスト版 `aspect` | 画面の拡大の仕方 (下の「画面の出し方」) | ○ |
+| `video_scale` | `off`、`integer`、`aspect`、`full` | `aspect` (Raspberry Pi 2 は `integer`) | 画面の拡大の仕方 (下の「画面の出し方」) | ○ |
 | `video_filter` | `scanline`、`curve`、`mask`、`cz-600de`、`cz-600db` を `,` で並べる。`none` | `none` | ブラウン管のように見せる効果と、モニタの枠 (同上) | ○ |
 | `osd` | `on`、`fps`、`off` | `on` | 画面の右上に fps、速さ、温度、IP アドレスなどを出す。ベアメタル版は余白が足りなければ `on` でも画面に重ねる。ホスト版は `fps` のときだけ重ねる | ○ |
 | `render_core`、`sound_core` | `on`、`off` | `on` | `off` で画面 / 音の合成もコア 1 で行う | - |
@@ -155,8 +156,8 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `video_scale=` | 拡大の仕方 |
 |---|---|
 | `off` | 拡大しない (1 倍で真ん中に出す) |
-| `integer` | 整数倍 (ベアメタル版の既定)。768x512 の枠の 1 倍か 2 倍に入る最大の倍率 (1920x1080 なら、どの画面モードも 1536x1024 くらい) |
-| `aspect` | 表示の高さいっぱいで、横は X68000 のモニタと同じ 4:3 (1920x1080 なら 1440x1080)。どの画面モードも同じ枠 (ホスト版の既定) |
+| `integer` | 整数倍 (Raspberry Pi 2 の既定)。768x512 の枠の 1 倍か 2 倍に入る最大の倍率 (1920x1080 なら、どの画面モードも 1536x1024 くらい) |
+| `aspect` | 表示の高さいっぱいで、横は X68000 のモニタと同じ 4:3 (1920x1080 なら 1440x1080)。どの画面モードも同じ枠 (Raspberry Pi 2 以外の既定) |
 | `full` | 表示いっぱいに引き伸ばす (1920x1080 なら 1920x1080) |
 
 | `video_filter=` に書く名前 | 掛けるもの |
@@ -191,7 +192,7 @@ Raspberry Pi 2 と Raspberry Pi 3 (Zero 2 W、3A+ は Pi 3 と同じ) では、`
 - Raspberry Pi 3 でも使える。ただし、選べる組み合わせは枠がないときと同じ (`curve` と、`full` + `mask` は選べない)。枠を出せないときは `video_scale=` のとおりに写すため。
 - 設定メニューでは Display のページの Bezel (off、cz-600de、cz-600db) で切り替える。初めて選んだときに絵を起動したドライブから読む (8.3MB。Pi 5 で 0.5 秒ほどかかる)。絵が読めなければ選べない。設定に枠を書いてあって絵が読めないときも、枠なしで写しているので、Scale や効果は今までどおり変えられる。
 
-公開版 v0.1.0 の `scale=` と `scanline=` も読み、v0.1.0 と同じ見た目になるように読み替える。ログに `scale=off is old; use video_scale= (Save settings rewrites it)` のように出す。設定メニューの Save settings で保存すると、その行を消して `video_scale=` と `video_filter=` の行を書く (何も変えていなくても)。
+公開版 v0.1.0 の `scale=` と `scanline=` も読み、次の表のように読み替える。`scale=` を書いていなければ、拡大の仕方はいまの既定になる (v0.1.0 では整数倍だった。同じ見た目にするには `video_scale=integer` と書く)。ログに `scale=off is old; use video_scale= (Save settings rewrites it)` のように出す。設定メニューの Save settings で保存すると、その行を消して `video_scale=` と `video_filter=` の行を書く (何も変えていなくても)。
 
 | v0.1.0 の書き方 | 読み替え |
 |---|---|
@@ -222,7 +223,7 @@ autotype_wait = 15
   何か押すと待つのをやめる (Shift などの修飾キーだけと、ゲームパッドの左右では止まらない。起動したときから押したままのゲームパッドのボタンも数えない)。組み合わせが 1 つもなければメニューは出さず、今までどおり `pix68k.cfg` で起動する。
   メニューを出すときは、その分 (`profile_wait=` 秒ほど) 起動が遅くなる。キーボードとゲームパッドのために USB の装置を X68000 を動かす前に探し、探し終えてから少なくとも 2 秒は待つ
 - **pix68k.cfg との重ね方**: 組み合わせを選んだときは、`pix68k.cfg` からは共通の項目 (`net`、`net_*`、`syslog`、`keyboard`、`hat`、
-  `video_filter`、`video_scale`、`osd`、`render_core`、`sound_core`、`midi_uart`、`midi_uart_family`、`write_back`、`profile_wait`。前の `scale`、`scanline`、`crt` も) だけを受け継ぎ、
+  `video_filter`、`video_scale`、`osd`、`render_core`、`sound_core`、`midi_uart`、`midi_uart_family`、`write_back`、`boot_warn`、`profile_wait`。前の `scale`、`scanline`、`crt` も) だけを受け継ぎ、
   X68000 の構成 (CPU、メモリ、ディスク、拡張ボード、MIDI、`autotype`) は組み合わせのファイルだけから読む。書いていない項目は既定の値になる。
   `pix68k.cfg` の `fd0=` などが組み合わせに混ざらないようにするためで、`pix68k.cfg` に写して使っていた控えのファイルは、そのまま置けば写したときと同じ構成になる。
   組み合わせのファイルに共通の項目を書けば、そちらを使う
@@ -268,16 +269,17 @@ SD カードのルートの `cmdline.txt` に書く。主なもの:
 ## 操作
 
 - 設定メニュー: Scroll Lock、Application (メニューのキー)、Menu のどれかで開く / 閉じる。Raspberry Pi 400 はラズベリーのキー + M、ホスト版は F12 でも開く。
-  ゲームパッドでは Home か、Select を押しながら上で開く / 閉じる (ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド)。中では十字キーで選び、A で決め、B で戻る / 閉じる。
+  ゲームパッドでは Home か、Select を押しながら上で開く / 閉じる (ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表か `pads.txt` にあるゲームパッド)。中では十字キーで選び、A で決め、B で戻る / 閉じる。
   FD の入れ替え、CD-ROM の入れ替え、機種と拡張ボードの選択、ステートの保存と読み込み、リセット、設定の保存ができる。
   開いている間は X68000 を止める ([settings-menu.md](docs/settings-menu.md))
+- 音を鳴らしたまま変えるミキサー: Shift + 設定メニューのキー (ホスト版は Shift + F12 でも) で開く / 閉じる ([docs/settings-menu.md](docs/settings-menu.md))
 - Ctrl + Alt + Delete: 書き戻していないディスクと SRAM を書いてから Raspberry Pi を再起動する。
   X68000 のリセット (CTRL + OPT.1 + DEL) は Ctrl + GUI (Windows / Command のキー) + Delete で打つ ([keyboard.md](docs/keyboard.md))
 - キーボード: ホストのキーを、JIS 配列で同じ位置の X68000 のキーにする。XF1〜XF5、かな、OPT.1 / OPT.2 などの割り当ては [keyboard.md](docs/keyboard.md) の表にある。
   USB キーボードは 4 台までいっしょに使える
 - Raspberry Pi 400: 本体のキーボードは、ラズベリーのキーを押している間ほかのキーを X68000 にしかないキーに置き換える (ラズベリー + 1〜5 が XF1〜XF5 など)
 - マウスとゲームパッド: USB マウスは X68000 のマウス、USB ゲームパッドはジョイスティック 1、2 になる。
-  ゲームパッドの Start と Select を同時に押すと、X68000 をリセットする (設定メニューの Reset と同じ。ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド (今は HORIPAD S と PCEngine PAD) で使える)
+  ゲームパッドの Start と Select を同時に押すと、X68000 をリセットする (設定メニューの Reset と同じ。ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド (今は HORIPAD S と PCEngine PAD) か、`pads.txt` に Start と Select を割り当てたゲームパッドで使える。`pads.txt` は設定メニューの Gamepad setup で作れる ([docs/settings-menu.md](docs/settings-menu.md)))
   ホスト版では、ウィンドウの中を左クリックするとマウスを取り込み、中ボタンのクリックか Ctrl + Alt で戻す ([build-and-test.md](docs/build-and-test.md))
 
 ## ネットワークの口
@@ -323,7 +325,8 @@ QEMU での試験、カーネルの大きさの上限などは [baremetal.md](do
 
 1. Raspberry Pi のファームウェア (Circle の `boot/` で `make` を実行するとダウンロードする) をルートに置く
 2. `config.txt` をルートに置く。Circle の `boot/config64.txt` をもとにし、`[pi4]` の節の `armstub=armstub8-rpi4.bin` の行を消し、
-   `[pi5]` の節に `framebuffer_depth=32` と `framebuffer_ignore_alpha=1` を書く (ないと Raspberry Pi 5 では何も出ずに止まる)
+   `[pi5]` の節に `framebuffer_depth=32` と `framebuffer_ignore_alpha=1` を書く (ないと Raspberry Pi 5 では何も出ずに止まる)。
+   最初の節 (`[pi3]` など) より前に `disable_overscan=1` を書く (ないと、ファームウェアが画面の縁を空けて X68000 の画面が小さくなることがある。[baremetal.md](docs/baremetal.md) の「ファームウェアの設定」)
 3. カーネル (`kernel8.img`、`kernel8-rpi4.img`、`kernel_2712.img`) をルートに置く。Raspberry Pi 2 は `kernel7.img` で、`config.txt` に `[pi2]` の節が要る ([baremetal.md](docs/baremetal.md) の「Raspberry Pi 2」)
 
 公開リポジトリ (j3tm0t0/pix68k) に `v` で始まるタグを push すると、`.github/workflows/release.yml` が GitHub のホストの runner で
