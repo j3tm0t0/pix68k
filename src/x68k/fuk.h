@@ -119,6 +119,8 @@ public:
     static constexpr uint32_t PAUSE_GAP_US = 100000;     // poll() の間がこれだけ空いたら、X68000 が止められていたとみなす
 
     struct Stats {
+        uint32_t strays[6] = {};  // stray の内訳 (Event::Stray の順。合計が stray)
+        uint32_t odd[5] = {};     // 返事がずれたかもしれないもの (Event::Odd の順)
         uint32_t reads = 0;        // ポート 1 に送った読み出し
         uint32_t replies = 0;      // 返事を受け取った読み出し
         uint64_t replyUs = 0;      // 読み出しを送ってから返事を受け取るまでの時間の合計
@@ -146,6 +148,79 @@ public:
         uint32_t tcReads = 0;       // TC で終えた、写した Read
         uint32_t tcUs[6] = {};      // 最近の 6 回の、最初のバイトを渡してから TC までの X68000 の時間 (tcUs[tcReads % 6] が次)
     };
+
+    // ---- 異常終了したコマンドと、つなぎ直した理由の記録 (#400) ----
+    // X68000 を動かすスレッド (コア) が固定長の記録をリングに積み、ログに出すスレッド (コア) が 1 つずつ取り出して
+    // 文字列にする。積む側は待たない。多すぎる分 (noteResult() の上限) とリングに入らない分は捨てて数える
+    struct Event {
+        // TRACE: WRITE ID から始まる書き込みの、コマンドごとのリザルト。STRAY: 捨てたバイト。ODD: ずれたかもしれない返事
+        enum Kind : uint8_t { FAILED, LINK_LOST, TRACE, STRAY, ODD };
+        // リザルトを作ったもの
+        enum Source : uint8_t {
+            FROM_FUK,     // FUK
+            DMA_ABORT,    // FUK のリザルトを、DMA の異常終了のためにオーバーランに変えた
+            FAIL_COMMAND, // failCommand() (つながりが切れた、't'、短い 'R')
+            CANCELLED,    // cancelWrite() (setResult7()。データがそろわず、FUK に送る前にやめた)
+            REFUSED,      // localExecute() (setResult7()。受け付けない書き込み)
+            OFFLINE,      // localExecute() (setResult7()。FUK がつながっていない)
+        };
+        // つなぎ直した理由
+        enum Reason : uint8_t { NO_REPLY, NO_R, NO_R_REST, NO_W, NO_W_DONE, NO_RESULT, QUEUE_FULL, UNPLUGGED, NEW_DEVICE };
+        enum Stray : uint8_t {
+            S_PORT1,  // ポート 1 の要求していないバイト
+            S_RESULT, // 読んだリザルトのバイトが、待つのをやめたあとに届いた
+            S_PORT2,  // ポート 2 の知らないバイト
+            S_W,      // 待っていない 'W'
+            S_W_DONE, // 待っていない 'w'
+            S_R,      // 待っていない 'R' (値は長さ)
+        };
+        enum Odd : uint8_t {
+            ODD_EARLY,  // 読み出しの要求を口に渡し終える前に返事が届いた (その返事のはずがない)
+            ODD_RESULT, // リザルト 7 バイトの US か N が、コマンドと合わない
+            ODD_SIS,    // SENSE INTERRUPT STATUS の PCN がシーク先と合わない
+            ODD_STATUS, // コマンドを待つはずのときに、ステータスがリザルトありを示す
+            ODD_SYNC,   // リセットのあとのステータスが、コマンドを待つ値でない
+        };
+        uint64_t atUs;                    // FukLink::nowUs()
+        Kind kind;
+        uint8_t source;                   // FAILED と TRACE のとき Source
+        uint8_t reason;                   // LINK_LOST のとき Reason、STRAY のとき Stray、ODD のとき Odd
+        uint8_t replyTag;                 // NO_REPLY のとき、返事を待っていた読み出しの使い道 (T_*)。STRAY と ODD なら、最後に返事を受けた読み出し
+        uint32_t value;                   // STRAY と ODD のとき、届いた値
+        uint32_t number;                  // TRACE ならひと続きの書き込みの中の番号、STRAY と ODD なら種類ごとの番号 (1 から)
+        uint32_t sinceUs;                 // STRAY と ODD のとき、最後の返事からの時間 (us)
+        uint8_t cmd[9], cmdLen;           // コマンドのバイト列 (途中までなら受け取った分。0 なら実行中のコマンドはない)
+        uint8_t res[7], resLen;           // FAILED のとき、X68000 に見せたリザルト
+        uint8_t phase;                    // そのときの Phase
+        uint8_t select, control;          // X68000 が最後に書いたドライブ選択とドライブ制御
+        uint32_t ms;                      // そのときの段階に入ってから (ms)。NO_REPLY なら、読み出しを送ってから
+        uint32_t stray;                   // コマンドの 1 バイト目から数えた、捨てたバイト
+        uint32_t dmaCount, dmaGot;        // Write のコマンドのとき、1 バイト目を受け取ったときの DMAC の転送バイト数と、DMAC から受け取ったバイト数
+        bool reader;                      // ディスクの読み出し (#381) の間
+        bool dmaChain;                    // 同じく、DMAC がチェーンかコンティニューだった (か、動いていなかった)
+        uint32_t writes;                  // FUK に送った 'M' の数 (Stats::writeFrames)
+    };
+    static constexpr unsigned EVENTS = 64;                 // リングの大きさ (2 のべき乗)
+    static constexpr uint32_t EVENT_WINDOW_US = 10000000;  // この時間あたり、
+    static constexpr unsigned EVENT_WRITES = 16;           // 書き込みのコマンドの異常終了をここまで、
+    static constexpr unsigned EVENT_OTHERS = 4;            // そのほかのコマンドの異常終了をここまで記録する
+    static constexpr unsigned STRAY_FIRST = 4;             // 捨てたバイトとずれた返事は、種類ごとに先頭のこの数だけ
+                                                           // (ひと続きの書き込みが始まるか、TRACE_WINDOW_US たつたびに数え直す)
+    static constexpr unsigned TRACE_FIRST = 4, TRACE_LAST = 32; // ひと続きの書き込みの、先頭と最後のこの数だけ
+    static constexpr uint64_t TRACE_WINDOW_US = 600000000; // この時間あたり、
+    static constexpr unsigned TRACE_RUNS = 16;             // ひと続きの書き込みをここまで記録する
+    static constexpr uint64_t TRACE_QUIET_US = 10000000;   // これだけ間が空いたら終わり (ためた記録を積む)
+    static constexpr uint64_t TRACE_AGAIN_US = 120000000;  // WRITE ID から、この時間の間の書き込みも記録する
+    static constexpr unsigned HELD = 64;                   // 書き込みの間ためておく、先頭の TRACE と、捨てたバイト、ずれた返事の数
+    // 1 つ取り出す (なければ false)。1 つのスレッド (コア) だけから呼ぶ。ほかのスレッドが X68000 を動かしていてよい
+    bool takeEvent(Event& e);
+    // 記録せずに捨てた数 (上限を超えた、リングに入らなかった)。どのスレッドから読んでもよい
+    unsigned eventsDropped() const { return __atomic_load_n(&eventsDropped_, __ATOMIC_RELAXED); }
+    // 終わる前に、ためている記録を、リングに入るだけ積む (X68000 を動かすスレッドから)。残っていれば true
+    bool flushEvents();
+    static constexpr unsigned EVENT_TEXT = 400;
+    // 1 行の文字列にする (改行なし。EVENT_TEXT バイトあれば足りる)
+    static void formatEvent(const Event& e, char* out, unsigned size);
 
     explicit Fuk(FukLink& link, Host* host = nullptr);
     ~Fuk();
@@ -249,8 +324,25 @@ private:
     void reply(uint8_t tag, uint8_t v);
     void checkTimeouts();
     template <typename F> bool waitFor(F done);
-    void goOffline();
-    void relink();
+    void goOffline(int reason = -1);
+    void relink(int reason = -1); // reason は Event::Reason (記録しないなら -1)
+    void noteLinkLost(uint8_t reason);
+    void noteResult(uint8_t source);
+    void fillEvent(Event& e, uint8_t kind);
+    void pushEvent(const Event& e);
+    bool eventAllowed(bool write);
+    static const char* tagName(uint8_t tag);
+    void fillLastCommand(Event& e, uint8_t kind, uint8_t reason, uint32_t value);
+    void noteStray(uint8_t kind, uint32_t value);
+    void noteOdd(uint8_t kind, uint32_t value);
+    void checkResult();
+    void traceCommand(int op);
+    void traceResult(uint8_t source);
+    void serviceTrace();
+    void holdEvent(const Event& e);
+    void resetStrayQuota();
+    bool flushOne();
+    void popTrace();
     void linkChanged() {
         __atomic_store_n(&sharedReady_, ready(), __ATOMIC_RELEASE);
         __atomic_add_fetch(&linkChanges_, 1u, __ATOMIC_ACQ_REL);
@@ -286,6 +378,28 @@ private:
     bool sharedLock_ = false;   // sharedStats_ を読み書きしている間は true (__atomic_test_and_set)
     Stats sharedStats_;
     unsigned publishCount_ = 0;
+    Event events_[EVENTS];
+    unsigned eventHead_ = 0, eventTail_ = 0; // 積む側と取り出す側がそれぞれ進める (atomic)
+    unsigned eventsDropped_ = 0;             // atomic
+    uint64_t eventWindow_ = 0;
+    unsigned eventUsed_[2] = {0, 0};         // [0] 書き込み、[1] そのほか
+    uint8_t resSource_ = Event::FROM_FUK;    // 今のコマンドのリザルトを作ったもの
+    uint8_t strayUsed_[6] = {}, oddUsed_[5] = {};
+    bool tracing_ = false;     // ひと続きの書き込みの間 (記録しない回でも true。その間はリングに積まずにためる)
+    bool traceRecord_ = false; // この回を記録する
+    unsigned traceRuns_ = 0;
+    uint64_t traceWindow_ = 0, strayWindow_ = 0;
+    Event held_[HELD];                       // 古い順 (heldPos_ から heldCount_ 個)。書き込みの間は積まずにためる
+    unsigned heldPos_ = 0, heldCount_ = 0;
+    uint32_t traceNumber_ = 0;
+    uint64_t traceAt_ = 0, traceIdAt_ = 0;   // 最後に記録した時刻と、最後の WRITE ID の時刻
+    Event trace_[TRACE_LAST];                // 最後の記録 (古いものから上書きする。X68000 を動かすスレッドだけが触る)
+    unsigned tracePos_ = 0, traceCount_ = 0;
+    uint64_t cmdAt_ = 0, replyAt_ = 0;
+    uint8_t replyTag_ = 0;
+    uint32_t strayAtCmd_ = 0, dmaAtCmd_ = 0;
+    bool chainAtCmd_ = false;
+    uint8_t rawControl_ = 0; // X68000 が最後に書いたドライブ制御 (排出のビットも。lastControl_ は落としてある)
     bool queueOverflow_ = false;
 
     // つながり

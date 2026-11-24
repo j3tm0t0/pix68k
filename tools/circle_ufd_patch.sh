@@ -176,11 +176,11 @@ awk '
   END { if (n1 != 1 || n2 != 1 || n3 != 1) exit 1 }' "$4" > "$4.w" ||
   { echo "$3: the lines to patch were not found (types.h, GetSize, m_nBlockCount)" >&2; exit 1; }
 mv "$4.w" "$4"
-# 転送を断られた (STALL、完了コード 6) ことを、ほかの失敗と見分けられるようにする (制御転送だけ。
-# ほかの転送の USBErrorUnknown を見ているドライバがあるため)
+# 転送を断られた (STALL、完了コード 6) ことを、ほかの失敗と見分けられるようにする (制御転送と、
+# 待っている USB-FDD への転送だけ。ほかの転送の USBErrorUnknown を見ているドライバがあるため)
 awk '
   $0 == "\t\tCLogger::Get ()->Write (From, LogWarning, \"Transfer error %u on endpoint %u\"," {
-    print "\t\tif (uchCompletionCode == 6 && pURB->GetEndpoint ()->GetType () == EndpointTypeControl) pURB->SetUSBError (USBErrorStall);\t// pix68k (#386): 6 = Stall Error (xHCI)"
+    print "\t\tif (uchCompletionCode == 6 && (pURB->GetEndpoint ()->GetType () == EndpointTypeControl || (g_pPix68kXHCILongTimeoutDevice != 0 && pURB->GetEndpoint ()->GetDevice () == g_pPix68kXHCILongTimeoutDevice))) pURB->SetUSBError (USBErrorStall);\t// pix68k (#386): 6 = Stall Error (xHCI)"
     n++
   }
   { print }

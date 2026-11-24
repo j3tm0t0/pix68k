@@ -12,6 +12,7 @@
 //   $EAFA00-$EAFA0F  MIDI ボード CZ-6BM1 (YM3802。setMidiBoard() でつないだときだけ。x68k/ym3802.h)
 //   $ECC080-$ECC0FF  まーきゅりーゆにっと (setMercury() でつないだときだけ。$ECC000-$ECDFFF のほかはバスエラー)
 //   $ECE000-$ECE3FF  ネットワークボード Neptune-X (setNeptune() でつないだときだけ。x68k/neptune.h)
+//   ($EC0000-$ECFFFF はユーザ I/O 領域で、ユーザモードからも使える。ほかの I/O はスーパーバイザ専用: userBlocked())
 //   $ED0000-$ED3FFF  SRAM (16KB)
 //   $F00000-$FBFFFF  CGROM (768KB)
 //   $FC0000-$FDFFFF  SCSI の ROM (内蔵 SCSI の機種だけ。なければバスエラー)

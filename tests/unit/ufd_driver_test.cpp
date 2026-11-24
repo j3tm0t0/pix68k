@@ -19,7 +19,7 @@ typedef int boolean;
 #define PIX68K_LONG_TIMEOUT
 enum THeap { HEAP_DMA30 };
 void* operator new[](size_t n, THeap) noexcept { return malloc(n); }
-enum { REQUEST_OUT = 0, REQUEST_CLASS = 0x20, REQUEST_TO_INTERFACE = 1 };
+enum { REQUEST_OUT = 0, REQUEST_CLASS = 0x20, REQUEST_TO_INTERFACE = 1, REQUEST_TO_ENDPOINT = 2, CLEAR_FEATURE = 1, ENDPOINT_HALT = 0 };
 struct TSetupData {
     u8 bmRequestType, bRequest;
     uint16_t wValue, wIndex, wLength;
@@ -32,11 +32,15 @@ struct CXHCIEndpoint {
 struct CUSBEndpoint {
     CXHCIEndpoint x;
     CXHCIEndpoint* GetXHCIEndpoint() { return &x; }
+    u8 GetNumber() const { return 2; }
 };
 struct CUSBRequest {
+    CUSBEndpoint* ep;
     u8* data;
+    u32 size;
     TUSBError error = USBErrorUnknown;
-    CUSBRequest(CUSBEndpoint*, void* p, u32, TSetupData*) : data((u8*)p) {}
+    CUSBRequest(CUSBEndpoint* e, void* p, u32 n, TSetupData* = nullptr) : ep(e), data((u8*)p), size(n) {}
+    u32 GetResultLength() const { return size; }
     TUSBError GetUSBError() const { return error; }
 };
 struct CUSBHostController {
@@ -46,7 +50,18 @@ struct CUSBHostController {
     int failTransfer = 0; // 1 = データ、2 = 割り込み
     u8 last[12] = {}, out[8192] = {};
     CUSBEndpoint *in = nullptr, *outEp = nullptr;
+    int clears = 0, clearResult = 0;
+    TUSBError dataError = USBErrorUnknown;
+    int ControlMessage(CUSBEndpoint*, u8 type, u8 req, int feature, int endpoint, void*, int) {
+        CHECK_EQ(type == (REQUEST_TO_ENDPOINT | REQUEST_OUT) && req == CLEAR_FEATURE && feature == ENDPOINT_HALT && endpoint == 0x82, true);
+        clears++;
+        return clearResult;
+    }
     boolean SubmitBlockingRequest(CUSBRequest* r) {
+        if (r->ep == in) {
+            r->error = dataError;
+            return Transfer(in, r->data, r->size) >= 0;
+        }
         commands++;
         memcpy(last, r->data, 12);
         r->error = error;
@@ -221,6 +236,21 @@ void testBroken() {
         CHECK_EQ(command(d, kWrite, 8192, FALSE), 1);
         CHECK_EQ(command(d, kReady, 0, TRUE), 1);
         CHECK_EQ(d.host.sent(), sent);
+    }
+    // データの転送の STALL (読めないセクタ): 書き込みを許す前なら、入口を戻してセンスを読みに行く
+    for (int c = 0; c < 5; c++) {
+        CUSBFloppyDiskDevice d;
+        d.host.failTransfer = 1;
+        d.host.dataError = c == 1 ? USBErrorUnknown : USBErrorStall;
+        if (c == 2) CHECK_EQ(d.Pix68kArmWrite(8, 8), TRUE); // 許したあとは戻さない
+        if (c == 3) d.host.clearResult = -1;
+        const u8* cdb = c == 4 ? kWrite : kRead; // 書く転送は戻さない
+        if (c == 4) CHECK_EQ(d.Pix68kArmWrite(8, 8), TRUE);
+        CHECK_EQ(command(d, cdb, 8192, c == 4 ? FALSE : TRUE), c == 0 ? 2 : 3);
+        CHECK_EQ(d.epIn.x.resets, c == 0 ? 1 : 0);
+        CHECK_EQ(d.host.interrupts, 0);
+        d.host.failTransfer = 0;
+        CHECK_EQ(command(d, kReady, 0, TRUE), c == 0 ? 0 : 1);
     }
     // 書き込みを許す前の STALL は、入口を戻して続ける
     CUSBFloppyDiskDevice d;

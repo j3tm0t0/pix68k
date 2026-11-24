@@ -40,7 +40,7 @@ class Machine;
 class Sound;
 class Video;
 
-static constexpr uint32_t STATE_VERSION = 21; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
+static constexpr uint32_t STATE_VERSION = 22; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
                                              // 4: SPC の、TEMP に入れるバイトの読み込みを待っているか (Spc::tempPending_)
                                              // 5: 68000 の速さを変えて動かしたときの時間の端数 (Machine::speedFrac_)
                                              // 6: 68000 のバスのウェイトと DRAM リフレッシュの端数 (Machine の TIME の最後)
@@ -62,6 +62,8 @@ static constexpr uint32_t STATE_VERSION = 21; // 3: 拡張ボード (+60 と、�
                                              //     1/12800 サイクル (Cpu020::SUB) になった。14 までは読むときに 16 倍する
                                              // 16: 2 枚目の数値演算プロセッサボード ($E9E080)。+60 の bit4 と、中身の "FPU2"
                                              //     (1 枚目の "FPUB" の次。2 枚目があるときだけ)。0 枚か 1 枚なら並びは 15 と同じ
+// 22: 並びは 21 と同じ。システムポートのコントラストを画面に反映する (Video には SysPort の値を入れる)。21 までの 0 は、
+//     電源投入時の値とみなす (SysPort::state())
 // 21: まーきゅりーゆにっとの PCM を 62.5kHz に直すフィルタの履歴 ("MERC" の最後。Mercury::state())。20 までを読んだら、
 //     履歴は今の出力の値で埋める
 // 20: 音を出力の周波数に直すフィルタの履歴 ("SND " の最後。Sound::state())。19 までを読んだら、履歴は
@@ -71,6 +73,7 @@ static constexpr uint32_t STATE_VERSION = 21; // 3: 拡張ボード (+60 と、�
 // 18: TS-6BGA の BitBLT host 転送の途中の入力位置とDWORD FIFO。
 // 17: TS-6BGA の VRAM とレジスタ、+60 の bit5 (接続) と bit6 ($EF0000)。
 static constexpr uint32_t STATE_REWRITTEN_SCSI = 12;
+static constexpr uint32_t STATE_CONTRAST = 22;
 static constexpr uint32_t STATE_REWRITTEN_ADPCM = 13;
 static constexpr uint32_t STATE_SCC_RS232C = 14;
 static constexpr uint32_t STATE_CPU020_SUB = 15;

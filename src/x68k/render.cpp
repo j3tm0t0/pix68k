@@ -101,12 +101,22 @@
 //     行わない。bit14 の半透明は bit10 によらず行う。
 //   - 65536 色では、ワードの最下位ビットを 0 にして色を引く。
 //   - テキストの横のスクロールで実画面からはみ出した分は、反対側をつなげて出す (本では「表示がおかしくなる」)。
+//   - コントラスト (システムポート $E8E001、0..15) は、合成したドットの R、G、B にそれぞれ min(コントラスト, 14) / 14
+//     を掛ける (contrastGain())。14 は Human68k のふだんの値で、14 と 15 を今の色、0 を黒とした。14 と 15 を同じにしたこと、
+//     直線、0 で黒は決めたことで、実機の明るさを測った資料はない。ラインを描くときの値を使うので、フレームの途中で変えるとそのラインから変わる。IOCS の _CONTRAST でフェードインするソフト
+//     (電脳倶楽部パーフェクトコレクションのメニューなど) は、コントラスト 0 の間に VRAM を書き換えて見せない。
+//     色コードのまま渡すライン (IndexedLineSink) では、渡すパレットの色に先に掛ける。ただし、グラフィックの手前の
+//     テキスト / スプライトの色に、もとが 0 でなく掛けると 0 (透明) になるものがあるライン (コントラスト 1 のごく暗い色)
+//     は、渡さずにここで描く (sinkPalette())。
 //
 // 速さのための作り: 1 ラインごとに、各画面を色コードの並び (1 ドット 1 バイト) にしてから重ね、最後にパレットを引く。
 // 色コードの並びは 8 ドットずつ 64 ビットの値として扱う (リトルエンディアンの CPU を前提にしている)。
 #include "x68k/render.h"
 
 #include <string.h>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 namespace x68k {
 
@@ -824,13 +834,64 @@ inline void composeLayers(uint32_t* out, int w, int stacking, const uint8_t* fro
 
 } // namespace
 
-void Renderer::renderLine(int y) {
-    syncGeometry();
-    if (!surface_.pixels || y < 0 || y >= smaller(height_, surface_.rows)) return;
-    const int w = smaller(width_, surface_.columns);
-    if (w <= 0) return;
-    if (indexedSink_) indexedSink_->beginLine(y, w);
-    uint32_t* out = surface_.pixels + (size_t)y * (size_t)surface_.pitch;
+static constexpr uint32_t CONTRAST_UNITY = 256;
+
+// コントラストに対する明るさの倍率 (CONTRAST_UNITY が 1 倍)。今は min(c, 14) / 14 を 1/256 刻みに丸めたもの
+// (速さと、直線でない倍率にも替えられるようにするため。丸めずに掛けて四捨五入した値との差は 1 まで)。実機の明るさを測ったら、ここだけを変える
+// (倍率は CONTRAST_UNITY 以下にすること)
+static uint32_t contrastGain(unsigned c) {
+    const unsigned full = SysPort::CONTRAST_POWER_ON;
+    return c >= full ? CONTRAST_UNITY : (c * CONTRAST_UNITY + full / 2) / full;
+}
+
+// XRGB の R、G、B に倍率を掛けて四捨五入する。各 8 ビット x 256 以下 + 128 は 16 ビットに収まるので、R と B を 1 度に計算する
+static inline uint32_t dim(uint32_t p, uint32_t gain) {
+    const uint32_t rb = ((p & 0x00ff00ffu) * gain + 0x00800080u) >> 8 & 0x00ff00ffu;
+    const uint32_t g = ((p >> 8 & 0xffu) * gain + 0x80u) & 0xff00u;
+    return rb | g;
+}
+
+// ラインの各ドットの R、G、B にコントラストの倍率 (1 倍より小さい) を掛ける (先頭の決めたこと)
+void Renderer::applyContrast(int w, uint32_t* out, uint32_t gain) {
+    if (gain == 0) {
+        memset(out, 0, (size_t)w * sizeof *out);
+        return;
+    }
+    int x = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // dim() と同じ計算を 4 ドット (16 バイト) ずつ。1 倍では呼ばないので、倍率は 8 ビットに入る
+    const uint8x8_t k = vdup_n_u8((uint8_t)gain);
+    for (; x + 4 <= w; x += 4) {
+        const uint8x16_t p = vreinterpretq_u8_u32(vandq_u32(vld1q_u32(out + x), vdupq_n_u32(0x00ffffffu)));
+        const uint8x8_t lo = vrshrn_n_u16(vmull_u8(vget_low_u8(p), k), 8);
+        const uint8x8_t hi = vrshrn_n_u16(vmull_u8(vget_high_u8(p), k), 8);
+        vst1q_u32(out + x, vreinterpretq_u32_u8(vcombine_u8(lo, hi)));
+    }
+#endif
+    for (; x < w; x++) out[x] = dim(out[x], gain);
+}
+
+// 色はドットごとに決まるので、パレットの色に先にコントラストを掛けても、引いた色に掛けても同じになる。
+// ただしテキストとスプライトは色が 0 のドットを透明とするので (composeLayers())、front (テキスト側) で
+// もとが 0 でなく掛けると 0 になる色があれば (コントラスト 1 のごく暗い色)、透明かどうかが変わってしまうので
+// nullptr を返す。そのラインは色コードを渡さずにここで描く。倍率 0 ではグラフィックも黒になるので渡してよい。
+// 元のパレットと倍率が前と同じなら、作ってあるものを返す (パレットの中身で比べる)
+const uint32_t* Renderer::sinkPalette(const uint32_t* src, SinkPalette& cache, bool front) {
+    const uint32_t gain = contrastGain(video_.contrast());
+    if (gain == CONTRAST_UNITY) return src;
+    if (cache.gain != gain || !sameBytes(src, cache.seen, sizeof cache.seen)) {
+        memcpy(cache.seen, src, sizeof cache.seen);
+        cache.gain = gain;
+        cache.vanished = false;
+        for (int i = 0; i < 256; i++) {
+            cache.dimmed[i] = dim(src[i], gain);
+            if (src[i] && !cache.dimmed[i]) cache.vanished = true;
+        }
+    }
+    return front && gain && cache.vanished ? nullptr : cache.dimmed;
+}
+
+bool Renderer::composeLine(int y, int w, uint32_t* out) {
     const uint16_t r0 = video_.videoControl(0), r1 = video_.videoControl(1), r2 = video_.videoControl(2);
     const uint32_t* xrgb = video_.paletteXrgb();
     const uint32_t* const tlut = xrgb + 256;
@@ -849,7 +910,7 @@ void Renderer::renderLine(int y) {
                 textPairsValid_ = true;
             }
             drawTextOnly(video_, y, w, out, textPairs_);
-            return;
+            return true;
         }
         buildTextLine(video_, y, w, textLine_ + MARGIN);
         text = textLine_ + MARGIN;
@@ -889,17 +950,21 @@ void Renderer::renderLine(int y) {
                     codes = mergeLine_ + MARGIN;
                 }
             }
-            if (indexedSink_->above(y, w, codes, nullptr, tlut, nullptr)) return;
+            // 奥は黒なので、色が 0 になって透明になっても同じ (sinkPalette() の front は false でよい)
+            if (indexedSink_->above(y, w, codes, nullptr, sinkPalette(tlut, sinkText_, false), nullptr)) return false;
         }
         composeLayers(out, w, stacking, front, back, tlut, [](int) { return (uint32_t)0; });
-        return;
+        return true;
     }
-    if (indexedSink_ && !special && graphic == GRAPHIC_CODE && stacking == STACK_ABOVE &&
-        indexedSink_->above(y, w, front, graphicLine_ + MARGIN, tlut, xrgb)) return;
+    if (indexedSink_ && !special && graphic == GRAPHIC_CODE && stacking == STACK_ABOVE) {
+        const uint32_t* tp = sinkPalette(tlut, sinkText_, true);
+        if (tp && indexedSink_->above(y, w, front, graphicLine_ + MARGIN, tp, sinkPalette(xrgb, sinkGraphic_, false)))
+            return false;
+    }
     if (special) {
         const uint8_t* zero = zeroLine_ + MARGIN;
         composeSpecial(w, out, r2, graphic, front ? front : zero, back ? back : zero, stacking);
-        return;
+        return true;
     }
     if (graphic == GRAPHIC_WORD) {
         // 65536 色。ワードの上位バイトと下位バイトでそれぞれパレットを引いた色を、XRGB にしたものの表を使う
@@ -920,10 +985,24 @@ void Renderer::renderLine(int y) {
         const uint32_t* th = wordHiXrgb_;
         const uint32_t* tl = wordLoXrgb_;
         composeLayers(out, w, stacking, front, back, tlut, [=](int x) { return th[word[x] >> 8] | tl[word[x] & 0xff]; });
-        return;
+        return true;
     }
     const uint8_t* gcode = graphicLine_ + MARGIN;
     composeLayers(out, w, stacking, front, back, tlut, [=](int x) { return xrgb[gcode[x]]; });
+    return true;
+}
+
+void Renderer::renderLine(int y) {
+    syncGeometry();
+    if (!surface_.pixels || y < 0 || y >= smaller(height_, surface_.rows)) return;
+    const int w = smaller(width_, surface_.columns);
+    if (w <= 0) return;
+    if (indexedSink_) indexedSink_->beginLine(y, w);
+    uint32_t* out = surface_.pixels + (size_t)y * (size_t)surface_.pitch;
+    // 色コードを渡した先が描くラインは、渡すパレットにコントラストを掛けてある (sinkPalette())
+    if (!composeLine(y, w, out)) return;
+    const uint32_t gain = contrastGain(video_.contrast());
+    if (gain != CONTRAST_UNITY) applyContrast(w, out, gain);
 }
 
 } // namespace x68k

@@ -39,6 +39,7 @@
 #include "platform/input_map.h"
 #include "platform/pad_map.h"
 #include "platform/pad_setup.h"
+#include "platform/key_log.h"
 #include "platform/key_merge.h"
 #include "platform/key_remap.h"
 #include "platform/key_tracker.h"
@@ -48,9 +49,11 @@
 #include "platform/osd.h"
 #include "platform/osd_bars.h"
 #include "platform/boot_warn.h"
+#include "platform/file_replace.h"
 #include "platform/osd_message.h"
 #include "platform/reboot_keys.h"
 #include "platform/settings_file.h"
+#include "platform/ufi_gate.h"
 #include "platform/update_rollback.h"
 #include "platform/sample_clock.h"
 #include "platform/sound_info.h"
@@ -303,7 +306,7 @@ private:
     void LoadOpnRhythm();
     static FRESULT ReadFileChecked(const char* path, u8*& data, unsigned& size);
     static FRESULT WriteFileReplacing(const char* path, const char* tmp, const void* data, unsigned size);
-    static FRESULT ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size, bool& usedTmp);
+    static platform::ReadFrom<FRESULT> ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size);
     u8* ReadRom(const char* name, unsigned size);
     bool LoadDisk(int drive, const char* name);
     void StartFuk(Emulator* emu); // fuk=on: FUK を探し、見つかれば内蔵の FDC の代わりに使う (#295)
@@ -312,6 +315,16 @@ private:
     bool PauseForFukRead();
     void FinishFukRead();
     void ReportFuk();             // FUK とのやり取りの数をログに出す
+#if RASPPI >= 4
+    // XDF を実物のディスクに書き戻す (ufd_restore.inc。#386)
+    struct TUfdWrite;
+    TUfdWrite* m_pUfdWrite = nullptr;
+    u8* m_pUfdBuf = nullptr;
+    void WarnUfdWrite();
+public:
+    bool ufdProgress(int phase, unsigned done, unsigned total);
+private:
+#endif
     bool LoadRealFloppy(int drive, int unit); // fd<N>=usb-fdd:<unit> (unit は 0 から。USB-FDD の実物のディスクを読む。#286)
     bool m_RealFloppy[2] = {false, false};    // m_pDisks[drive] は USB-FDD から読んだディスク (書き出せる。#287)
     u8* m_pRealFloppyBuf[2] = {nullptr, nullptr}; // USB-FDD から読んだイメージの置き場 (ドライブごと。一度確保したら使い回す)
@@ -389,6 +402,12 @@ private:
     void resetMachine() override;
     bool hasRealFloppy(int drive) const override { return m_RealFloppy[drive]; }
     bool saveFloppyImage(int drive, platform::MenuText& msg) override;
+#if RASPPI >= 4
+    int floppyWriteUnit() const override { return platform::UfiGate::enabledUnit(); }
+    bool prepareFloppyWrite(const char* name, FloppyWriteInfo& info, platform::MenuText& msg) override;
+    bool runFloppyWrite(bool acceptPartial, platform::MenuText& msg) override;
+    void cancelFloppyWrite() override;
+#endif
     const char* rollbackVersion() const override { return m_HasRollback ? m_Rollback.version : nullptr; }
     bool rollBack(platform::MenuText& msg) override;
     bool saveState(int slot, platform::MenuText& msg) override;
@@ -847,6 +866,7 @@ private:
     uint64_t m_OsdEmuFrames = 0;           // 前に数えたときの X68000 のフレームの数 (Emulator::stats()。fps を出す)
     uint32_t m_OsdPublished = 0;       // ExpireOsd() が前に見た、合成したフレームの数
     u64 m_OsdPublishedTicks = 0;       // その数が変わった時刻
+    platform::KeyLogFilter m_KeyLog[MaxKeyboards]; // キーボードごとの、ログに出した最後のキーの状態 (#360)
     platform::KeyRemap m_KeyRemap[MaxKeyboards]; // キーボードごとの、種類に合わせたレポートの書き換え (Pi 400 の切り替えのキーなど)
     // キーボードごとの押しているキー (書き換えたあと) を合わせる。最後の枠 (VirtualKeyboard) はネットワークからのキー入力
     static constexpr int VirtualKeyboard = MaxKeyboards;

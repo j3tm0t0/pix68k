@@ -169,6 +169,16 @@
 
 namespace {
 
+// FUK の異常終了したコマンドと、つなぎ直した理由 (#400)
+void logFukEvents(x68k::Fuk& fuk) {
+    x68k::Fuk::Event e;
+    while (fuk.takeEvent(e)) {
+        char text[x68k::Fuk::EVENT_TEXT];
+        x68k::Fuk::formatEvent(e, text, sizeof text);
+        fprintf(stderr, "fuk: %s\n", text);
+    }
+}
+
 // ホスト版の設定の既定の値。video_scale はウィンドウに合わせて 4:3 を保って最大 (aspect。ウィンドウが小さくても切らない)。
 // v0.1.0 の scale= と scanline= は、v0.1.0 のホスト版と同じく読まない
 // (ベアメタル版の項目として残す。保存でも書き直さない)
@@ -2438,6 +2448,7 @@ int runMachine(Options& opt) {
             video->setMixer(&mixer.view());
         }
         video->present(screen, renderer.width(), renderer.height(), x68k::Renderer::MAX_WIDTH);
+        if (fuk) logFukEvents(*fuk);
         if (opt.maxSpeed)
             maxSpeed.update(*m, (uint64_t)((double)(m->totalCycles() - frameCycles) * 1e6 / cpuHz),
                             (SDL_GetPerformanceCounter() - frameTicks) * 1000000 / freq);
@@ -2475,12 +2486,19 @@ int runMachine(Options& opt) {
     printf("%ld frames: emulated %.3f s, wall %.3f s (%.1f%% of real time), %.2f frames/s emulated\n", frame, emuSec,
            wallSec, wallSec > 0 ? emuSec / wallSec * 100.0 : 0.0, emuSec > 0 ? frame / emuSec : 0.0);
     if (fuk) {
+        logFukEvents(*fuk);
+        while (fuk->flushEvents()) logFukEvents(*fuk);
+        logFukEvents(*fuk);
         const x68k::Fuk::Stats& st = fuk->stats();
         printf("fuk: %u reads (reply in %llu us on average, %u us at most), %u read frames, %u write frames; "
-               "waited %u times (%llu us, %u timed out), yielded %llu us; %u timeouts, %u links, %u stray bytes, %u cancelled writes\n",
+               "waited %u times (%llu us, %u timed out), yielded %llu us; %u timeouts, %u links, %u stray bytes, %u cancelled writes, "
+               "%u refused writes, %u events not logged\n",
                st.reads, (unsigned long long)(st.replies ? st.replyUs / st.replies : 0), st.replyMaxUs, st.readFrames,
                st.writeFrames, st.waits, (unsigned long long)st.waitUs, st.waitTimeouts, (unsigned long long)st.yieldUs,
-               st.timeouts, st.links, st.stray, st.cancelledWrites);
+               st.timeouts, st.links, st.stray, st.cancelledWrites, st.refusedWrites, fuk->eventsDropped());
+        printf("fuk: stray bytes: %u port 1, %u late result, %u unknown port 2, %u 'W', %u 'w', %u 'R'; odd replies: %u early, "
+               "%u result, %u PCN, %u status, %u sync\n", st.strays[0], st.strays[1], st.strays[2], st.strays[3], st.strays[4],
+               st.strays[5], st.odd[0], st.odd[1], st.odd[2], st.odd[3], st.odd[4]);
         // DMA の Read を届いた時刻の間隔で渡したもの (#320)。late は、渡す時刻より 64 us を超えて遅れて届いたバイトのあった Read
         printf("fuk: %u timed reads, lead %llu us in all, %u late (%u us at most), %u stamps dropped\n", st.timedReads,
                (unsigned long long)st.leadUs, st.lateReads, st.lateMaxUs, fukLink ? fukLink->droppedStamps() : 0u);

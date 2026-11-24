@@ -135,6 +135,7 @@ void VideoReplayer::apply(uint32_t e) {
             __atomic_store_n(&frames_, frames_ + 1, __ATOMIC_RELEASE);
         }
         else if (off == VideoJournal::CTL_VDISP) shadow_.beginVerticalDisplay();
+        else if (off == VideoJournal::CTL_CONTRAST) shadow_.setContrast(v);
         break;
     }
 }

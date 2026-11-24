@@ -1416,6 +1416,8 @@ void CKernel::KeyStatusHandlerRaw(unsigned char modifiers, const unsigned char r
     if (slot < 0 || slot >= MaxKeyboards) return;
     s_pThis->KeyReport(slot, modifiers, rawKeys);
     if (s_pThis->m_pEmulator != nullptr) return;
+    // 前と同じ内容のレポートでは出さない
+    if (!s_pThis->m_KeyLog[slot].changed(modifiers, rawKeys)) return;
     CString msg;
     msg.Format("key: mod=%02X", (unsigned)modifiers);
     for (unsigned i = 0; i < 6; i++) {
@@ -1438,6 +1440,7 @@ void CKernel::KeyboardRemovedHandler(CDevice* device, void* context) {
     // キューの書き手を 1 つにするため、USB の割り込みを止めて送る
     EnterCritical();
     k->m_pKeyboard[slot] = nullptr;
+    k->m_KeyLog[slot].reset();
     k->m_KeyRemap[slot].reset(); // 押していたキーの置き換え先と Num Lock の状態を忘れる
     k->m_KeyMerge.clear(slot);
     k->DispatchKeys();

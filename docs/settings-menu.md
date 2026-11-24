@@ -19,6 +19,8 @@ PC につながずに、ディスクの入れ替えや設定の変更ができ�
   - Save FD0 image / Save FD1 image (ベアメタル版で、そのドライブに USB-FDD から読んだ実物のディスクが入っているときだけ出る): ディスクを
     `/pix68k/FD-<CRC-32>.XDF` (例: `FD-602F7858.XDF`) に書き出す。同じ名前のファイルがあれば、書き出し済みとして何もしない (上書きしない)。書いたあと読み戻して確かめる。
     書き出したイメージは FD0 / FD1 の一覧に出る。実物のディスクには書かない
+  - Write XDF (ベアメタル版の Pi 4 / Pi 5 で、`experimental_usb_fdd_write=` を書いたときだけ出る。**experimental**。実物で試した範囲は [disks-and-scsi.md](disks-and-scsi.md)): XDF のイメージを、
+    USB-FDD に入れた実物のディスクに書く。今の中身を控えてから尋ねる (はじめは「No」)。[disks-and-scsi.md](disks-and-scsi.md) の「XDF を実物のディスクに書き戻す」
   - HD0 (SASI): `.hdf` の一覧から選ぶ。次の起動から
   - CD-ROM: `.iso` と `.cue` の一覧から選ぶ。CD-ROM 装置をつないで起動していれば、すぐに媒体を入れ替える ((none) で取り出す。読めないイメージを選んだときは、入っている媒体はそのまま。ベアメタル版で、前の媒体を外したあとにメモリが足りなかったときは、装置は空になり、そう出す)。つないでいなければ次の起動から (外付け SCSI ボードか、X68030 / 060turbo の内蔵 SCSI が要る)
   - SCSI board (68000 のとき): 外付け SCSI ボード (`scsi_ex`)。次の起動から
@@ -38,8 +40,8 @@ PC につながずに、ディスクの入れ替えや設定の変更ができ�
     - Bezel: モニタの枠 (`video_filter` の `cz-600de` / `cz-600db`)。off、cz-600de (グレー)、cz-600db (黒) の順に替える。ベアメタル版だけに出す。
       初めて選んだときに起動したドライブの `/pix68k/bezel-cz-600de.bin` などを読み、読めなければ選ばない。枠があるときは、主のページの Display は
       「cz-600de + scanline,curve,mask」のように、拡大の代わりに枠の名前を出す (枠はガラスの部分に写し、Scale を使わない)
-  - Sound mixer: Enter で音のミキサーのページに入る (Esc か Back で戻る。#300)。この項目と Gamepad setup で、主のページは 68000 のベアメタル版で 32 行 (Roll back が出ているときは 33 行) になり、
-    960x540 (Raspberry Pi 2 の既定。出せるのは 31 行) では 1 行 (33 行なら 2 行)、768x512 では 2 行 (同 3 行) あふれて、選んでいる行に合わせて動かして出す。主のページには、0 dB から変えた音量の数を出す (「default」か「2 changed」)。
+  - Sound mixer: Enter で音のミキサーのページに入る (Esc か Back で戻る。#300)。この項目と Gamepad setup で、主のページは 68000 のベアメタル版で 32 行 (Roll back と、書き込みを許したときの Write XDF が出ていれば、1 つにつき 1 行増える) になり、
+    960x540 (Raspberry Pi 2 の既定。出せるのは 31 行) では 1 行、768x512 では 2 行 (増えた分だけさらに) あふれて、選んでいる行に合わせて動かして出す。主のページには、0 dB から変えた音量の数を出す (「default」か「2 changed」)。
     ページの見出しの下に、いまの設定で使える音源を 1 行で出す (「OPM ADPCM MERC(PCM+OPN3) MIDI:MT-32 CD」。#310。MIDI の音源を用意できなければ「MIDI:MT-32 (no ROM)」、「MIDI:SF2 (no SF2)」、「MIDI:MT-32 (failed)」)
     - OPM、ADPCM、Mercury PCM、YMF288、MIDI、CD、Master: 音源ごとの音量と全体の音量 (`vol_opm`、`vol_adpcm`、`vol_mercury`、`vol_ymf288`、
       `vol_midi`、`vol_cd`、`vol_master`)。←→ で 1 dB ずつ、-40 dB から +12 dB まで変え、-40 の下は無音 (off)。変えるとすぐに反映する

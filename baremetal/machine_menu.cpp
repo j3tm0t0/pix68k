@@ -388,8 +388,7 @@ const char* CKernel::SavePadMap(const platform::PadMap& map, int slot) {
     tmp.Format("%s/pix68k/pads.new", m_BootDrive);
     u8* old = nullptr;
     unsigned oldSize = 0;
-    bool usedTmp = false;
-    FRESULT r = ReadWithFallback(txt, tmp, old, oldSize, usedTmp);
+    FRESULT r = ReadWithFallback(txt, tmp, old, oldSize).result;
     if (r != FR_OK && r != FR_NO_FILE && r != FR_NO_PATH) {
         // 読めないまま書くと、ほかの機種の行が消える
         m_Logger.Write(FromMenu, LogWarning, "%s: cannot read (FRESULT %d); not saved", (const char*)txt, (int)r);
@@ -544,10 +543,10 @@ bool CKernel::loadState(int slot, platform::MenuText& msg) {
     StatePath(tmp, m_BootDrive, slot, "new");
     unsigned size = 0;
     u8* data = nullptr;
-    bool usedTmp = false;
     // 置き換えの途中で止まったときは .new だけが残っている (.p68 がないときだけ .new を読む)
-    const FRESULT r = ReadWithFallback(path, tmp, data, size, usedTmp);
-    if (usedTmp) path = tmp;
+    const platform::ReadFrom<FRESULT> from = ReadWithFallback(path, tmp, data, size);
+    const FRESULT r = from.result;
+    if (from.usedTmp) path = tmp;
     if (r != FR_OK || data == nullptr) {
         if (r == FR_NO_FILE || r == FR_NO_PATH) msg.add("no state ").add((long)slot);
         else msg.add("cannot read state ").add((long)slot);

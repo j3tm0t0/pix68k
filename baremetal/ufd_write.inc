@@ -91,12 +91,32 @@ int CUSBFloppyDiskDevice::Pix68kCommand (const u8 *pCmdBlk, void *pBuffer, size_
 
 	if (nBufLen > 0)
 	{
-		if (!bIn)
+		int nResult = -1;
+		if (bIn)
+		{
+			CUSBRequest DataURB (m_pEndpointIn, m_pPix68kBuffer, nBufLen);
+			if (pHost->SubmitBlockingRequest (&DataURB))
+			{
+				nResult = DataURB.GetResultLength ();
+			}
+			// 読めないセクタを、データの転送の STALL で知らせるドライブ。まだ一度も書き込みを許していなければ、
+			// 入口を戻して、センスを読みに行く (読めないセクタのあるディスクの、読めるところを読むため)。
+			// 割り込みの 2 バイトは待たない
+			else if (   !m_bPix68kArmed
+				 && DataURB.GetUSBError () == USBErrorStall
+				 && pHost->ControlMessage (GetEndpoint0 (), REQUEST_TO_ENDPOINT | REQUEST_OUT, CLEAR_FEATURE,
+							   ENDPOINT_HALT, m_pEndpointIn->GetNumber () | 0x80, 0, 0) >= 0
+				 && m_pEndpointIn->GetXHCIEndpoint ()->ResetFromHalted ())
+			{
+				return 2;
+			}
+		}
+		else
 		{
 			memcpy (m_pPix68kBuffer, pBuffer, nBufLen);
+			nResult = pHost->Transfer (m_pEndpointOut, m_pPix68kBuffer, nBufLen);
 		}
 
-		int nResult = pHost->Transfer (bIn ? m_pEndpointIn : m_pEndpointOut, m_pPix68kBuffer, nBufLen);
 		if (nResult < 0)
 		{
 			m_bPix68kBroken = TRUE;

@@ -80,6 +80,8 @@ void testImageName() {
     memset(name, 'x', sizeof name);
     realFloppyImageName(0x602f7858u, name);
     CHECK_EQ(strcmp(name, "FD-602F7858.XDF"), 0);
+    realFloppyImageName(0x602f7858u, name, true);
+    CHECK_EQ(strcmp(name, "FD-602F7858-PARTIAL.XDF"), 0);
     CHECK_EQ(strlen(name) + 1, REAL_FLOPPY_IMAGE_NAME_SIZE);
     realFloppyImageName(0x0000000au, name);
     CHECK_EQ(strcmp(name, "FD-0000000A.XDF"), 0);

@@ -145,7 +145,8 @@
 #include "platform/real_floppy.h"
 #include "fuk_usb.h"
 #include "x68k/fuk.h"
-#include "platform/ufi_gate.h"
+#include "platform/floppy_restore.h"
+#include "platform/floppy_write_text.h"
 #include "x68k/fuk_reader.h"
 #include "platform/setting_warning.h"
 #include "platform/mt32_synth.h"
@@ -569,7 +570,7 @@ bool CKernel::CancelProfileChoice() {
 
 // WriteFileReplacing() で書いたファイルを読む。path がないときだけ tmp を読む (path があれば、空でも path)
 // (手順は platform/file_replace.h の readWithFallback())
-FRESULT CKernel::ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size, bool& usedTmp) {
+platform::ReadFrom<FRESULT> CKernel::ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size) {
     struct Reader {
         u8*& data;
         unsigned& size;
@@ -577,7 +578,7 @@ FRESULT CKernel::ReadWithFallback(const char* path, const char* tmp, u8*& data, 
         bool missing(FRESULT r) const { return r == FR_NO_FILE || r == FR_NO_PATH; }
         bool ok(FRESULT r) const { return r == FR_OK; }
     } reader{data, size};
-    return platform::readWithFallback(reader, path, tmp, usedTmp);
+    return platform::readWithFallback(reader, path, tmp);
 }
 
 // ROM を /pix68k、なければルートから読む。大きさが違えば読まなかったことにする
@@ -607,9 +608,9 @@ FRESULT CKernel::LoadConfigText(const char* name, const char* tmpName, platform:
     tmp.Format("%s/pix68k/%s", m_BootDrive, tmpName);
     u8* data = nullptr;
     unsigned size = 0;
-    bool usedTmp = false;
-    const FRESULT r = ReadWithFallback(cfg, tmp, data, size, usedTmp);
-    path = usedTmp ? tmp : cfg;
+    const platform::ReadFrom<FRESULT> from = ReadWithFallback(cfg, tmp, data, size);
+    const FRESULT r = from.result;
+    path = from.path;
     const bool loaded = text.load(r == FR_OK && data != nullptr ? (const char*)data : "", r == FR_OK ? size : 0);
     delete[] data;
     // メモリが足りずに中身を持てなければ、読めなかったことにする (空のまま書き直して、ほかの行を消さないように)
@@ -624,10 +625,10 @@ void CKernel::LoadPadMaps() {
     tmp.Format("%s/pix68k/pads.new", m_BootDrive);
     u8* data = nullptr;
     unsigned size = 0;
-    bool usedTmp = false;
-    const FRESULT r = ReadWithFallback(txt, tmp, data, size, usedTmp);
+    const platform::ReadFrom<FRESULT> from = ReadWithFallback(txt, tmp, data, size);
+    const FRESULT r = from.result;
     if (r == FR_NO_FILE || r == FR_NO_PATH) return;
-    const char* path = usedTmp ? (const char*)tmp : (const char*)txt;
+    const char* path = from.path;
     if (r != FR_OK) {
         m_Logger.Write(FromMachine, LogWarning, "%s: cannot read (FRESULT %d)", path, (int)r);
         return;
@@ -702,9 +703,9 @@ void CKernel::ReadConfig() {
     ReapplyInputSettings(keyboard, hat);
 }
 
-// experimental_usb_fdd_write=usb-fdd:N: そのドライブの書き込みの命令を許す (#386。既定では閉じている。まだ書く手順はない)。
+// experimental_usb_fdd_write=usb-fdd:N: そのドライブの書き込みの命令を許す (#386。既定では閉じている)。
 // path は読んだファイル、base はその中身
-void CKernel::EnableUsbFloppyWrite(bool readOk, const char* path, const platform::ConfigText& base) {
+void CKernel::EnableUsbFloppyWrite(const bool readOk, const char* const path, const platform::ConfigText& base) {
     CString cfg;
     cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);
     char value[platform::ConfigText::MAX_LINE];
@@ -718,7 +719,7 @@ void CKernel::EnableUsbFloppyWrite(bool readOk, const char* path, const platform
 #if RASPPI >= 4
     platform::UfiGate::enable(unit);
     m_Logger.Write(FromMachine, LogWarning,
-                   "EXPERIMENTAL: experimental_usb_fdd_write=usb-fdd:%d (this version has only the command layer and never writes)",
+                   "EXPERIMENTAL: experimental_usb_fdd_write=usb-fdd:%d (Write XDF in the settings menu can overwrite the disk)",
                    unit);
 #else
     m_Logger.Write(FromMachine, LogWarning, "experimental_usb_fdd_write=%s: needs a Pi 4 or Pi 5; not enabled", value);
@@ -871,7 +872,9 @@ bool CKernel::LoadDisk(int drive, const char* name) {
         if (name[0] == '/') path.Format("%s%s", m_BootDrive, name);
         else path.Format("%s/pix68k/%s", m_BootDrive, name);
         tmp.Format("%s.new", (const char*)path);
-        if (ReadWithFallback(path, tmp, data, size, usedTmp) != FR_OK || data == nullptr) {
+        const platform::ReadFrom<FRESULT> from = ReadWithFallback(path, tmp, data, size);
+        usedTmp = from.usedTmp;
+        if (from.result != FR_OK || data == nullptr) {
             delete[] data;
             m_Logger.Write(FromMachine, LogWarning, "fd%d: cannot read %s", drive, (const char*)path);
             return false;
@@ -881,7 +884,9 @@ bool CKernel::LoadDisk(int drive, const char* name) {
         for (const char* ext : exts) {
             path.Format("%s/pix68k/fd%d.%s", m_BootDrive, drive, ext);
             tmp.Format("%s.new", (const char*)path);
-            if (ReadWithFallback(path, tmp, data, size, usedTmp) == FR_OK && data != nullptr) break;
+            const platform::ReadFrom<FRESULT> from = ReadWithFallback(path, tmp, data, size);
+            usedTmp = from.usedTmp;
+            if (from.result == FR_OK && data != nullptr) break;
             delete[] data;
             data = nullptr;
         }
@@ -1060,6 +1065,13 @@ void CKernel::StartFuk(Emulator* emu) {
 void CKernel::ServiceFuk() {
     if (m_pFukUsb == nullptr) return;
     m_pFukUsb->Scan();
+    // 異常終了したコマンドと、つなぎ直した理由など (コア 1 が積んだもの)。1 回に 1 件 (残りは次の回)
+    x68k::Fuk::Event event;
+    if (m_pFuk->takeEvent(event)) {
+        char text[x68k::Fuk::EVENT_TEXT];
+        x68k::Fuk::formatEvent(event, text, sizeof text);
+        m_Logger.Write(FromMachine, LogNotice, "fuk: %s", text);
+    }
     const unsigned changes = m_pFuk->linkChanges(); // コア 1 が書く (atomic)
     if (changes == m_FukChanges) return;
     m_FukChanges = changes;
@@ -1238,10 +1250,16 @@ void CKernel::ReportFuk() {
     const CFukUsb::Counters& c = m_pFukUsb->GetCounters();
     m_Logger.Write(FromMachine, LogNotice,
                    "fuk: %u reads (reply in %u us on average, %u us at most), %u read frames, %u write frames; waited %u times "
-                   "(%u us, %u timed out), yielded %u us; %u timeouts, %u links, %u stray bytes, %u cancelled writes",
+                   "(%u us, %u timed out), yielded %u us; %u timeouts, %u links, %u stray bytes, %u cancelled writes, %u refused writes, "
+                   "%u events not logged",
                    st.reads, st.replies ? (unsigned)(st.replyUs / st.replies) : 0, st.replyMaxUs, st.readFrames,
                    st.writeFrames, st.waits, (unsigned)st.waitUs, st.waitTimeouts, (unsigned)st.yieldUs, st.timeouts, st.links,
-                   st.stray, st.cancelledWrites);
+                   st.stray, st.cancelledWrites, st.refusedWrites, m_pFuk->eventsDropped());
+    m_Logger.Write(FromMachine, LogNotice,
+                   "fuk: stray bytes: %u port 1, %u late result, %u unknown port 2, %u 'W', %u 'w', %u 'R'; odd replies: "
+                   "%u early, %u result, %u PCN, %u status, %u sync",
+                   st.strays[0], st.strays[1], st.strays[2], st.strays[3], st.strays[4], st.strays[5], st.odd[0], st.odd[1],
+                   st.odd[2], st.odd[3], st.odd[4]);
     m_Logger.Write(FromMachine, LogNotice,
                    "fuk usb: sent %u+%u bytes, received %u+%u, %u IPIs, %u send failures, %u receive stops, %u removals, "
                    "%u bytes dropped",
@@ -1499,6 +1517,10 @@ bool CKernel::saveFloppyImage(int drive, platform::MenuText& msg) {
     }
     return platform::floppyImageSaved(r);
 }
+
+#if RASPPI >= 4
+#include "ufd_restore.inc"
+#endif
 
 // HTTP のタスクが、フロッピーディスクのイメージの写しのバッファ (bytes バイト) を確保してよいか (ヒープの空きを見る。
 // Circle の new は足りないと全体を止める)
@@ -2418,6 +2440,9 @@ TShutdownMode CKernel::RunMachine() {
     // 主な確保 (X68000 のメモリ、ディスクのイメージ、MIDI の音源の ROM と SoundFont) を終えたあとのヒープの使った量
     // (それぞれの大きさは、読んだときのログに出ている)
     ReportHeap(FromMachine, "after loading");
+#if RASPPI >= 4
+    WarnUfdWrite(); // 画面に出せるのは 1 つなので、SRAM の警告を優先する
+#endif
     WarnSramBoot();
     for (;;) {
         ShowTsFrame();

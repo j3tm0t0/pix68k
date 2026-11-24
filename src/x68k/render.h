@@ -62,6 +62,19 @@ private:
     static constexpr int LINE_SIZE = MAX_WIDTH + 2 * MARGIN;
 
     void syncGeometry();
+    // ライン y を合成して out (w ドット) に書く。色コードを渡した先が描くと引き受けたときは書かずに false を返す
+    bool composeLine(int y, int w, uint32_t* out);
+    void applyContrast(int w, uint32_t* out, uint32_t gain); // コントラストの倍率 (1 倍より小さい) を掛ける
+    // 色コードを渡す先に渡すパレット。元の 256 色と倍率が前と同じなら作り直さない
+    struct SinkPalette {
+        uint32_t seen[256] = {};   // 元のパレット
+        uint32_t dimmed[256] = {}; // コントラストを掛けたもの
+        uint32_t gain = ~0u;       // 掛けた倍率 (~0 はまだ作っていない)
+        bool vanished = false;     // もとが 0 でなく、掛けると 0 になる色があるか
+    };
+    // コントラストの倍率が 1 なら src、そうでなければ掛けたもの (cache の中) を返す。front (奥にグラフィックがある
+    // テキスト側) で、掛けると透明になってしまう色があれば nullptr (渡さない)
+    const uint32_t* sinkPalette(const uint32_t* src, SinkPalette& cache, bool front);
     void buildColorSplitTables();
     bool buildSpriteLine(int y, int w);
     int buildGraphicLine(int y, int w, uint16_t r0, uint16_t r1, uint16_t r2, bool split);
@@ -115,6 +128,7 @@ private:
     uint32_t textPairsSeen_[16];
     bool textPairsValid_ = false;
     IndexedLineSink* indexedSink_ = nullptr;
+    SinkPalette sinkText_, sinkGraphic_;
 };
 
 } // namespace x68k

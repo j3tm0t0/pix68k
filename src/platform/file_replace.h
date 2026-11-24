@@ -60,21 +60,28 @@ FsResult replaceFile(Fs& fs, const char* path, const char* tmp, const void* data
 }
 
 // replaceFile() で書いたファイルを読む。path があれば path を読み (空でも path)、path がないときだけ tmp を読む。
-// tmp を読めたら usedTmp を true にする。返すのは、path を読んだ結果か、path がなくて tmp を読んだ結果
+// 読んだファイルのパス (path か tmp) と、tmp を読めたかも返す (書きかけの tmp の中身を、path のものと取り違えないように)。
+// 結果は、path を読んだ結果か、path がなくて tmp を読んだ結果
 // (tmp もなければ path の結果)。結果の型 R は Fs が決める (ベアメタル版は FatFs の FRESULT)。Fs が持つもの:
 //   R    read(const char* path)   読む (読んだ中身は Fs が持つ)
 //   bool missing(R r)             ファイルがない (FatFs では FR_NO_FILE と FR_NO_PATH)
 //   bool ok(R r)                  読めた
+template <class R> struct ReadFrom {
+    R result;
+    const char* path; // 読んだファイル (呼んだ側が渡した path か tmp のポインタ)。読めなければ path
+    bool usedTmp;     // tmp を読めた
+};
+
 template <class Fs>
-auto readWithFallback(Fs& fs, const char* path, const char* tmp, bool& usedTmp) -> decltype(fs.read(path)) {
-    usedTmp = false;
+auto readWithFallback(Fs& fs, const char* path, const char* tmp) -> ReadFrom<decltype(fs.read(path))> {
+    bool usedTmp = false;
     auto r = fs.read(path);
     if (fs.missing(r)) {
         auto t = fs.read(tmp);
         if (fs.ok(t)) usedTmp = true;
         if (!fs.missing(t)) r = t;
     }
-    return r;
+    return {r, usedTmp ? tmp : path, usedTmp};
 }
 
 } // namespace platform

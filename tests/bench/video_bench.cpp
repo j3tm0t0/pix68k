@@ -1,7 +1,9 @@
 // 画面の合成 (Renderer::renderFrame) にかかる時間を測る (テストではない)。
 // 場面ごとに何フレームか描き、1 フレームの時間 (ミリ秒) の最小と中央を出す。
 //
-//   video_bench [-n フレーム数] [場面...]   (場面を省くと全部)
+//   video_bench [-n フレーム数] [-c コントラスト] [--sink] [場面...]   (場面を省くと全部)
+//
+//   -c は $E8E001 の値 (0..15。省くと 14 = 通常)、--sink は色コードを渡す先 (libretro の GPU) に渡すだけにする
 //
 // 場面 (名前で選ぶ):
 //   fill768      下限の目安。768x512 の画素を 1 色で埋めるだけ (Renderer は使わない)
@@ -16,7 +18,8 @@
 //
 // Pi (Linux) ではベアメタルと同じ -O2 で次のようにビルドする:
 //   g++ -O2 -mcpu=cortex-a53 -std=c++17 -Isrc tests/bench/video_bench.cpp \
-//       src/x68k/video.cpp src/x68k/gvram.cpp src/x68k/render.cpp -o video_bench
+//       src/x68k/video.cpp src/x68k/gvram.cpp src/x68k/render.cpp src/x68k/video_replay.cpp \
+//       -ffunction-sections -Wl,--gc-sections -o video_bench
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,9 +202,23 @@ int compareDouble(const void* a, const void* b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-uint32_t g_pixels[Renderer::MAX_WIDTH * Renderer::MAX_HEIGHT];
+alignas(16384) uint32_t g_pixels[Renderer::MAX_WIDTH * Renderer::MAX_HEIGHT];
+
+// 受け取ったものを使わずに、描いたことにする先
+struct NullSink : x68k::IndexedLineSink {
+    uint64_t sum = 0;
+    void beginLine(int, int) override {}
+    bool above(int, int, const uint8_t*, const uint8_t*, const uint32_t* t, const uint32_t* g) override {
+        sum += t[1] + (g ? g[1] : 0);
+        return true;
+    }
+};
+
+int g_contrast = 14;
+bool g_sink = false;
 
 void measure(const Scene& scene, int frames) {
+    NullSink sink;
     double* ms = new double[frames];
     Video* video = new Video();
     video->reset();
@@ -209,6 +226,8 @@ void measure(const Scene& scene, int frames) {
     if (scene.setup) {
         scene.setup(*video);
         renderer = new Renderer(*video);
+        video->setContrast((uint8_t)g_contrast);
+        if (g_sink) renderer->setIndexedLineSink(&sink);
         renderer->setTarget(g_pixels, Renderer::MAX_WIDTH, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
         renderer->renderFrame(); // 1 回目は表の準備も含むので数えない
     }
@@ -242,13 +261,21 @@ void measure(const Scene& scene, int frames) {
 int main(int argc, char* argv[]) {
     int frames = 200;
     int first = 1;
-    if (argc >= 3 && !strcmp(argv[1], "-n")) {
-        frames = atoi(argv[2]);
-        first = 3;
-        if (frames < 1) {
-            fprintf(stderr, "-n: want a positive number of frames\n");
+    for (; first < argc && argv[first][0] == '-'; first++) {
+        if (!strcmp(argv[first], "--sink")) {
+            g_sink = true;
+        } else if (!strcmp(argv[first], "-n") && first + 1 < argc) {
+            frames = atoi(argv[++first]);
+        } else if (!strcmp(argv[first], "-c") && first + 1 < argc) {
+            g_contrast = atoi(argv[++first]);
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[first]);
             return 2;
         }
+    }
+    if (frames < 1 || g_contrast < 0 || g_contrast > 15) {
+        fprintf(stderr, "-n: want a positive number of frames; -c: want 0 to 15\n");
+        return 2;
     }
     const int count = (int)(sizeof kScenes / sizeof kScenes[0]);
     if (first >= argc) {

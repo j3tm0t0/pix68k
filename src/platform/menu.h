@@ -417,6 +417,42 @@ public:
         (void)msg;
         return false;
     }
+    // XDF のイメージを実物のディスク (USB-FDD) に書き戻せるか (pix68k.cfg の experimental_usb_fdd_write= で許したときだけ。
+    // platform/floppy_restore.h)。許したドライブの番号。なければ -1
+    virtual int floppyWriteUnit() const { return -1; }
+    // 書く前の準備: 今のディスクを全部読み、控えをファイルに残す (1 分ほどかかる。進みは Menu::showProgress() で出す)。
+    // true なら、info の行を見せて、書いてよいかを尋ねる
+    struct FloppyWriteInfo {
+        static constexpr int LINES = 8;
+        static constexpr size_t TEXT = 136; // 枠の幅 (Menu::COLS 桁) の UTF-8 が入る大きさ
+        char line[LINES][TEXT];
+        int count = 0;
+        // 読めないセクタがあり、控えが欠けている。bad の行を見せて、欠けたまま書いてよいかを先に尋ねる
+        static constexpr int BAD_LINES = 10;
+        bool partial = false;
+        char bad[BAD_LINES][TEXT];
+        int badCount = 0;
+        void add(const char* s) {
+            if (count < LINES) copyString(line[count++], TEXT, s);
+        }
+        void addBad(const char* s) {
+            if (badCount < BAD_LINES) copyString(bad[badCount++], TEXT, s);
+        }
+    };
+    virtual bool prepareFloppyWrite(const char* name, FloppyWriteInfo& info, MenuText& msg) {
+        (void)name;
+        (void)info;
+        (void)msg;
+        return false;
+    }
+    // 準備したものを書き、読み戻して比べる。準備はここで終わる。acceptPartial は、控えが欠けたまま書くことを認めたか
+    virtual bool runFloppyWrite(bool acceptPartial, MenuText& msg) {
+        (void)acceptPartial;
+        (void)msg;
+        return false;
+    }
+    // 書かずに、準備したものを捨てる
+    virtual void cancelFloppyWrite() {}
     // 更新 (#369) で残した前の版の名前。戻せなければ nullptr (項目を出さない)。rollBack() が true なら再起動する
     virtual const char* rollbackVersion() const { return nullptr; }
     virtual bool rollBack(MenuText& msg) {
@@ -464,7 +500,15 @@ public:
         restartPending_ = false;
         midiHint_ = nullptr;
     }
-    void close() { open_ = false; }
+    void close() {
+        cancelWrite();
+        open_ = false;
+    }
+    // 長くかかる操作 (実物のディスクへの書き込み) の進みを状態の行に出す。呼んだあとで描き直す
+    void showProgress(const char* text) {
+        status_.clear();
+        status_.add(text);
+    }
     bool isOpen() const { return open_; }
     // 「Restart」が選ばれた (ホスト版は閉じたあとに作り直す)
     bool restartRequested() const { return restartPending_; }
@@ -476,6 +520,10 @@ public:
         if (!open_) return false;
         if (page_ == FILES) {
             fileKey(u);
+            return open_;
+        }
+        if (page_ == WRITE) {
+            writeKey(u);
             return open_;
         }
         // 拡張ボードと画面の出し方のページでは、Esc (か BS) は主のページに戻る
@@ -595,12 +643,13 @@ public:
     // テスト用: 選んでいる項目の名前
     const char* currentLabel() const {
         if (page_ == FILES) return "files";
+        if (page_ == WRITE) return writeYes_ ? "Yes" : "No";
         return label(item(cursor_));
     }
     // テスト用: 選んでいる項目の値の文字 (メニューの行の、名前の右に出すもの)。buf に入れて返す
     const char* currentValue(char* buf, size_t size) const {
         MenuText t(buf, size);
-        if (page_ != FILES) value(item(cursor_), t);
+        if (page_ != FILES && page_ != WRITE) value(item(cursor_), t);
         return t.str();
     }
     bool inFileList() const { return page_ == FILES; }
@@ -609,9 +658,9 @@ public:
     int stateSlot() const { return slot_; }
 
 private:
-    enum Page { MAIN, FILES, BOARDS, DISPLAY, MIXER, ROLLBACK };
+    enum Page { MAIN, FILES, BOARDS, DISPLAY, MIXER, WRITE, ROLLBACK };
     enum Item {
-        I_FD0, I_FD1, I_FD0_DUMP, I_FD1_DUMP, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
+        I_FD0, I_FD1, I_FD0_DUMP, I_FD1_DUMP, I_UFD_WRITE, I_HD0, I_CD, I_CPU, I_CLOCK, I_RAM, I_HIGH_MEM, I_LOCAL_MEM, I_MAX_SPEED,
         I_SCSI_EX, I_SC0, I_SC1, I_SC2, I_SC3, I_SC4, I_SC5, I_SC6, I_BOARDS, I_DISPLAY, I_MIXER, I_OSD, I_OSD_BARS, I_PAD_SETUP,
         I_SLOT, I_SAVE_STATE, I_LOAD_STATE, I_RESET, I_SAVE_SETTINGS, I_ROLLBACK, I_RESTART, I_CLOSE,
         // ここから拡張ボードのページの項目
@@ -642,6 +691,7 @@ private:
         // 実物のドライブ (USB-FDD) から読んだディスクが入っているときだけ出す
         case I_FD0_DUMP:
         case I_FD1_DUMP: return host_.hasRealFloppy(it - I_FD0_DUMP);
+        case I_UFD_WRITE: return host_.floppyWriteUnit() >= 0;
         case I_CLOCK: return pending_.cpu == 68000 || pending_.cpu == 68060;
         case I_SCSI_EX: return pending_.cpu == 68000;
         case I_HIGH_MEM: return pending_.cpu == 68030;
@@ -680,7 +730,7 @@ private:
     }
     const char* label(Item it) const {
         static const char* const kLabels[I_COUNT] = {
-            "FD0", "FD1", "Save FD0 image", "Save FD1 image", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
+            "FD0", "FD1", "Save FD0 image", "Save FD1 image", "Write XDF", "HD0 (SASI)", "CD-ROM", "CPU", "Clock", "RAM", "High memory", "Local memory", "Max speed",
             "SCSI board", "SC0", "SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "Boards", "Display", "Sound mixer", "OSD", "OSD bars", "Gamepad setup",
             "State slot", "Save state", "Load state", "Reset", "Save settings", "Roll back", "Restart", "Close",
             "FPU board", "Mercury Unit", "Neptune-X", "MIDI board", "MIDI out", "Back",
@@ -880,6 +930,9 @@ private:
         case I_OSD_BARS:
             t.add(pending_.osdBars ? "on" : "off");
             break;
+        case I_UFD_WRITE:
+            t.add("to usb-fdd:").add((long)host_.floppyWriteUnit()).add(" EXPERIMENTAL");
+            break;
         case I_ROLLBACK:
             if (host_.rollbackVersion() != nullptr) t.add("to ").add(host_.rollbackVersion());
             break;
@@ -898,11 +951,30 @@ private:
         };
         char buf[LINE_BYTES];
         MenuText t(buf, sizeof buf);
-        if (page_ != FILES) {
+        if (page_ == WRITE) {
+            line("EXPERIMENTAL: write an XDF to a USB-FDD disk");
+            line("");
+            const bool ask = askPartial() && !writeBusy_;
+            for (int i = 0; i < (ask ? writeInfo_.badCount : writeInfo_.count); i++) {
+                t.clear();
+                t.add(" ").add(ask ? writeInfo_.bad[i] : writeInfo_.line[i]);
+                line(t.str());
+            }
+            line("");
+            if (!writeBusy_) {
+                line(ask ? "The backup is INCOMPLETE. Go on without it?" : "The whole disk is overwritten. Write it?");
+                if (!writeYes_) hl = n;
+                line(" No");
+                if (writeYes_) hl = n;
+                line(ask ? " Yes, go on with an incomplete backup" : " Yes, overwrite the disk");
+            }
+            line("");
+            line(status_.str());
+        } else if (page_ != FILES) {
             line(page_ == BOARDS    ? "Expansion boards  (Esc: back)"
                  : page_ == DISPLAY ? "Display  (Esc: back)"
                  : page_ == MIXER   ? "Sound mixer  (Left / Right: 1 dB, Esc: back)"
-                 : page_ == ROLLBACK ? "Roll back pix68k to the previous version?  (Esc: back)"
+                 : page_ == ROLLBACK ? "Roll back to the previous version?  (Esc: back)"
                                     : "pix68k menu  (X68000 is paused)");
             // ミキサーのページは、見出しの下に使える音源を 1 行出す (なければ空行)
             line(page_ == MIXER && mixerKnown_ ? mixer_.sources : "");
@@ -935,7 +1007,8 @@ private:
             line(page_ != MAIN && strcmp(status_.str(), HELP) == 0 ? HELP_BOARDS : status_.str());
         } else {
             t.clear();
-            if (fileKind_ == MenuFileKind::FLOPPY) t.add(fileDrive_ ? "FD1: " : "FD0: ");
+            if (fileWrite_) t.add("USB-FDD ").add((long)host_.floppyWriteUnit()).add(" (experimental): ");
+            else if (fileKind_ == MenuFileKind::FLOPPY) t.add(fileDrive_ ? "FD1: " : "FD0: ");
             else if (fileKind_ == MenuFileKind::CDROM) t.add("CD-ROM: ");
             else if (fileKind_ == MenuFileKind::SCSI_DISK) t.add("SC").add((long)fileDrive_).add(": ");
             else t.add("HD0: ");
@@ -955,7 +1028,8 @@ private:
             const int last = first + cap < total ? first + cap : total;
             for (int i = first; i < last; i++) {
                 t.clear();
-                if (i == 0) t.add(fileKind_ == MenuFileKind::FLOPPY ? " [Eject]" : " [None]");
+                if (i == 0 && fileWrite_) t.add(" [Cancel]");
+                else if (i == 0) t.add(fileKind_ == MenuFileKind::FLOPPY ? " [Eject]" : " [None]");
                 else t.add(" ").add(files_.name(i - 1));
                 if (i == fileCursor_) hl = n;
                 line(t.str());
@@ -1194,6 +1268,11 @@ private:
         case I_FD1_DUMP:
             if (host_.saveFloppyImage(it - I_FD0_DUMP, status_) && status_.str()[0] == 0) status_.add("image saved");
             break;
+        case I_UFD_WRITE:
+            openFiles(MenuFileKind::FLOPPY, 0);
+            fileWrite_ = true;
+            fileCursor_ = 0;
+            break;
         case I_HD0:
             openFiles(MenuFileKind::HARD_DISK, 0);
             break;
@@ -1276,6 +1355,7 @@ private:
     void openFiles(MenuFileKind kind, int drive) {
         fileKind_ = kind;
         fileDrive_ = drive;
+        fileWrite_ = false;
         files_.clear();
         host_.listFiles(kind, files_);
         fileCursor_ = 0;
@@ -1328,9 +1408,69 @@ private:
         }
     }
 
+    // 実物のディスクに書いてよいかを尋ねるページ。はじめは No
+    void writeKey(uint8_t u) {
+        switch (u) {
+        case menu_key::UP:
+        case menu_key::LEFT:
+            writeYes_ = false;
+            break;
+        case menu_key::DOWN:
+        case menu_key::RIGHT:
+            writeYes_ = true;
+            break;
+        case menu_key::ENTER:
+        case menu_key::KP_ENTER:
+            if (!writeYes_) {
+                cancelWrite();
+                break;
+            }
+            status_.clear();
+            if (askPartial()) { // 次に、書いてよいかを尋ねる。また No から
+                partialOk_ = true;
+                writeYes_ = false;
+                break;
+            }
+            writeBusy_ = true;
+            host_.runFloppyWrite(partialOk_, status_);
+            writeBusy_ = false;
+            page_ = MAIN;
+            break;
+        case menu_key::ESC:
+        case menu_key::BACKSPACE:
+            cancelWrite();
+            break;
+        default:
+            if (isMenuKey(u, true)) close();
+            break;
+        }
+    }
+    bool askPartial() const { return writeInfo_.partial && !partialOk_; }
+    void cancelWrite() {
+        if (page_ != WRITE) return;
+        host_.cancelFloppyWrite();
+        page_ = MAIN;
+        status_.clear();
+        status_.add("not written");
+    }
+
     void chooseFile() {
         const char* name = fileCursor_ == 0 ? "" : files_.name(fileCursor_ - 1);
         status_.clear();
+        if (fileWrite_) {
+            host_.beginAction(MENU_ACTION_OTHER);
+            page_ = MAIN;
+            if (name[0] == 0) return;
+            writeInfo_.count = writeInfo_.badCount = 0;
+            writeInfo_.partial = partialOk_ = false;
+            writeYes_ = false;
+            writeBusy_ = true;
+            page_ = WRITE;
+            const bool ok = host_.prepareFloppyWrite(name, writeInfo_, status_);
+            writeBusy_ = false;
+            if (!ok) page_ = MAIN;
+            return;
+        }
         host_.beginAction(fileKind_ == MenuFileKind::FLOPPY && !name[0] ? MENU_ACTION_EJECT + fileDrive_
                                                                          : MENU_ACTION_OTHER);
         if (fileKind_ == MenuFileKind::FLOPPY) {
@@ -1389,6 +1529,9 @@ private:
     MenuFileList files_;
     MenuFileKind fileKind_ = MenuFileKind::FLOPPY;
     int fileDrive_ = 0;
+    bool fileWrite_ = false; // ファイルの一覧は、実物のディスクに書くイメージを選ぶもの
+    MenuHost::FloppyWriteInfo writeInfo_;
+    bool writeYes_ = false, writeBusy_ = false, partialOk_ = false;
     int fileCursor_ = 0;
     char statusBuf_[LINE_BYTES];
     MenuText status_;

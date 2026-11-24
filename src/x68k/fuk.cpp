@@ -222,8 +222,9 @@ void Fuk::failSeeks() {
 
 bool Fuk::localSeekPending() const { return (localSeek_[0] | localSeek_[1] | localSeek_[2] | localSeek_[3]) != 0; }
 
-void Fuk::goOffline() {
+void Fuk::goOffline(int reason) {
     const bool was = ready();
+    if (was && reason >= 0) noteLinkLost((uint8_t)reason);
     failCommand();
     failSeeks();
     dropQueue();
@@ -233,8 +234,9 @@ void Fuk::goOffline() {
 }
 
 // 見分けからやり直す (つないだとき、返事が来なくなったとき)
-void Fuk::relink() {
+void Fuk::relink(int reason) {
     const bool was = ready();
+    if (was && reason >= 0) noteLinkLost((uint8_t)reason);
     failCommand();
     failSeeks();
     dropQueue();
@@ -245,7 +247,7 @@ void Fuk::relink() {
 
 void Fuk::serviceLink() {
     if (!link_.online()) {
-        if (ls_ != L_OFFLINE) goOffline();
+        if (ls_ != L_OFFLINE) goOffline(Event::UNPLUGGED);
         wasOnline_ = false;
         return;
     }
@@ -261,7 +263,7 @@ void Fuk::serviceLink() {
         wasOnline_ = true;
         epoch_ = epoch;
         probeFailed_ = false;
-        relink();
+        relink(Event::NEW_DEVICE);
     }
     const uint64_t t = now();
     uint8_t buf[64];
@@ -344,15 +346,17 @@ void Fuk::receivePort1() {
     while (ready() && (n = link_.receive(p1_, buf, sizeof buf)) != 0) {
         for (unsigned i = 0; i < n && ready(); i++) {
             if (!awaiting_) {
-                stats_.stray++;
+                noteStray(Event::S_PORT1, buf[i]);
                 continue;
             }
+            if (out1Pos_ < out1Len_) noteOdd(Event::ODD_EARLY, buf[i]); // 読み出しの要求は out1_ の最後にある
             awaiting_ = false;
             const uint64_t took = now() - awaitSent_; // awaitSince_ は、止められていた時間を足すので使わない
             stats_.replies++;
             stats_.replyUs += took;
             if (took > stats_.replyMaxUs) stats_.replyMaxUs = (uint32_t)took;
-            reply(awaitTag_, buf[i]);
+            reply(replyTag_ = awaitTag_, buf[i]);
+            replyAt_ = now();
         }
     }
 }
@@ -372,6 +376,7 @@ void Fuk::reply(uint8_t tag, uint8_t v) {
         // 捨て続ける (serviceLink()。静かになったら届き終わったとみなす)
         ls_ = L_SETTLE;
         lastRx_ = now();
+        if ((v & (MSR_RQM | MSR_DIO)) != MSR_RQM) noteOdd(Event::ODD_SYNC, v);
         msr_ = v;
         msrKnown_ = true;
         msrAt_ = lastRx_;
@@ -391,6 +396,7 @@ void Fuk::reply(uint8_t tag, uint8_t v) {
         msr_ = v;
         msrKnown_ = true;
         msrAt_ = now();
+        if (phase_ == P_IDLE && cmdLen_ == 0 && (v & (MSR_RQM | MSR_DIO)) == (MSR_RQM | MSR_DIO)) noteOdd(Event::ODD_STATUS, v);
         if (phase_ != P_RESULT_WAIT || resFetching_) return;
         if ((v & (MSR_RQM | MSR_DIO)) == (MSR_RQM | MSR_DIO)) {
             // リザルトが用意できた。数が分かっているコマンドは、続けてその数だけ読む
@@ -406,7 +412,7 @@ void Fuk::reply(uint8_t tag, uint8_t v) {
     case T_RESULT:
         resFetching_ = false;
         if (phase_ != P_RESULT_FETCH && phase_ != P_RESULT_WAIT) {
-            stats_.stray++;
+            noteStray(Event::S_RESULT, v);
             return;
         }
         if (resLen_ < (int)sizeof res_) res_[resLen_++] = v;
@@ -417,6 +423,7 @@ void Fuk::reply(uint8_t tag, uint8_t v) {
                 else if (v & ST0_SEEK_END) seekBusy_ &= (uint8_t)~(1u << (v & 3));
             }
             if (resLen_ >= resWant_) {
+                checkResult();
                 enterResult(resIrq_);
             } else {
                 resFetching_ = true;
@@ -526,6 +533,7 @@ void Fuk::frameDone() {
         resLen_ = 7;
         sisLocal_ = true;
         if (readAbort_) {
+            resSource_ = Event::DMA_ABORT;
             res_[0] = (uint8_t)((res_[0] & 0x3f) | ST0_ABNORMAL);
             res_[1] |= ST1_OVERRUN;
         }
@@ -535,7 +543,7 @@ void Fuk::frameDone() {
         return;
     }
     if (phase_ != P_READ_WAIT) { // 待っていない (時間切れのあとに届いたなど)
-        stats_.stray++;
+        noteStray(Event::S_R, frameLen_);
         return;
     }
     if (frameLen_ < 7) {
@@ -550,6 +558,7 @@ void Fuk::frameDone() {
     sisLocal_ = true;
     if (dmaAborted_ && dataLen_ != 0) {
         // 'R' を待っている間に DMA が異常終了している。データを渡す相手がいないので、オーバーランで終わる
+        resSource_ = Event::DMA_ABORT;
         res_[0] = (uint8_t)((res_[0] & 0x3f) | ST0_ABNORMAL);
         res_[1] |= ST1_OVERRUN;
         enterResult(true);
@@ -598,7 +607,7 @@ void Fuk::port2Byte(uint8_t b) {
         break;
     case 'W': // 書くデータを求めている
         if (phase_ != P_WRITE_WAIT) {
-            stats_.stray++;
+            noteStray(Event::S_W, b);
             break;
         }
         wGot_ = 0;
@@ -609,14 +618,14 @@ void Fuk::port2Byte(uint8_t b) {
     case 'w': // 書き込みが終わった (書けなかったときは 'W' なしで来る)。リザルト 7 バイトを読む
         wAwaitDone_ = false;
         if (phase_ == P_WRITE_WAIT || phase_ == P_WRITE_DATA || phase_ == P_WRITE_BUSY) startFetch(7, true);
-        else stats_.stray++;
+        else noteStray(Event::S_W_DONE, b);
         break;
     case 't': // 中止
         wAwaitDone_ = false;
         if (phase_ != P_IDLE && phase_ != P_RESULT) failCommand();
         break;
     default:
-        stats_.stray++;
+        noteStray(Event::S_PORT2, b);
         break;
     }
 }
@@ -627,6 +636,7 @@ void Fuk::checkTimeouts() {
     if (!ready()) return;
     const uint64_t t = now();
     bool lost = awaiting_ && t - awaitSince_ >= REPLY_TIMEOUT_US;
+    const bool noReply = lost;
     const uint64_t in = t - phaseSince_;
     switch (phase_) {
     case P_READ_WAIT: lost = lost || in >= READ_TIMEOUT_US; break;
@@ -647,7 +657,12 @@ void Fuk::checkTimeouts() {
     if (lost) {
         // 返事が来ない。あとから届く返事を次の読み出しのものと取り違えないよう、見分けからやり直す
         stats_.timeouts++;
-        relink();
+        relink(noReply                  ? Event::NO_REPLY
+               : phase_ == P_READ_WAIT  ? Event::NO_R
+               : phase_ == P_READ_DATA  ? Event::NO_R_REST
+               : phase_ == P_WRITE_WAIT ? Event::NO_W
+               : phase_ == P_WRITE_BUSY ? Event::NO_W_DONE
+                                        : Event::NO_RESULT);
     }
 }
 
@@ -680,7 +695,7 @@ void Fuk::service() {
         queueOverflow_ = false;
         if (ready()) {
             stats_.timeouts++;
-            relink();
+            relink(Event::QUEUE_FULL);
         }
     }
     if (!ready()) return;
@@ -707,7 +722,10 @@ Fuk::Stats Fuk::snapshot() {
 
 void Fuk::poll() {
     service();
-    if ((++publishCount_ & 127) == 0) publish(); // ラスタごとに呼ばれるので、4 ms に 1 回ほど
+    if ((++publishCount_ & 127) == 0) { // ラスタごとに呼ばれるので、4 ms に 1 回ほど
+        publish();
+        serviceTrace();
+    }
     // リザルトの用意を待っている間は、ステータスを間を空けて読む
     if (ready() && phase_ == P_RESULT_WAIT && !msrPending_ && !resFetching_ && now() >= resultPollAt_) {
         resultPollAt_ = now() + RESULT_POLL_US;
@@ -747,6 +765,410 @@ bool Fuk::start(unsigned waitMs) {
     }
 }
 
+// ---------------------------------------------------------------- 異常終了の記録 (#400)
+
+bool Fuk::takeEvent(Event& e) {
+    const unsigned tail = __atomic_load_n(&eventTail_, __ATOMIC_RELAXED);
+    if (tail == __atomic_load_n(&eventHead_, __ATOMIC_ACQUIRE)) return false;
+    e = events_[tail & (EVENTS - 1)];
+    __atomic_store_n(&eventTail_, tail + 1, __ATOMIC_RELEASE);
+    return true;
+}
+
+void Fuk::pushEvent(const Event& e) {
+    const unsigned head = __atomic_load_n(&eventHead_, __ATOMIC_RELAXED);
+    if (head - __atomic_load_n(&eventTail_, __ATOMIC_ACQUIRE) >= EVENTS) {
+        __atomic_add_fetch(&eventsDropped_, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    events_[head & (EVENTS - 1)] = e;
+    __atomic_store_n(&eventHead_, head + 1, __ATOMIC_RELEASE);
+}
+
+void Fuk::fillEvent(Event& e, uint8_t kind) {
+    memset(&e, 0, sizeof e);
+    e.atUs = now();
+    e.kind = (Event::Kind)kind;
+    memcpy(e.cmd, cmd_, sizeof e.cmd);
+    // 実行中ならコマンド全部、受け取っている途中ならそこまで
+    e.cmdLen = (uint8_t)(phase_ != P_IDLE ? kCmdLen[cmd_[0] & 0x1f] : cmdLen_);
+    e.phase = (uint8_t)phase_;
+    e.select = lastSelect_;
+    e.control = rawControl_;
+    e.reader = reader_;
+    e.ms = (uint32_t)((e.atUs - phaseSince_) / 1000);
+    e.stray = stats_.stray - strayAtCmd_;
+    e.dmaCount = dmaAtCmd_;
+    e.dmaGot = wGot_;
+    e.dmaChain = chainAtCmd_;
+    e.writes = stats_.writeFrames;
+}
+
+void Fuk::noteLinkLost(uint8_t reason) {
+    Event e;
+    fillEvent(e, Event::LINK_LOST);
+    // SEEK と RECALIBRATE は、送ったあとも段階は P_IDLE
+    const int op = cmd_[0] & 0x1f;
+    if (e.cmdLen == 0 && seekBusy_ != 0 && (op == CMD_SEEK || op == CMD_RECALIBRATE)) e.cmdLen = kCmdLen[op];
+    e.reason = reason;
+    e.replyTag = awaitTag_;
+    if (reason == Event::NO_REPLY) e.ms = (uint32_t)((e.atUs - awaitSince_) / 1000);
+    pushEvent(e);
+}
+
+bool Fuk::eventAllowed(bool write) {
+    const uint64_t t = now();
+    if (t - eventWindow_ >= EVENT_WINDOW_US) {
+        eventWindow_ = t;
+        eventUsed_[0] = eventUsed_[1] = 0;
+    }
+    if (eventUsed_[write ? 0 : 1] < (write ? EVENT_WRITES : EVENT_OTHERS)) {
+        eventUsed_[write ? 0 : 1]++;
+        return true;
+    }
+    __atomic_add_fetch(&eventsDropped_, 1u, __ATOMIC_RELAXED);
+    return false;
+}
+
+// res_ がそろった (X68000 に見せる前)。異常終了なら記録する。普段から出るもの (ディスクがないときの SENSE DEVICE STATUS、
+// 引き取る割り込みのない SENSE INTERRUPT STATUS、レディの変化、EOT まで読んだ Read の異常終了 (ST1 が EN だけ)) は記録しない
+void Fuk::noteResult(uint8_t source) {
+    const int op = cmd_[0] & 0x1f;
+    const bool write = isWriteType(op);
+    if (reader_) return; // ディスクの読み出し (#381) のコマンド
+    traceResult(source);
+    if (op == CMD_SENSE_DEVICE) return;
+    const uint8_t ic = (uint8_t)(res_[0] & 0xc0);
+    if (op == CMD_SENSE_INTERRUPT) {
+        if (ic != ST0_ABNORMAL) return;
+    } else if (ic == 0) {
+        return;
+    }
+    if (isReadType(op) && source == Event::FROM_FUK && ic == ST0_ABNORMAL && resLen_ == 7 && res_[1] == 0x80 && res_[2] == 0) return;
+    if (!eventAllowed(write)) return;
+    Event e;
+    fillEvent(e, Event::FAILED);
+    e.cmdLen = kCmdLen[op];
+    e.source = source;
+    e.resLen = (uint8_t)resLen_;
+    memcpy(e.res, res_, sizeof e.res);
+    pushEvent(e);
+}
+
+// 実行中のコマンドがなければ、その前のコマンドを入れる
+void Fuk::fillLastCommand(Event& e, uint8_t kind, uint8_t reason, uint32_t value) {
+    fillEvent(e, kind);
+    if (e.cmdLen == 0 && cmdAt_ != 0) e.cmdLen = kCmdLen[cmd_[0] & 0x1f];
+    e.reason = reason;
+    e.value = value;
+    e.replyTag = replyTag_;
+    const uint64_t since = replyAt_ != 0 ? e.atUs - replyAt_ : 0;
+    e.sinceUs = since < 0xffffffffu ? (uint32_t)since : 0xffffffffu;
+}
+
+void Fuk::noteStray(uint8_t kind, uint32_t value) {
+    stats_.stray++;
+    stats_.strays[kind]++;
+    if (now() - strayWindow_ >= TRACE_WINDOW_US) resetStrayQuota();
+    if (strayUsed_[kind] >= STRAY_FIRST) return;
+    strayUsed_[kind]++;
+    Event e;
+    fillLastCommand(e, Event::STRAY, kind, value);
+    e.number = stats_.strays[kind];
+    holdEvent(e);
+}
+
+// 返事がずれたかもしれない (記録するだけで、動作は変えない)
+void Fuk::noteOdd(uint8_t kind, uint32_t value) {
+    stats_.odd[kind]++;
+    if (now() - strayWindow_ >= TRACE_WINDOW_US) resetStrayQuota();
+    if (oddUsed_[kind] >= STRAY_FIRST) return;
+    oddUsed_[kind]++;
+    Event e;
+    fillLastCommand(e, Event::ODD, kind, value);
+    e.number = stats_.odd[kind];
+    e.resLen = (uint8_t)resLen_;
+    memcpy(e.res, res_, sizeof e.res);
+    holdEvent(e);
+}
+
+// 決まった数だけ読んだリザルトが、コマンドと合うか。前に余分なバイトがあると、1 つずつずれる
+void Fuk::checkResult() {
+    const int op = cmd_[0] & 0x1f;
+    if (resLen_ == 7) {
+        const bool n = (op == CMD_WRITE_ID && res_[6] != cmd_[2]) || (isWriteType(op) && op != CMD_WRITE_ID && res_[6] != cmd_[5]);
+        if (((res_[0] ^ cmd_[1]) & 3) != 0 || n) noteOdd(Event::ODD_RESULT, res_[0]);
+    } else if (op == CMD_SENSE_INTERRUPT && resLen_ == 2 && (res_[0] & (0xc0 | ST0_SEEK_END)) == ST0_SEEK_END) {
+        const int want = lastCyl_[res_[0] & 3];
+        if (want >= 0 && res_[1] != want) noteOdd(Event::ODD_SIS, res_[1]);
+    }
+}
+
+// コマンドの 1 バイト目: WRITE ID から、ひと続きの書き込みの記録を始める
+void Fuk::traceCommand(int op) {
+    if (reader_ || !isWriteType(op)) return;
+    const uint64_t t = now();
+    if (op == CMD_WRITE_ID) traceIdAt_ = t;
+    else if (traceIdAt_ == 0 || t - traceIdAt_ >= TRACE_AGAIN_US) return;
+    traceAt_ = t;
+    if (tracing_) return;
+    tracing_ = true;
+    if (heldCount_ != 0 || traceCount_ != 0) return; // 前の記録を移し終えていない: 続きとして扱う (番号も続ける)
+    if (traceRuns_ == 0 || t - traceWindow_ >= TRACE_WINDOW_US) {
+        traceWindow_ = t;
+        traceRuns_ = 0;
+    }
+    traceRecord_ = traceRuns_ < TRACE_RUNS;
+    if (!traceRecord_) {
+        __atomic_add_fetch(&eventsDropped_, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    traceRuns_++;
+    traceNumber_ = 0;
+    resetStrayQuota();
+}
+
+void Fuk::resetStrayQuota() {
+    memset(strayUsed_, 0, sizeof strayUsed_);
+    memset(oddUsed_, 0, sizeof oddUsed_);
+    strayWindow_ = now();
+}
+
+// 書き込みの間は、ログに出すほうの負荷を増やさないよう、書き込みが落ち着くまでためる
+void Fuk::holdEvent(const Event& e) {
+    if (!tracing_ && heldCount_ == 0) {
+        pushEvent(e);
+        return;
+    }
+    if (heldCount_ == HELD) {
+        __atomic_add_fetch(&eventsDropped_, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    held_[(heldPos_ + heldCount_++) % HELD] = e;
+}
+
+void Fuk::traceResult(uint8_t source) {
+    const int op = cmd_[0] & 0x1f;
+    if (!tracing_) return;
+    if (!isWriteType(op) && !(op == CMD_SENSE_INTERRUPT && resLen_ == 2)) return;
+    if (isWriteType(op)) traceAt_ = now();
+    if (!traceRecord_) return;
+    Event e;
+    fillEvent(e, Event::TRACE);
+    e.cmdLen = kCmdLen[op];
+    e.source = source;
+    e.resLen = (uint8_t)resLen_;
+    memcpy(e.res, res_, sizeof e.res);
+    e.ms = (uint32_t)((e.atUs - cmdAt_) / 1000);
+    e.number = ++traceNumber_;
+    if (e.number <= TRACE_FIRST) {
+        holdEvent(e);
+        return;
+    }
+    if (traceCount_ == TRACE_LAST) popTrace(); // いちばん古いものを捨てる (番号が飛ぶので分かる)
+    trace_[(tracePos_ + traceCount_++) % TRACE_LAST] = e;
+}
+
+// ためた記録のいちばん古いものを外す
+void Fuk::popTrace() {
+    tracePos_ = (tracePos_ + 1) % TRACE_LAST;
+    traceCount_--;
+}
+
+// ためた記録を 1 つリングに移す (先頭のものと捨てたバイトなど、そのあと最後のもの)
+bool Fuk::flushOne() {
+    if (heldCount_ != 0) {
+        pushEvent(held_[heldPos_]);
+        heldPos_ = (heldPos_ + 1) % HELD;
+        heldCount_--;
+        return true;
+    }
+    if (traceCount_ == 0) return false;
+    pushEvent(trace_[tracePos_]);
+    popTrace();
+    return true;
+}
+
+// 書き込みが TRACE_QUIET_US なければ終わりとみて、ためた記録を、1 回に 1 つずつリングに移す (リングが半分より埋まっていれば
+// 待つ)。移し終える前に次の書き込みが始まったら、続きとして扱い、それが終わるまで待つ
+void Fuk::serviceTrace() {
+    // リザルトを読まないまま止まっても出す (ほかの段階は、時間切れで P_RESULT になる)
+    if (tracing_ && (phase_ == P_IDLE || phase_ == P_RESULT) && now() - traceAt_ >= TRACE_QUIET_US) tracing_ = false;
+    if (tracing_ || (heldCount_ == 0 && traceCount_ == 0)) return;
+    if (__atomic_load_n(&eventHead_, __ATOMIC_RELAXED) - __atomic_load_n(&eventTail_, __ATOMIC_ACQUIRE) >= EVENTS / 2) return;
+    flushOne();
+}
+
+bool Fuk::flushEvents() {
+    tracing_ = false;
+    while (__atomic_load_n(&eventHead_, __ATOMIC_RELAXED) - __atomic_load_n(&eventTail_, __ATOMIC_ACQUIRE) < EVENTS)
+        if (!flushOne()) return false;
+    return heldCount_ != 0 || traceCount_ != 0;
+}
+
+namespace {
+// 文字列を作る (ベアメタルでも使えるよう、printf を使わない)
+struct Text {
+    char* p;
+    unsigned left;
+    void ch(char c) {
+        if (left <= 1) return;
+        *p++ = c;
+        left--;
+    }
+    void str(const char* s) {
+        while (*s) ch(*s++);
+    }
+    void hex2(uint8_t v) {
+        static const char k[] = "0123456789abcdef";
+        ch(k[v >> 4]);
+        ch(k[v & 15]);
+    }
+    void bytes(const uint8_t* b, unsigned n) {
+        for (unsigned i = 0; i < n; i++) {
+            if (i) ch(' ');
+            hex2(b[i]);
+        }
+    }
+    void num(uint64_t v, unsigned digits = 1) {
+        char t[20];
+        unsigned n = 0;
+        do {
+            t[n++] = (char)('0' + v % 10);
+            v /= 10;
+        } while (v != 0 && n < sizeof t);
+        while (n < digits) t[n++] = '0';
+        while (n) ch(t[--n]);
+    }
+};
+} // namespace
+
+static const char* commandName(int op) {
+    switch (op) {
+    case CMD_READ_DIAGNOSTIC: return "READ DIAGNOSTIC";
+    case CMD_SPECIFY: return "SPECIFY";
+    case CMD_SENSE_DEVICE: return "SENSE DEVICE STATUS";
+    case CMD_WRITE_DATA: return "WRITE DATA";
+    case CMD_READ_DATA: return "READ DATA";
+    case CMD_RECALIBRATE: return "RECALIBRATE";
+    case CMD_SENSE_INTERRUPT: return "SENSE INTERRUPT STATUS";
+    case CMD_WRITE_DELETED: return "WRITE DELETED DATA";
+    case CMD_READ_ID: return "READ ID";
+    case CMD_READ_DELETED: return "READ DELETED DATA";
+    case CMD_WRITE_ID: return "WRITE ID";
+    case CMD_SEEK: return "SEEK";
+    case 0x11:
+    case 0x19:
+    case 0x1d: return "SCAN";
+    default: return "command";
+    }
+}
+
+const char* Fuk::tagName(uint8_t tag) {
+    return tag >= T_DRIVE ? "drive status" : tag == T_RESULT ? "result" : tag == T_MSR ? "status" : tag == T_SYNC ? "sync" : "other";
+}
+
+void Fuk::formatEvent(const Event& e, char* out, unsigned size) {
+    if (size == 0) return;
+    static const char* const kSource[] = {"from the device", "from the device, changed by a DMA error", "made by failCommand",
+                                          "made by setResult7, write cancelled", "made by setResult7, write refused",
+                                          "made by setResult7, not connected"};
+    static const char* const kReason[] = {"no reply to a register read", "no 'R'", "the rest of 'R' did not come", "no 'W' or 'w' after the command",
+                                          "no 'w' after the data", "no result", "the send queue is full", "unplugged or the port closed",
+                                          "the device came back as new"};
+    static const char* const kPhase[] = {"idle", "waiting for 'R'", "read data", "waiting for 'W'", "write data", "waiting for 'w'",
+                                         "waiting for the result", "reading the result", "result"};
+    static const char* const kStray[] = {"port 1 byte not asked for", "late result byte", "unknown port 2 byte",
+                                         "'W' not waited for", "'w' not waited for", "'R' not waited for, length"};
+    static const char* const kOdd[] = {"reply before the request was sent", "result does not match the command",
+                                       "PCN is not the seek target", "status shows a result while idle", "status after a reset"};
+    Text t = {out, size};
+    const int op = e.cmd[0] & 0x1f;
+    const unsigned cmdLen = e.cmdLen <= sizeof e.cmd ? e.cmdLen : sizeof e.cmd;
+    t.str("at ");
+    t.num(e.atUs / 1000000);
+    t.ch('.');
+    t.num(e.atUs / 1000 % 1000, 3);
+    t.str(" s: ");
+    if (e.kind == Event::LINK_LOST) {
+        t.str("link lost: ");
+        t.str(kReason[e.reason < sizeof kReason / sizeof kReason[0] ? e.reason : 0]);
+        if (e.reason == Event::NO_REPLY) {
+            t.str(" (");
+            t.str(tagName(e.replyTag));
+            t.ch(')');
+        }
+        t.str(", ");
+        t.num(e.ms);
+        t.str(" ms, ");
+        t.str(kPhase[e.phase < sizeof kPhase / sizeof kPhase[0] ? e.phase : 0]);
+        t.str(", command ");
+        if (e.cmdLen == 0) t.str("none");
+        else {
+            t.str(commandName(op));
+            t.str(" [");
+            t.bytes(e.cmd, cmdLen);
+            t.ch(']');
+        }
+    } else if (e.kind == Event::STRAY || e.kind == Event::ODD) {
+        const bool odd = e.kind == Event::ODD;
+        t.str(odd ? "odd reply: " : "stray: ");
+        t.str(odd ? kOdd[e.reason < sizeof kOdd / sizeof kOdd[0] ? e.reason : 0] : kStray[e.reason < sizeof kStray / sizeof kStray[0] ? e.reason : 0]);
+        t.ch(' ');
+        if (!odd && e.reason == Event::S_R) t.num(e.value); // 長さ
+        else t.hex2((uint8_t)e.value);
+        t.str(" (#");
+        t.num(e.number);
+        t.str("), ");
+        t.num(e.sinceUs);
+        t.str(" us after the last reply (");
+        t.str(tagName(e.replyTag));
+        t.str("), ");
+        t.str(kPhase[e.phase < sizeof kPhase / sizeof kPhase[0] ? e.phase : 0]);
+        t.str(", last command [");
+        t.bytes(e.cmd, cmdLen);
+        t.ch(']');
+        if (odd) {
+            t.str(", result [");
+            t.bytes(e.res, e.resLen <= 7 ? e.resLen : 7);
+            t.ch(']');
+        }
+    } else {
+        if (e.kind == Event::TRACE) {
+            t.str("write trace #");
+            t.num(e.number);
+            t.str(", ");
+            t.num(e.ms);
+            t.str(" ms: ");
+        }
+        t.str(commandName(op));
+        t.str(" [");
+        t.bytes(e.cmd, cmdLen);
+        t.str(e.kind == Event::TRACE ? "], result [" : "] failed, result [");
+        t.bytes(e.res, e.resLen <= 7 ? e.resLen : 7);
+        t.str("] ");
+        t.str(kSource[e.source < sizeof kSource / sizeof kSource[0] ? e.source : 0]);
+    }
+    if (e.reader) t.str(", reading a disk");
+    t.str(", select ");
+    t.hex2(e.select);
+    t.str(", control ");
+    t.hex2(e.control);
+    if (e.cmdLen != 0 && isWriteType(op)) {
+        t.str(", DMA ");
+        t.num(e.dmaGot);
+        t.ch('/');
+        t.num(e.dmaCount);
+        if (e.dmaChain) t.str(" (chained or stopped)");
+    }
+    t.str(", ");
+    t.num(e.stray);
+    t.str(" stray, ");
+    t.num(e.writes);
+    t.str(" write frames");
+    *t.p = 0;
+}
+
 // ---------------------------------------------------------------- コマンド
 
 void Fuk::setResult7(uint8_t st0, uint8_t st1) {
@@ -775,6 +1197,7 @@ void Fuk::enterResult(bool irq) {
         resLen_ = 1;
     }
     resPos_ = 0;
+    noteResult(resSource_);
     setPhase(P_RESULT);
     if (irq) localIrq_ = true;
     // X68000 がリザルトを読んでいる間に、そのあとのステータスを読んでおく
@@ -792,6 +1215,7 @@ void Fuk::failCommand() {
     const int op = cmd_[0] & 0x1f;
     const uint8_t us = cmd_[1] & 7;
     resFetching_ = false;
+    resSource_ = Event::FAIL_COMMAND;
     if (op == CMD_SENSE_INTERRUPT) {
         res_[0] = ST0_INVALID;
         resLen_ = 1;
@@ -827,6 +1251,7 @@ void Fuk::dispatch() {
     const int op = cmd_[0] & 0x1f;
     sisLocal_ = false;
     dmaAborted_ = false;
+    resSource_ = Event::FROM_FUK;
     if (isReadType(op)) {
         setPhase(P_READ_WAIT);
     } else if (isWriteType(op)) {
@@ -893,6 +1318,7 @@ void Fuk::localExecute() {
         if (cmdRefused_) setResult7((uint8_t)(ST0_ABNORMAL | us), ST1_OVERRUN); // DMA を使わない書き込み
         else setResult7((uint8_t)(ST0_ABNORMAL | ST0_NOT_READY | us), 0);
         resPos_ = 0;
+        noteResult(cmdRefused_ ? Event::REFUSED : Event::OFFLINE);
         setPhase(P_RESULT);
         localIrq_ = true;
     } else {
@@ -914,7 +1340,7 @@ void Fuk::reset() {
     forceReady_ = forceReadySent_ = false;
     driveSel_ = 0;
     memset(localSeek_, 0, sizeof localSeek_);
-    lastSelect_ = lastControl_ = 0;
+    lastSelect_ = lastControl_ = rawControl_ = 0;
     if (!ready()) return;
     // 'W' のあと 'M' を送り始める前 (DMAC からデータを受け取っている途中) なら、'M' は送らない。そろっていない
     // データを 0 で埋めて送ると、ディスクに書かれる。Pico のファームは、リセットで 'M' を待つのをやめる
@@ -950,6 +1376,7 @@ void Fuk::resetDevice() {
 // 異常終了を返す。リセットで FUK のモーターとドライブの選択も初めに戻るので、X68000 が最後に書いた値を送り直す
 void Fuk::cancelWrite() {
     stats_.cancelledWrites++;
+    resSource_ = Event::CANCELLED;
     setResult7((uint8_t)(ST0_ABNORMAL | (cmd_[1] & 7)), ST1_OVERRUN);
     enterResult(true);
     if (!ready()) return;
@@ -1177,6 +1604,12 @@ void Fuk::write(uint32_t offset, uint8_t v) {
             // SENSE INTERRUPT STATUS はこちらで答える
             if (op == CMD_SENSE_INTERRUPT && localSeekPending()) cmdLocal_ = true;
             memset(cmd_, 0, sizeof cmd_);
+            strayAtCmd_ = stats_.stray;
+            cmdAt_ = now();
+            traceCommand(op);
+            wGot_ = 0;
+            dmaAtCmd_ = 0;
+            chainAtCmd_ = false;
             if (!cmdLocal_) {
                 if (op == CMD_SENSE_INTERRUPT && sisLocal_ && !devIrq_ && seekBusy_ == 0) {
                     // Read の割り込みはこちらで作ったもので、FUK には引き取る割り込みがない。FUK には送らず、
@@ -1190,6 +1623,8 @@ void Fuk::write(uint32_t offset, uint8_t v) {
                 }
                 const uint32_t count = host_ != nullptr ? host_->fukDmaCount() : 0;
                 noDma_ = isReadType(op) && count == 0;
+                dmaAtCmd_ = count;
+                chainAtCmd_ = host_ != nullptr && isWriteType(op) && !host_->fukDmaSingleBlock();
                 if (isWriteType(op) && (count == 0 || nonDma_ || !host_->fukDmaSingleBlock())) {
                     // DMA を使わない書き込みと、DMAC がチェーンかコンティニューで動いている書き込み (転送バイト数は
                     // 最初のブロックの分で、全体のバイト数ではない) は受け付けない。FUK には、書くバイト数をコマンドの前に知らせる決まりで、
@@ -1236,6 +1671,7 @@ void Fuk::write(uint32_t offset, uint8_t v) {
         // ドライブ制御: bit0-3 ドライブの選択、bit5 排出、bit6 排出禁止、bit7 LED の点滅
         fddIrq_ = false;
         driveSel_ = v & 15;
+        rawControl_ = v;
         lastControl_ = (uint8_t)(v & ~0x20); // 送り直すときに、排出はやり直さない
         if (!ready()) break;
         pushWrite(REG_DRIVE_CONTROL, v);
@@ -1329,6 +1765,7 @@ void Fuk::abortTransfer() {
     if (phase_ == P_READ_DATA && streaming_) {
         readAbort_ = true; // リザルトが届いてから、オーバーランにして返す (frameDone())
     } else if (phase_ == P_READ_DATA) {
+        resSource_ = Event::DMA_ABORT;
         res_[0] = (uint8_t)((res_[0] & 0x3f) | ST0_ABNORMAL);
         res_[1] |= ST1_OVERRUN;
         enterResult(true);

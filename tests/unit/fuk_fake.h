@@ -56,6 +56,8 @@ public:
     bool silent = false;       // 何も返さない
     bool noReadFrame = false;  // Read のコマンドに 'R' を返さない
     bool writeProtected = false;
+    bool extraAfterResult = false;   // リザルトの最後のバイトのあとに、余分な 0x5a を送る
+    bool extraBeforeResult = false;  // リザルト 7 バイトの前に、余分な 0x5a を送る
     unsigned sendLimit = 0;    // 0 でなければ、ポート 1 への 1 回の送信で受け付けるバイト数の上限
     unsigned sendLimit2 = 0;   // 同じく、ポート 2
     uint32_t asyncSendUs[2] = {0, 0}; // 0 でなければ、FUK のポート 1 / 2 に送ったバイトが装置に届くまでの時間 (口の中に残る)
@@ -76,6 +78,7 @@ public:
     unsigned overlappedReads = 0;        // 返事が届く前に次の読み出しが来た回数 (0 でなければならない)
     unsigned resets = 0;
     unsigned port2Unexpected = 0;        // 書くデータを待っていないときにポート 2 に届いた、0x00 でないバイト (0 でなければならない)
+    void sendPort2(uint8_t b) { out2(b); } // 余分な通知
     unsigned readCommands = 0, writeCommands = 0;
     unsigned realtimeReads = 0;          // realtime に当たった Read
 
@@ -231,7 +234,7 @@ private:
         const uint8_t us = cmd_[1] & 7;
         uint8_t c = cmd_[2], h = cmd_[3], r = cmd_[4], n = cmd_[5];
         if (writeProtected) {
-            result7((uint8_t)(0x40 | us), 0x02, c, h, r, n);
+            result7((uint8_t)(0x40 | us), 0x02, c, h, r, op == 0x0d ? cmd_[2] : n);
             return;
         }
         if (op == 0x0d) { // WRITE ID: 4 バイトずつの ID。セクタを D で埋める
@@ -498,7 +501,10 @@ private:
             return;
         }
         if (!out_[0].empty() && b != 0x00) overlappedReads++;
+        if (extraBeforeResult && b == 0x03 && phase_ == RESULT && resLen_ == 7 && resPos_ == 0) out1(0x5a);
+        const bool result = b == 0x03 && phase_ == RESULT;
         out1(regRead(b));
+        if (extraAfterResult && result && phase_ != RESULT) out1(0x5a);
     }
 
     void rxPort2(uint8_t b) {

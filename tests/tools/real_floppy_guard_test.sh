@@ -138,8 +138,8 @@ if sh "$PATCH" "$CPP" "$T/w.cpp" "$H" "$T/w.h" "$X" "$T/wx.cpp" "$ROOT/baremetal
   pc=$(body "$T/w.cpp" 'int CUSBFloppyDiskDevice::Pix68kCommand (' |
     awk '/UfiGate::enabled/ { e = NR } /m_Pix68kGate\.allow/ { a = NR } /pHost->/ && !p { p = NR } END { print (e && a && p && e < a && a < p) ? "ok" : "ng" }')
   [ "$n" = 1 ] && [ "$pc" = ok ] && ok '送る前に UfiGate で判定する' || ng 'UfiGate の判定が送る前にない'
-  grep -q 'uchCompletionCode == 6 && pURB->GetEndpoint ()->GetType () == EndpointTypeControl' "$T/wx.cpp" &&
-    ok 'xHCI: STALL を知らせるのは制御転送だけ' || ng 'xHCI の STALL の書き換えがない'
+  grep -q 'uchCompletionCode == 6 && (pURB->GetEndpoint ()->GetType () == EndpointTypeControl || (g_pPix68kXHCILongTimeoutDevice != 0 && pURB->GetEndpoint ()->GetDevice () == g_pPix68kXHCILongTimeoutDevice)))' "$T/wx.cpp" &&
+    ok 'xHCI: STALL を知らせるのは制御転送と USB-FDD だけ' || ng 'xHCI の STALL の書き換えがない'
 else
   ng "書き込みの関数を足す書き換えが当たらない: $(cat "$T/err")"
 fi
@@ -158,7 +158,7 @@ n=$(calls 'enable *\(' | wc -l)
 # 読めたか、どのファイルか、の判定は ufi_disk_test が試す (usbFddWriteUnitFrom())。ここでは、読んだ直後に 1 回だけ渡すことを見る
 n=$(grep -rn 'EnableUsbFloppyWrite(' "$ROOT"/baremetal/*.cpp | grep -v '^[^:]*:[0-9]*:void ' | wc -l)
 [ "$n" -eq 1 ] && body "$ROOT/baremetal/machine_run.cpp" 'void CKernel::ReadConfig()' |
-  awk '/LoadConfigText\("pix68k.cfg", "pix68k.new", base, path\)/ { l = NR } /EnableUsbFloppyWrite\(r == FR_OK, path, base\);/ { e = NR } END { exit !(l && e == l + 1) }' &&
+  awk '/^    FRESULT r = LoadConfigText\("pix68k.cfg", "pix68k.new", base, path\);$/ { l = NR } /^    EnableUsbFloppyWrite\(r == FR_OK, path, base\);$/ { e = NR } END { exit !(l && e == l + 1) }' &&
   ok 'pix68k.cfg を読んだ結果だけを渡す' || ng 'pix68k.cfg を読んだ結果のほかのものを渡している'
 # 比べるパスと、読んだファイルのパス (pix68k.new を読んだのに pix68k.cfg と答えない)。ほかの代入があれば落ちる
 EN=$(body "$RUN" 'void CKernel::EnableUsbFloppyWrite(')
@@ -166,21 +166,154 @@ LC=$(body "$RUN" 'FRESULT CKernel::LoadConfigText(')
 [ "$(printf '%s\n' "$EN" | grep -cE 'cfg(\.Format| *=|\.Append)')" = 1 ] &&
   printf '%s\n' "$EN" | grep -qxF '    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);' &&
   [ "$(printf '%s\n' "$LC" | grep -cE '(^|[^a-zA-Z.])path(\.Format| *=|\.Append)')" = 1 ] &&
-  printf '%s\n' "$LC" | grep -qxF '    path = usedTmp ? tmp : cfg;' &&
+  printf '%s\n' "$LC" | awk '/^    const platform::ReadFrom<FRESULT> from = ReadWithFallback\(cfg, tmp, data, size\);$/ { l = NR } /^    path = from\.path;$/ { p = NR } END { exit !(l && p == l + 2) }' &&
   printf '%s\n' "$LC" | grep -qxF '    cfg.Format("%s/pix68k/%s", m_BootDrive, name);' &&
   printf '%s\n' "$LC" | grep -qxF '    tmp.Format("%s/pix68k/%s", m_BootDrive, tmpName);' &&
-  printf '%s\n' "$LC" | grep -qF 'ReadWithFallback(cfg, tmp, data, size, usedTmp);' &&
+  printf '%s\n' "$EN" | grep -qxF 'void CKernel::EnableUsbFloppyWrite(const bool readOk, const char* const path, const platform::ConfigText& base) {' &&
+  [ "$(printf '%s\n' "$LC" | grep -oE '(^|[^a-zA-Z_])(tmp|cfg|path) *(=[^=]|\+=|\.[A-Z])' | wc -l)" -eq 3 ] &&
+  [ "$(printf '%s\n' "$LC" | grep -oE '(^|[^a-zA-Z_])tmp([^a-zA-Z_]|$)' | wc -l)" -eq 3 ] &&
+  [ "$(printf '%s\n' "$LC" | grep -oE '(^|[^a-zA-Z_])from([^a-zA-Z_]|$)' | wc -l)" -eq 3 ] &&
+  RF2=$(body "$RUN" 'platform::ReadFrom<FRESULT> CKernel::ReadWithFallback(') &&
+  printf '%s\n' "$RF2" | grep -qxF '    return platform::readWithFallback(reader, path, tmp);' &&
+  printf '%s\n' "$RF2" | grep -qxF '        FRESULT read(const char* p) { return ReadFileChecked(p, data, size); }' &&
+  [ "$(printf '%s\n' "$RF2" | grep -c 'return ')" -eq 4 ] &&
   ok 'pix68k.new を読んだら、そのパスで比べる' || ng 'pix68k.new と pix68k.cfg を区別していない'
-# この版には、確認を開けるところがない
+# 上の判定につながる関数は、ホストでは動かせないので、全文を比べる (注釈の行は除く)。1 行の変更や入れ替えでも落ちる。
+# わざと変えたときは、pix68k.new を読んだのに pix68k.cfg と答えないことを確かめてから、ここも直す
+code() { sed '/^ *\/\//d'; }
+{
+  body "$RUN" 'FRESULT CKernel::ReadFileChecked(' | code
+  body "$RUN" 'platform::ReadFrom<FRESULT> CKernel::ReadWithFallback(' | code
+  body "$RUN" 'FRESULT CKernel::LoadConfigText(' | code
+  body "$RUN" 'void CKernel::EnableUsbFloppyWrite(' | code
+  body "$RUN" 'void CKernel::ReadConfig()' | code | sed '/^    EnableUsbFloppyWrite(/q'
+} > "$T/cfg_got"
+cat > "$T/cfg_want" <<'EOF'
+FRESULT CKernel::ReadFileChecked(const char* path, u8*& data, unsigned& size) {
+    data = nullptr;
+    size = 0;
+    FIL f;
+    FRESULT r = f_open(&f, path, FA_READ | FA_OPEN_EXISTING);
+    if (r != FR_OK) return r;
+    const unsigned n = (unsigned)f_size(&f);
+    u8* buf = n > 0 ? new u8[n] : nullptr;
+    UINT got = 0;
+    if (n > 0) {
+        if (buf == nullptr) r = FR_NOT_ENOUGH_CORE;
+        else if ((r = f_read(&f, buf, n, &got)) == FR_OK && got != n) r = FR_INT_ERR;
+    }
+    f_close(&f);
+    if (r != FR_OK) {
+        delete[] buf;
+        return r;
+    }
+    data = buf;
+    size = n;
+    return FR_OK;
+}
+platform::ReadFrom<FRESULT> CKernel::ReadWithFallback(const char* path, const char* tmp, u8*& data, unsigned& size) {
+    struct Reader {
+        u8*& data;
+        unsigned& size;
+        FRESULT read(const char* p) { return ReadFileChecked(p, data, size); }
+        bool missing(FRESULT r) const { return r == FR_NO_FILE || r == FR_NO_PATH; }
+        bool ok(FRESULT r) const { return r == FR_OK; }
+    } reader{data, size};
+    return platform::readWithFallback(reader, path, tmp);
+}
+FRESULT CKernel::LoadConfigText(const char* name, const char* tmpName, platform::ConfigText& text, CString& path) {
+    CString cfg, tmp;
+    cfg.Format("%s/pix68k/%s", m_BootDrive, name);
+    tmp.Format("%s/pix68k/%s", m_BootDrive, tmpName);
+    u8* data = nullptr;
+    unsigned size = 0;
+    const platform::ReadFrom<FRESULT> from = ReadWithFallback(cfg, tmp, data, size);
+    const FRESULT r = from.result;
+    path = from.path;
+    const bool loaded = text.load(r == FR_OK && data != nullptr ? (const char*)data : "", r == FR_OK ? size : 0);
+    delete[] data;
+    return r == FR_OK && !loaded ? FR_NOT_ENOUGH_CORE : r;
+}
+void CKernel::EnableUsbFloppyWrite(const bool readOk, const char* const path, const platform::ConfigText& base) {
+    CString cfg;
+    cfg.Format("%s/pix68k/pix68k.cfg", m_BootDrive);
+    char value[platform::ConfigText::MAX_LINE];
+    const int unit = platform::usbFddWriteUnitFrom(readOk, path, cfg, base, value, sizeof value);
+    if (unit == -1) return;
+    if (unit < 0) {
+        m_Logger.Write(FromMachine, LogWarning, "experimental_usb_fdd_write=%s: use usb-fdd:0 to usb-fdd:%d; not enabled", value,
+                       platform::REAL_FLOPPY_UNITS - 1);
+        return;
+    }
+#if RASPPI >= 4
+    platform::UfiGate::enable(unit);
+    m_Logger.Write(FromMachine, LogWarning,
+                   "EXPERIMENTAL: experimental_usb_fdd_write=usb-fdd:%d (Write XDF in the settings menu can overwrite the disk)",
+                   unit);
+#else
+    m_Logger.Write(FromMachine, LogWarning, "experimental_usb_fdd_write=%s: needs a Pi 4 or Pi 5; not enabled", value);
+#endif
+}
+void CKernel::ReadConfig() {
+    platform::ConfigText base;
+    CString path;
+    FRESULT r = LoadConfigText("pix68k.cfg", "pix68k.new", base, path);
+    EnableUsbFloppyWrite(r == FR_OK, path, base);
+EOF
+cmp -s "$T/cfg_got" "$T/cfg_want" && ok 'pix68k.cfg を読んで書き込みを許すまでの関数は、確かめたときのまま' ||
+  { ng 'pix68k.cfg を読んで書き込みを許すまでの関数が変わった'; diff "$T/cfg_want" "$T/cfg_got"; }
 n=$(calls 'confirm *\(' | grep -vE 'confirm *\( *(false|FALSE|0) *\)' | wc -l)
-[ "$n" -eq 0 ] && ok '確認を開けるところがない' || ng "確認を開けるところが $n か所ある"
-# 足す関数は 2 つだけで、装置に送るのは Pix68kCommand() の 3 か所だけ (門を通るかは ufd_driver_test が試す)
+[ "$n" -eq 1 ] && body "$ROOT/baremetal/ufd_restore.inc" 'bool CKernel::runFloppyWrite(' |
+  awk '/checkSame\(/ { c = NR } /UfiGate::confirm\(true\)/ { o = NR } /restore\.write\(/ { w = NR } /UfiGate::confirm\(false\)/ && w && !x { x = NR } END { exit !(c && o && w && x && c < o && o < w && w < x) }' &&
+  ok '確認を開けるのは、設定メニューで Yes を選んだあとの、書く間だけ' || ng "確認を開けるところ ($n)"
+# 控えを残し、読み戻して確かめてから、書いてよいかを尋ねる (手順は floppy_restore_test が試す)
+RES=$ROOT/baremetal/ufd_restore.inc
+body "$RES" 'bool CKernel::prepareFloppyWrite(' |
+  awk '/saveFloppyImageFile\(fs, save,/ { s = NR } /fs\.crc32\(save, crc\)/ { c = NR } /restore\.backupDone\(saved, crc\)/ { b = NR } /return true;/ { r = NR; n++ } END { exit !(s && c && b && n == 1 && s < c && c < b && b < r) }' &&
+  ok '控えを確かめてから、書いてよいかを尋ねる' || ng '控えを確かめる前に、書いてよいかを尋ねている'
+body "$RES" 'bool CKernel::runFloppyWrite(' |
+  awk '/if \(acceptPartial\) w\.restore\.acceptPartial\(\)/ { a = NR } /checkSame\(/ { c = NR } /f_sync\(&f\)/ { m = NR } /restore\.write\(/ { w = NR } END { exit !(a && c && m && w && a < c && c < m && m < w) }' &&
+  [ "$(grep -c 'restore\.acceptPartial()' "$RES")" = 1 ] &&
+  ok '欠けた控えで書くのは、別の確認のあとだけ。記録を残してから書く' || ng '欠けた控えの確認か、記録の順番が違う'
+# 別名を使っても数えられるように、型の名前を問わず confirm(true) を数え、UfiGate の別名を禁じる
+[ "$(grep -rnE 'confirm *\( *(true|TRUE|1) *\)' "$ROOT/src" "$ROOT/baremetal" "$ROOT/host" "$ROOT/tools" | grep -vE '^[^:]*:[0-9]+: *(//|#)' | wc -l)" -eq 1 ] &&
+  ! grep -rnE '(using|typedef|define).*UfiGate' "$ROOT/src" "$ROOT/baremetal" "$ROOT/host" "$ROOT/tools" | grep -q . &&
+  ok '確認を開けるところは、別名でも 1 か所' || ng '別名で確認を開けている'
+# ベアメタルの部分 (ホストでは動かせない): 断る条件と、渡すもの。行の順番で見る
+PR=$(body "$RES" 'bool CKernel::prepareFloppyWrite(')
+RF=$(body "$RES" 'bool CKernel::runFloppyWrite(')
+has() { # $1: 説明、$2: 本文、$3: 行 (前後の空白を除いて一致)
+  printf '%s\n' "$2" | sed 's/^ *//' | grep -qxF -- "$3" && ok "$1" || ng "$1: '$3' がない"
+}
+# $3 の行のあと 4 行のうちに return false; があること
+refuses() { printf '%s\n' "$2" | grep -F -A4 -- "$3" | grep -qF 'return false;' && ok "$1" || ng "$1: '$3' で断っていない"; }
+refuses 'FD0 / FD1 に実物のディスクが入っていれば断る' "$PR" 'if (m_RealFloppy[d]) {'
+has 'FD0 と FD1 の両方を見る' "$PR" 'for (int d = 0; d < 2; d++)'
+refuses 'FUK の読み出し中は断る' "$PR" 'if (m_FukReading || m_FukReadRequest >= 0) {'
+has 'XDF の大きさを見る' "$PR" 'const bool size = f_size(&f) == R::IMAGE_BYTES;'
+has '読み終えたかを見る' "$PR" 'const bool ok = size && f_read(&f, image, R::IMAGE_BYTES, &got) == FR_OK && got == R::IMAGE_BYTES;'
+refuses '大きさが違うか読めなければ断る' "$PR" 'if (!ok) {'
+has '控えは今の中身' "$PR" 'platform::saveFloppyImageFile(fs, save, tmp, old, (unsigned)R::IMAGE_BYTES, w.restore.oldCrc());'
+has '控えの .TXT も読み戻す' "$PR" 'fs.crc32(txt, got) && got == want;'
+has '書くのは選んだイメージ' "$RF" 'ok = w.restore.write(m_pUfdBuf, &progress);'
+has 'image は書き込み元のバッファ' "$PR" 'u8* const image = m_pUfdBuf;'
+has '書き終わるか、書いていなければ、自分の行だけを消す' "$RF" 'if (ok || !w.restore.touched()) UnmarkUfdWrite(mark, markWas);'
+[ "$(printf '%s\n' "$RF" | grep -c 'UnmarkUfdWrite(')" -eq 2 ] && ok '記録を消すのは 2 か所 (終わったとき、書けなかったとき)' || ng '記録を消すところの数が変わった'
+grep -A3 'static void OnRemoved' "$RES" | grep -qF 'static_cast<CUfiUsb*>(context)->m_pDev = nullptr;' && ok '抜かれたら装置を使わない' || ng '抜かれた装置を使う'
+grep -A3 'static void OnRemoved' "$RES" | grep -qF 'platform::UfiGate::confirm(false);' &&
+  ok '抜かれたら確認を取り消す' || ng '抜かれても確認が残る'
+# 状態の行に直接出す文も、メニューの枠 (48 桁) に収める (ほかの文は floppy_write_text_test が試す)。1 行に書いた文字列だけを数える (数の桁は数えない)
+w=$(awk '/msg\.add\(/ { line = $0; n = 0
+    while (match(line, /"[^"]*"/)) { n += RLENGTH - 2; line = substr(line, RSTART + RLENGTH) }
+    if (n > 48) print FNR ": " n }' "$RES")
+[ "$(grep -c 'msg\.add(' "$RES")" -ge 8 ] && [ -z "$w" ] && ok '状態の行の文は枠に収まる' || ng "枠に収まらない文: $w"
+# 足す関数は 2 つだけで、装置に送るのは Pix68kCommand() の中だけ (門を通るかは ufd_driver_test が試す)
 INC=$ROOT/baremetal/ufd_write.inc
 f=$(grep -oE 'CUSBFloppyDiskDevice::[A-Za-z0-9_]+ *\(' "$INC" | tr -d ' (' | LC_ALL=C sort | tr '\n' ' ')
 [ "$f" = 'CUSBFloppyDiskDevice::Pix68kArmWrite CUSBFloppyDiskDevice::Pix68kCommand ' ] &&
   ok '足す関数は 2 つだけ' || ng "足す関数: $f"
 n=$(grep -cE 'SubmitBlockingRequest|SubmitAsyncRequest|Transfer \(|Transfer\(|ControlMessage|GetHost' "$INC")
-[ "$n" -eq 4 ] && ok '送るのは Pix68kCommand() の 3 か所だけ' || ng "送るところの数が変わった ($n)"
+[ "$n" -eq 6 ] && ok '送るのは Pix68kCommand() の中だけ' || ng "送るところの数が変わった ($n)"
 
 # 書き換えが当たらない形の入力では失敗すること。$1: 説明、$2: usbfloppydevice.cpp に掛ける sed の式
 broken() {

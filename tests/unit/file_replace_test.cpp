@@ -240,8 +240,12 @@ void testReadWithFallback() {
         ReadFs fs;
         fs.pathResult = c.path;
         fs.tmpResult = c.tmp;
-        bool usedTmp = !c.usedTmp; // 呼んだ側の値が残らないこと
-        const FakeResult r = platform::readWithFallback(fs, "cfg", "new", usedTmp);
+        const char* const cfg = "cfg";
+        const char* const tmp = "new";
+        const auto from = platform::readWithFallback(fs, cfg, tmp);
+        const FakeResult r = from.result;
+        const bool usedTmp = from.usedTmp;
+        CHECK_EQ(from.path == (c.usedTmp ? tmp : cfg), true); // 読んだファイルのパス
         if (r != c.want || usedTmp != c.usedTmp || fs.reads != c.reads ||
             (c.got ? (fs.got == nullptr || strcmp(fs.got, c.got) != 0) : fs.got != nullptr))
             printf("  %s\n", c.name);
@@ -253,9 +257,10 @@ void testReadWithFallback() {
     // path が空のファイルでも path を読む (空の pix68k.cfg は「設定なし」で、古い tmp は読まない)
     ReadFs fs;
     fs.pathData = "";
-    bool usedTmp = true;
-    CHECK_EQ(platform::readWithFallback(fs, "cfg", "new", usedTmp), R_OK);
-    CHECK_EQ(usedTmp, false);
+    const auto from = platform::readWithFallback(fs, "cfg", "new");
+    CHECK_EQ(from.result, R_OK);
+    CHECK_EQ(from.usedTmp, false);
+    CHECK_EQ(strcmp(from.path, "cfg"), 0);
     CHECK_EQ(strcmp(fs.got, ""), 0);
 }
 

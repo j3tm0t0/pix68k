@@ -90,6 +90,7 @@ struct Screen {
     // 512x512 (31kHz)、画面はすべて OFF、パレット 0 は両方とも $0000
     void init() {
         v.reset();
+        v.setContrast(14); // Video のリセットはコントラストを変えない
         r.setTarget(px, Renderer::MAX_WIDTH, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
         crtc(0, 0x5b);
         crtc(2, 0x11);
@@ -1535,6 +1536,236 @@ void testIndexedCapture() {
     for (auto line : frame.supported) CHECK_EQ(line, 0);
 }
 
+// ---- コントラスト ----
+//
+// 合成したドットの R、G、B に min(コントラスト, 14) / 14 を掛ける (14 と 15 でそのまま、0 で黒)。ラインを描くときの値を使う。
+// 記録を通して描いても同じになる
+
+uint32_t dimmed(uint32_t p, unsigned c) {
+    // 256 x c / 14 を四捨五入したもの (c = 0..15)
+    static const unsigned gain[16] = {0, 18, 37, 55, 73, 91, 110, 128, 146, 165, 183, 201, 219, 238, 256, 256};
+    uint32_t out = 0;
+    for (int sh = 0; sh <= 16; sh += 8) out |= (((p >> sh) & 0xff) * gain[c] + 128) / 256 << sh;
+    return out;
+}
+
+// 渡されたパレットを覚えておくだけの、色コードを受け取る先 (ラインは引き受けない)
+struct PaletteProbe : x68k::IndexedLineSink {
+    const uint32_t* text = nullptr;
+    const uint32_t* graphic = nullptr;
+    int calls = 0;
+    void beginLine(int, int) override {}
+    bool above(int, int, const uint8_t*, const uint8_t*, const uint32_t* t, const uint32_t* g) override {
+        text = t;
+        graphic = g;
+        calls++;
+        return false;
+    }
+};
+
+// 描き方ごとに、どのコントラストでも、コントラスト 14 で描いたドットに 1 度だけ掛けたものになる
+// (透明かどうか、半透明の計算、重なりの順は変わらない)
+void testContrastModes() {
+    printf("contrast applies once in every drawing path\n");
+    struct Mode {
+        const char* name;
+        uint16_t r20, vc0, vc1, vc2;
+        bool special, dark;
+    };
+    const Mode modes[] = {
+        {"16 colors, above", 0x0015, 0, 0x06e4, 0x006f, false, false},
+        {"16 colors, split", 0x0015, 0, 0x21e4, 0x006f, false, false},
+        {"16 colors, below", 0x0015, 0, 0x24e4, 0x006f, false, false},
+        {"256 colors, above", 0x0115, 1, 0x06e4, 0x006f, false, false},
+        {"65536 colors, above", 0x0315, 3, 0x06e4, 0x006f, false, false},
+        {"65536 colors, below", 0x0315, 3, 0x24e4, 0x006f, false, false},
+        {"text only", 0x0015, 0, 0x06e4, 0x0020, false, false},
+        {"text and sprite", 0x0015, 0, 0x06e4, 0x0060, false, false},
+        {"graphic only", 0x0015, 0, 0x06e4, 0x000f, false, false},
+        {"half transparent pages, 16 colors", 0x0015, 0, 0x06e4, 0x1d6f, true, false},
+        {"half transparent pages, 256 colors", 0x0115, 1, 0x06e4, 0x1d6f, true, false},
+        {"half transparent text", 0x0015, 0, 0x06e4, 0x5d6f, true, false},
+        {"special priority", 0x0015, 0, 0x06e4, 0x146f, true, false},
+        {"dark front colors", 0x0015, 0, 0x06e4, 0x006f, false, true},
+        {"dark split colors", 0x0015, 0, 0x21e4, 0x006f, false, true},
+    };
+    for (const Mode& m : modes) {
+        S.init();
+        S.crtc(20, m.r20);
+        S.vc(0, m.vc0);
+        S.vc(1, m.vc1);
+        S.palette(256, 0);
+        if (m.dark)
+            for (int i = 1; i < 256; i++) S.palette(256 + i, (uint16_t)(i & 1)); // すべて 4 か、すべて 0
+        for (int i = 0; i < 4; i++) S.pcg8(4 + i, 4, 0x33550100);
+        for (int n = 0; n < 8; n++) S.sprite(n, n * 12, 4, 0x0401, 3);
+        for (int x = 0; x < 512; x++) {
+            S.tdot(x, 4, x / 3 % 4);
+            S.gword(x, 4, (uint16_t)(x * 131 + 7));
+        }
+        S.vc(2, m.vc2);
+        S.v.setContrast(14);
+        S.r.renderLine(4);
+        uint32_t full[512];
+        memcpy(full, S.px + 4 * Renderer::MAX_WIDTH, sizeof full);
+        int lit = 0;
+        for (uint32_t p : full) lit += p != 0;
+        CHECK_EQ(lit > 100, true);
+        for (unsigned c = 0; c < 16; c++) {
+            S.v.setContrast((uint8_t)c);
+            S.r.renderLine(4);
+            int wrong = 0;
+            for (int x = 0; x < 512; x++) wrong += S.px[4 * Renderer::MAX_WIDTH + x] != dimmed(full[x], c);
+            if (wrong) printf("  %s, contrast %u\n", m.name, c);
+            CHECK_EQ(wrong, 0);
+        }
+        S.v.setContrast(14);
+    }
+}
+
+// 色コードを渡す先のパレット: 14 と 15 では元のまま。小さいときは、元の色かコントラストが変わったラインで新しい色になる
+void testContrastSinkPalette() {
+    printf("sink palettes follow the palette and the contrast\n");
+    PaletteProbe probe;
+    S.init();
+    S.palette(256, 0);
+    S.vc(2, 0x006f);
+    for (int x = 0; x < 512; x++) S.gword(x, 4, 1);
+    S.r.setIndexedLineSink(&probe);
+    const uint32_t* xrgb = S.v.paletteXrgb();
+    for (unsigned c : {14u, 15u}) {
+        S.v.setContrast((uint8_t)c);
+        S.r.renderLine(4);
+        CHECK_EQ(probe.text == xrgb + 256, true);
+        CHECK_EQ(probe.graphic == xrgb, true);
+    }
+    CHECK_EQ(probe.calls, 2);
+    auto matches = [&](unsigned c) {
+        S.r.renderLine(4);
+        int wrong = 0;
+        for (int i = 0; i < 256; i++) wrong += probe.text[i] != dimmed(xrgb[256 + i], c) || probe.graphic[i] != dimmed(xrgb[i], c);
+        return wrong;
+    };
+    S.v.setContrast(7);
+    CHECK_EQ(matches(7), 0);
+    CHECK_EQ(matches(7), 0); // 変わらないライン
+    S.palette(256 + 5, 0xfffe);
+    CHECK_EQ(matches(7), 0); // テキストの色だけ変えた
+    S.palette(255, 0xfffe);
+    CHECK_EQ(matches(7), 0); // グラフィックの色だけ変えた
+    S.v.setContrast(3);
+    CHECK_EQ(matches(3), 0); // コントラストだけ変えた
+    S.v.setContrast(0);
+    CHECK_EQ(matches(0), 0);
+    S.v.setContrast(7);
+    CHECK_EQ(matches(7), 0);
+    CHECK_EQ(probe.calls, 9);
+    S.r.setIndexedLineSink(nullptr);
+    S.v.setContrast(14);
+}
+
+void testContrast() {
+    printf("contrast scales each channel by min(contrast, 14) / 14\n");
+    S.init();
+    S.crtc(20, 0x0315); // 65536 色
+    S.vc(0, 3);
+    S.vc(2, 0x002f); // テキストとグラフィック
+    for (int i = 0; i < 256; i++) S.palette(i, (uint16_t)(i * 0x0101 | 1));
+    for (int x = 0; x < 512; x++) S.gword(x, 3, (uint16_t)(x * 131 + 7));
+    S.tdot(5, 3, 2);
+    S.r.renderLine(3);
+    static uint32_t full[512];
+    memcpy(full, S.px + 3 * Renderer::MAX_WIDTH, sizeof full);
+    for (unsigned c : {15u, 14u, 7u, 1u, 0u}) {
+        S.v.setContrast((uint8_t)c);
+        CHECK_EQ(S.v.contrast(), c);
+        S.r.renderLine(3);
+        int wrong = 0;
+        for (int x = 0; x < 512; x++) {
+            wrong += S.px[3 * Renderer::MAX_WIDTH + x] != dimmed(full[x], c);
+        }
+        CHECK_EQ(wrong, 0);
+    }
+    // 4 ビットより上は捨てる
+    S.v.setContrast(0x1f);
+    CHECK_EQ(S.v.contrast(), 15);
+    // テキストだけのライン (別の描き方) にも掛ける
+    S.vc(2, 0x0020);
+    S.tdot(9, 4, 3);
+    S.r.renderLine(4);
+    const uint32_t textFull = S.px[4 * Renderer::MAX_WIDTH + 9];
+    S.v.setContrast(0);
+    S.r.renderLine(4);
+    CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH + 9], 0u);
+    CHECK_EQ(textFull != 0u, true);
+    S.v.setContrast(15);
+
+    // 記録を通して、フレームの途中でコントラストを変える
+    static Screen source, shadow;
+    static uint32_t ring[1 << 10];
+    x68k::VideoJournal journal;
+    journal.init(ring, 10);
+    x68k::VideoReplayer replayer(journal, shadow.v, shadow.r);
+    source.init();
+    shadow.init();
+    shadow.r.setTarget(shadow.px, Renderer::MAX_WIDTH, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
+    source.v.setJournal(&journal);
+    source.vc(2, 0x0020);
+    for (int y = 0; y < 8; y++) source.tdot(9, y, 3);
+    for (int y = 0; y < 8; y++) {
+        source.v.setContrast(y < 4 ? 15 : 5);
+        journal.push(x68k::VideoJournal::make(x68k::VideoJournal::OP_RASTER, (uint32_t)y, 0));
+        journal.publish();
+        while (replayer.step()) {
+        }
+    }
+    source.v.setJournal(nullptr);
+    CHECK_EQ(shadow.v.contrast(), 5u);
+    const uint32_t bright = shadow.px[0 * Renderer::MAX_WIDTH + 9], dim = shadow.px[4 * Renderer::MAX_WIDTH + 9];
+    CHECK_EQ(bright, shadow.T(3));
+    CHECK_EQ(dim, dimmed(bright, 5));
+
+    // 色コードを受け取る先 (libretro の GPU) には、コントラストを掛けたパレットを渡す。
+    // 受け取る先が描いたラインは、ここで描いたものと同じになる
+    pix68k_retro::PalettedFrame frame;
+    frame.skipSoftware = true;
+    S.init();
+    S.crtc(20, 0x0015); // 16 色
+    S.vc(0, 0);
+    S.palette(256, 0); // テキストの色コード 0 は透明
+    S.palette(256 + 3, 0x0001); // どのチャンネルも 4。コントラスト 1 で 0 になるが、透明にはしない
+    for (int i = 1; i < 16; i++) S.palette(i, 0xfffe); // 明るいグラフィック
+    S.pcg8(4, 0, 0x33550000); // テキストだけの描き方にならないよう、スプライトも出す (x = 4..)
+    S.sprite(0, 4, 4, 0x0401, 3);
+    for (int x = 0; x < 32; x++) {
+        S.tdot(x, 4, x % 4); // 色コード 3 は上の暗い色
+        S.gword(x, 4, (uint16_t)(x % 7));
+    }
+    unsigned captured = 0;
+    for (unsigned c : {15u, 14u, 7u, 1u, 0u}) for (int enable : {0x60, 0x6f}) {
+        S.v.setContrast((uint8_t)c);
+        S.vc(2, (uint16_t)enable);
+        S.r.setIndexedLineSink(nullptr);
+        S.r.renderLine(4);
+        uint32_t expected[512];
+        memcpy(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected);
+        if (c == 1 && enable == 0x6f) CHECK_EQ(expected[3], 0u); // 暗いテキストが手前にあり、グラフィックは見えない
+        std::fill(S.px + 4 * Renderer::MAX_WIDTH, S.px + 4 * Renderer::MAX_WIDTH + 512, kUntouched);
+        S.r.setIndexedLineSink(&frame);
+        S.r.renderLine(4);
+        // コントラスト 1 で暗い色がグラフィックの手前にあるラインだけは、透明にならないよう、ここで描く
+        const bool viaSink = !(c == 1 && enable == 0x6f);
+        CHECK_EQ(frame.supported[4], viaSink);
+        captured += frame.supported[4];
+        if (viaSink) CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH], kUntouched); // 受け取る先が描いたラインには書かない
+        frame.resolve(S.px, 512, 5);
+        CHECK_EQ(memcmp(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected), 0);
+    }
+    CHECK_EQ(captured, 9u);
+    S.r.setIndexedLineSink(nullptr);
+    S.v.setContrast(15);
+}
+
 } // namespace
 
 int main() {
@@ -1563,5 +1794,8 @@ int main() {
     testRasterInterrupt(true);
     testJournalReplay();
     testJournalPaletteOutside();
+    testContrast();
+    testContrastModes();
+    testContrastSinkPalette();
     return finish();
 }

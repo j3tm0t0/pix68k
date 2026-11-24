@@ -696,6 +696,8 @@ void Machine::powerOn() {
     rtc_.reset();
     keyboard_.reset();
     mouse_.reset();
+    sysPort_.powerOn();
+    video_->setContrast(sysPort_.contrast());
     resetDevices();
     // GPIP の固定の入力: アラームなし (1)、EXPWON (1)、電源スイッチ (0)、OPM の割り込みなし (1)、
     // GPIP5 (未接続、1)
@@ -1359,9 +1361,10 @@ bool Machine::setTs6bga(bool on, uint32_t base) {
 
 bool Machine::userBlocked(uint32_t addr, int fc) const {
     if (fc != m68k::FC_USER_DATA && fc != m68k::FC_USER_PROG) return false;
-    // エリアセット ($E86001) で決めた RAM の先頭と、I/O 領域はスーパーバイザ専用
+    // エリアセット ($E86001) で決めた RAM の先頭と、I/O 領域はスーパーバイザ専用。ただし、拡張ボードのための
+    // ユーザ I/O 領域 ($EC0000-$ECFFFF) はユーザモードでも使える (Inside X68000 の PDF 26 ページ、1 章の「ユーザ I/O, SRAM」)
     if (addr < ((uint32_t)areaSet_ + 1) * 0x2000) return true;
-    return addr >= 0xe80000 && addr < 0xf00000;
+    return addr >= 0xe80000 && addr < 0xf00000 && (addr & 0xff0000) != 0xec0000;
 }
 
 int Machine::readByte(uint32_t addr, int fc) {
@@ -1620,7 +1623,15 @@ bool Machine::ioWrite(uint32_t addr, uint8_t v) {
         if (odd) rtc_.write((int)((off & 0x1f) >> 1), v);
         return true;
     case 6: return true; // プリンタ
-    case 7: sysPort_.write(off, v); return true;
+    case 7:
+        // コントラスト: 値が変わるときは、今の時刻までのラスタを前の明るさで描かせてから変える。周辺機器の同期は
+        // イベント (水平表示期間の始まりなど) ごとなので、ずれるのはイベントをまたぐ命令の中の書き込みだけで、
+        // パレット (同期しない) と同じ。パレットはラスタごとに何語も書くソフトがあるので速さのために同期しないが、
+        // コントラストは多くても 1 フレームに数回なので、同期しても遅くならない
+        if ((off & 0x0f) == 0x1 && (v & 0x0f) != sysPort_.contrast()) syncDevices();
+        sysPort_.write(off, v);
+        if ((off & 0x0f) == 0x1) video_->setContrast(sysPort_.contrast());
+        return true;
     case 8:
         syncDevices(); // 書く前の時間の分だけ、前の設定で音を作る
         sound_.opmWrite(off, v);

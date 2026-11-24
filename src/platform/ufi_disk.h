@@ -1,6 +1,6 @@
 // USB-FDD (UFI) の X68000 の 2HD のディスクを、書き込みのために読み書きする (#386)。実機の USB には触らず、UfiTransport を通す
 // (ベアメタル版はPi 4 / Pi 5 の CUSBFloppyDiskDevice::Pix68kCommand()、試験では偽物)。
-// open() のあとで、媒体が変わった、抜かれた、媒体のエラー、USB の転送が失敗した、のどれかを見たら、そこから先は何も送らない
+// open() のあとで、媒体が変わった、抜かれた、媒体のエラー (書く前の読み出しは除く)、USB の転送が失敗した、のどれかを見たら、そこから先は何も送らない
 // (stopped()。同じオブジェクトでは戻せない)。書き直しはしない。
 // ベアメタルでも使えるよう、例外、RTTI、STL は使わない (ヘッダだけ)。
 #pragma once
@@ -101,11 +101,12 @@ public:
         return run(cdb, dst, (size_t)count * BLOCK_BYTES, true);
     }
     // src の count ブロック (1 トラックまで) を lba から書く。false のとき、その範囲のどこまで書けたかは分からない
-    // (error() が PROTECTED、CHANGED、NOT_READY、BAD_RANGE、NOT_ALLOWED のときは、ドライブの答えでは書いていない)
+    // (error() が PROTECTED、CHANGED、BAD_RANGE、NOT_ALLOWED のときは、ドライブの答えでは書いていない)
     bool write(uint32_t lba, uint32_t count, const uint8_t* src) {
         if (!usable()) return false;
         if (!inRange(lba, count) || src == nullptr) return fail(BAD_RANGE);
         if (protect_ == WRITE_PROTECTED) return fail(PROTECTED);
+        writing_ = true;
         uint8_t cdb[12];
         makeRw(cdb, UfiOp::WRITE10, lba, count);
         if (!t_->armWrite(lba, count)) return fail(NOT_ALLOWED);
@@ -200,7 +201,8 @@ private:
             return stop(HARDWARE);
         case 2: return stop(NOT_READY);
         // 書き直すには、データの転送路を戻す手順 (HALT の解除) が要り、確かめていないので、ここで止める
-        case 3: return stop(MEDIUM);
+        // 書く前の読み出しなら、読めるところを読むために続ける (データの転送路は CUSBFloppyDiskDevice::Pix68kCommand() が戻す)
+        case 3: return writing_ ? stop(MEDIUM) : fail(MEDIUM);
         case 5: return fail(REJECTED);
         case 6: return stop(CHANGED);
         case 7:
@@ -211,7 +213,7 @@ private:
     }
 
     UfiTransport* t_ = nullptr;
-    bool open_ = false, stopped_ = false;
+    bool open_ = false, stopped_ = false, writing_ = false;
     Error error_ = NONE;
     Protect protect_ = UNKNOWN;
     uint8_t key_ = 0, asc_ = 0, ascq_ = 0;

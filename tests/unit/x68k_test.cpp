@@ -170,6 +170,53 @@ void testBusErrors() {
     CHECK_EQ(causesBusError({0x027c, 0xdfff, 0x1039, 0x00e8, 0x8001}), true); // andi #$dfff,sr; move.b $e88001,d0
 }
 
+// ユーザ I/O 領域 ($EC0000-$ECFFFF) は、つないだボードをユーザモードからも使える (Inside X68000 の PDF 26 ページ)。
+// 隣のスプライト ($EBFFFF まで) と SRAM ($ED0000 から) は、ユーザモードではバスエラーのまま
+void testUserIo() {
+    auto run = [](int cpu, bool boards, std::initializer_list<uint16_t> insn, bool user) {
+        x68k::Config cfg;
+        cfg.setCpu(cpu);
+        x68k::Machine m(cfg);
+        CHECK_EQ(m.ok(), true);
+        if (boards) {
+            CHECK_EQ(m.setMercury(true), true);
+            CHECK_EQ(m.setNeptune(true), true);
+        }
+        Rom rom;
+        if (user) rom.code({0x027c, 0xdfff}); // andi #$dfff,sr
+        rom.code(insn);
+        const Result r = runRom(m, rom);
+        CHECK_EQ(r.d6 == 1 || r.d7 == 1, true); // 最後まで行ったか、バスエラーになった
+        return r.d7 == 1;
+    };
+    const int cpus[] = {
+        68000,
+#ifndef PIX68K_NO_CPU020
+        68030, 68060,
+#endif
+    };
+    for (int cpu : cpus) {
+        for (bool user : {false, true}) {
+            CHECK_EQ(run(cpu, true, {0x4239, 0x00ec, 0xc0c3}, user), false);         // clr.b $ecc0c3 (68000 は読んでから書く)
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00ec, 0xc0c1}, user), false);         // move.b $ecc0c1,d0
+            CHECK_EQ(run(cpu, true, {0x13fc, 0x0020, 0x00ec, 0xc0c9}, user), false); // move.b #$20,$ecc0c9
+            CHECK_EQ(run(cpu, true, {0x3039, 0x00ec, 0xc080}, user), false);         // move.w $ecc080,d0
+            CHECK_EQ(run(cpu, true, {0x33fc, 0x0000, 0x00ec, 0xc080}, user), false); // move.w #0,$ecc080
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00ec, 0xe000}, user), false);         // move.b $ece000,d0 (Neptune-X)
+            // ボードの番地でないところと、ボードのないときは、どちらのモードでもバスエラー
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00ec, 0xc000}, user), true);
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00ec, 0x0000}, user), true);
+            CHECK_EQ(run(cpu, false, {0x1039, 0x00ec, 0xc0c1}, user), true);
+            CHECK_EQ(run(cpu, false, {0x13fc, 0x0020, 0x00ec, 0xc0c1}, user), true);
+            // 両隣
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00eb, 0xffff}, user), user);
+            CHECK_EQ(run(cpu, true, {0x13c0, 0x00eb, 0xffff}, user), user);
+            CHECK_EQ(run(cpu, true, {0x1039, 0x00ed, 0x0000}, user), user);
+            CHECK_EQ(run(cpu, true, {0x13c0, 0x00ed, 0x0000}, user), user); // スーパーバイザでは書き込み禁止で無視される
+        }
+    }
+}
+
 void testSramWriteProtect() {
     x68k::Machine m;
     Rom rom;
@@ -1567,6 +1614,7 @@ int main() {
         {"reset vector", testResetVector},
         {"memory map (peek)", testMemoryMapPeek},
         {"bus errors", testBusErrors},
+        {"user I/O area", testUserIo},
         {"68000 memory (12MB, no high memory)", testMemory68000},
         {"SRAM write protect", testSramWriteProtect},
         {"SRAM memory size", testSramMemorySize},

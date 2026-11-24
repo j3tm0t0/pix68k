@@ -119,8 +119,7 @@ void CKernel::ChooseProfile() {
         tmp.Format("%s/pix68k/%s", m_BootDrive, platform::PROFILE_CHOICE_TMP);
         u8* data = nullptr;
         unsigned size = 0;
-        bool usedTmp = false;
-        if (ReadWithFallback(path, tmp, data, size, usedTmp) == FR_OK &&
+        if (ReadWithFallback(path, tmp, data, size).result == FR_OK &&
             !platform::parseProfileChoice(data != nullptr ? (const char*)data : "", size, last, sizeof last, once))
             m_Logger.Write(FromProfile, LogWarning, "%s: not a profile name; ignored", (const char*)path);
         delete[] data;

@@ -13,18 +13,24 @@ class StateIO;
 class SysPort {
 public:
     void state(StateIO& s); // 状態の保存と復元 (x68k/state.h、state.cpp)
-    void reset();
+    // コントラストの電源投入時の値。資料がないので、Human68k のふだんの値 (Inside X68000 の 517 ページ) にしておく。
+    // IPL ROM は起動の途中に自分で書くので、この値が見えるのは IPL ROM が書くまでと、IPL ROM を通らない試験だけ
+    static constexpr uint8_t CONTRAST_POWER_ON = 14;
+    void powerOn(); // 電源投入: reset() に加えて、コントラストを決める
+    void reset();   // RESET 命令: コントラストは変えない
     uint8_t read(uint32_t offset);
     void write(uint32_t offset, uint8_t v);
     // $E8E00D に 0x31 を書くと SRAM に書き込める
     bool sramWritable() const { return sramWrite_ == 0x31; }
     // $E8E007 の bit1 (HRL): 高解像度の 256/512 ドットのドットクロックを変える
     bool hrl() const { return (keyctrl_ & 0x02) != 0; }
+    // $E8E001 のコントラスト (0..15)
+    uint8_t contrast() const { return contrast_; }
     // $E8E00B が返す値: 0xFF = 68000 10MHz、0xFE = 68000 16MHz (XVI)、0xDC = 68030 25MHz
     uint8_t cpuInfo = 0xfe;
 
 private:
-    uint8_t contrast_ = 0, tvctrl_ = 0, imageUnit_ = 0, keyctrl_ = 0, sramWrite_ = 0, power_ = 0;
+    uint8_t contrast_ = CONTRAST_POWER_ON, tvctrl_ = 0, imageUnit_ = 0, keyctrl_ = 0, sramWrite_ = 0, power_ = 0;
 };
 
 // I/O コントローラ ($E9C001 割り込みの状態とマスク、$E9C003 ベクタ)

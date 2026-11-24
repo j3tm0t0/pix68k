@@ -2,6 +2,9 @@
 #include <string.h>
 
 #include "fuk_fake.h"
+#include <atomic>
+#include <thread>
+
 #include "test_check.h"
 #include "x68k/fuk.h"
 
@@ -1306,6 +1309,638 @@ void testReset() {
     CHECK_EQ(dev.overlappedReads, 0);
 }
 
+// 異常終了したコマンドの記録 (#400)
+// 書き込みの記録 (TRACE) を飛ばして 1 つ取り出す
+bool takeFailure(Fuk& fuk, Fuk::Event& e) {
+    while (fuk.takeEvent(e))
+        if (e.kind != Fuk::Event::TRACE) return true;
+    return false;
+}
+
+bool lastEvent(Fuk& fuk, Fuk::Event& e) {
+    bool any = false;
+    while (takeFailure(fuk, e)) any = true;
+    return any;
+}
+
+void testEvents() {
+    Fuk::Event e;
+    char text[Fuk::EVENT_TEXT];
+    const uint8_t write[] = {0x45, 0x00, 2, 1, 1, 3, 8, 0x35, 0xff};
+    const uint8_t format[] = {0x4d, 0x00, 3, 8, 0x54, 0xe5};
+    const uint8_t read[] = {0x46, 0x00, 80, 0, 1, 3, 8, 0x35, 0xff}; // シリンダ 80 はない
+    uint8_t res[7];
+    {
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        motorOn(dev, fuk);
+        runUntil(dev, fuk, [] { return false; }, 50000);
+        CHECK_EQ(takeFailure(fuk, e), 0);
+        // 書き込み禁止のディスクへの WRITE ID: FUK のリザルト
+        dev.writeProtected = true;
+        host.count = 32;
+        sendCommand(dev, fuk, format, 6);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        for (int i = 0; i < 32; i++) fuk.write(3, (uint8_t)i);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(takeFailure(fuk, e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::FAILED);
+        CHECK_EQ(e.source, Fuk::Event::FROM_FUK);
+        CHECK_EQ(e.cmdLen, 6);
+        CHECK_EQ(memcmp(e.cmd, format, 6), 0);
+        CHECK_EQ(e.resLen, 7);
+        CHECK_EQ(memcmp(e.res, res, 7), 0);
+        CHECK_EQ(e.res[1], 0x02);
+        CHECK_EQ(e.dmaGot, 32u);
+        CHECK_EQ(e.dmaCount, 32u);
+        CHECK_EQ(e.select, 0x80);
+        CHECK_EQ(takeFailure(fuk, e), 0);
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, "WRITE ID [4d 00 03 08 54 e5] failed, result [40 02 00") != nullptr, 1);
+        CHECK_EQ(strstr(text, "from the device, select 80") != nullptr, 1);
+        CHECK_EQ(strstr(text, "DMA 32/32,") != nullptr, 1);
+        // 短いバッファでも、はみ出さずに 0 で終わる
+        char small[16];
+        memset(small, 0x7f, sizeof small);
+        Fuk::formatEvent(e, small, 10);
+        CHECK_EQ(strlen(small), 9u);
+        CHECK_EQ(small[10], 0x7f);
+        // 正常に終わった WRITE ID は記録しない
+        dev.writeProtected = false;
+        sendCommand(dev, fuk, format, 6);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        for (int i = 0; i < 32; i++) fuk.write(3, i % 4 == 3 ? 3 : 1);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(res[0] & 0xc0, 0);
+        CHECK_EQ(takeFailure(fuk, e), 0);
+        // 受け付けない書き込み (チェーン)
+        host.single = false;
+        host.count = 1024;
+        command(fuk, write, 9);
+        for (int i = 0; i < 7; i++) res[i] = fuk.read(3);
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.source, Fuk::Event::REFUSED);
+        CHECK_EQ(e.dmaCount, 1024u);
+        CHECK_EQ(e.dmaChain, 1);
+        CHECK_EQ(e.dmaGot, 0u);
+        host.single = true;
+        // データがそろわずにやめた書き込み
+        sendCommand(dev, fuk, write, 9);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        for (int i = 0; i < 100; i++) fuk.write(3, 0x33);
+        fuk.terminalCount();
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.source, Fuk::Event::CANCELLED);
+        CHECK_EQ(e.dmaGot, 100u);
+        CHECK_EQ(e.dmaCount, 1024u);
+    }
+    {
+        // 読めないセクタを読み続けても、EVENT_OTHERS 件まで。そのあとの書き込みの異常終了は記録する
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        motorOn(dev, fuk);
+        host.count = 1024;
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        for (int k = 0; k < 10; k++) {
+            sendCommand(dev, fuk, read, 9);
+            readResult(dev, fuk, res, 7);
+            CHECK_EQ(res[0] & 0xc0, 0x40);
+        }
+        unsigned n = 0;
+        while (takeFailure(fuk, e)) n++;
+        CHECK_EQ(n, Fuk::EVENT_OTHERS);
+        CHECK_EQ(fuk.eventsDropped(), 10 - Fuk::EVENT_OTHERS);
+        dev.writeProtected = true;
+        sendCommand(dev, fuk, write, 9);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        for (int i = 0; i < 1024; i++) fuk.write(3, 0x33);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.cmd[0], 0x45);
+        // 時間がたてば、また記録する
+        runUntil(dev, fuk, [] { return false; }, Fuk::EVENT_WINDOW_US, 1000);
+        sendCommand(dev, fuk, read, 9);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.cmd[0], 0x46);
+        // EOT まで読んだ Read の異常終了 (EN だけ) は記録しない
+        dev.eotAbnormal = true;
+        const uint8_t good[] = {0x46, 0x00, 2, 1, 8, 3, 8, 0x35, 0xff};
+        sendCommand(dev, fuk, good, 9);
+        uint8_t buf[1024];
+        int got = 0;
+        runUntil(dev, fuk, [&] {
+            if (fuk.dataReady()) got += fuk.readData(buf, 1024);
+            return got >= 1024;
+        });
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(res[1], 0x80);
+        CHECK_EQ(takeFailure(fuk, e), 0);
+        // リザルトのない異常 (引き取る割り込みのない SENSE INTERRUPT STATUS) も記録しない
+        const uint8_t sis[] = {0x08};
+        sendCommand(dev, fuk, sis, 1);
+        readResult(dev, fuk, res, 1);
+        CHECK_EQ(res[0], 0x80);
+        CHECK_EQ(takeFailure(fuk, e), 0);
+    }
+    {
+        // つなぎ直した理由: 'R' が来ない。そのときのコマンドも
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        motorOn(dev, fuk);
+        host.count = 1024;
+        dev.noReadFrame = true;
+        sendCommand(dev, fuk, read, 9);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.stats().timeouts != 0; }) < 5000000, 1);
+        CHECK_EQ(takeFailure(fuk, e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::LINK_LOST);
+        CHECK_EQ(e.reason, Fuk::Event::NO_R);
+        CHECK_EQ(e.cmdLen, 9);
+        CHECK_EQ(memcmp(e.cmd, read, 9), 0);
+        CHECK_EQ(e.ms >= Fuk::READ_TIMEOUT_US / 1000, 1);
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, "link lost: no 'R', 30") != nullptr, 1);
+        CHECK_EQ(strstr(text, "command READ DATA [46 00 50") != nullptr, 1);
+        // X68000 には failCommand() のリザルトを見せる
+        CHECK_EQ(takeFailure(fuk, e), 1);
+        CHECK_EQ(e.source, Fuk::Event::FAIL_COMMAND);
+        CHECK_EQ(e.res[0], 0x48);
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, "made by failCommand") != nullptr, 1);
+    }
+    {
+        // 返事が来ない、抜いた
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        dev.silent = true;
+        fuk.read(1);
+        fuk.write(5, 1);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.stats().timeouts != 0; }) < 5000000, 1);
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.reason, Fuk::Event::NO_REPLY);
+        CHECK_EQ(e.cmdLen, 0);
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, "no reply to a register read (") != nullptr, 1);
+        CHECK_EQ(strstr(text, "command none") != nullptr, 1);
+        dev.silent = false;
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 5000000, 1);
+        CHECK_EQ(lastEvent(fuk, e), 0);
+        dev.unplug();
+        runUntil(dev, fuk, [] { return false; }, 10000);
+        CHECK_EQ(lastEvent(fuk, e), 1);
+        CHECK_EQ(e.reason, Fuk::Event::UNPLUGGED);
+    }
+    {
+        // 取り出さなければ、入らない分を捨てて数える (上書きしない)
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        motorOn(dev, fuk);
+        host.count = 0; // 受け付けない書き込み
+        unsigned sent = 0;
+        while (fuk.eventsDropped() == 0 && sent < 200) {
+            command(fuk, write, 9);
+            for (int i = 0; i < 7; i++) res[i] = fuk.read(3);
+            if (++sent % Fuk::EVENT_WRITES == 0) runUntil(dev, fuk, [] { return false; }, Fuk::EVENT_WINDOW_US + 1000, 1000);
+        }
+        CHECK_EQ(sent, Fuk::EVENTS + 1);
+        unsigned n = 0;
+        uint64_t at = 0;
+        while (takeFailure(fuk, e)) { // 古い順で、中身もそのまま
+            n++;
+            CHECK_EQ(e.atUs >= at, 1);
+            CHECK_EQ(memcmp(e.cmd, write, 9), 0);
+            CHECK_EQ(e.source, Fuk::Event::REFUSED);
+            at = e.atUs;
+        }
+        CHECK_EQ(n, Fuk::EVENTS);
+        // 空けば、また積める (リングを回り込む)
+        runUntil(dev, fuk, [] { return false; }, Fuk::EVENT_WINDOW_US + 1000, 1000);
+        const unsigned dropped = fuk.eventsDropped();
+        for (unsigned k = 0; k < Fuk::EVENT_WRITES + 3; k++) { // 上限を超えた分は捨てる
+            command(fuk, write, 9);
+            for (int i = 0; i < 7; i++) res[i] = fuk.read(3);
+        }
+        n = 0;
+        while (takeFailure(fuk, e)) n++;
+        CHECK_EQ(n, Fuk::EVENT_WRITES);
+        CHECK_EQ(fuk.eventsDropped() - dropped, 3u);
+    }
+    for (int stage = 0; stage < 2; stage++) {
+        // 'W' が来ない、データを送ったあと 'w' が来ない
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.ready(); }) < 2000000, 1);
+        motorOn(dev, fuk);
+        host.count = 1024;
+        fuk.write(5, 0x21); // 排出のビットも、書いたまま記録する
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        sendCommand(dev, fuk, write, 8);
+        runUntil(dev, fuk, [] { return false; }, 10000);
+        if (stage == 0) dev.silent = true;
+        fuk.write(3, write[8]);
+        if (stage == 1) {
+            CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+            dev.silent = true;
+            for (int i = 0; i < 1024; i++) fuk.write(3, 0x33);
+        }
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.stats().timeouts != 0; }, 20000000) < 20000000, 1);
+        CHECK_EQ(takeFailure(fuk, e), 1);
+        CHECK_EQ(e.reason, stage == 0 ? Fuk::Event::NO_W : Fuk::Event::NO_W_DONE);
+        CHECK_EQ(e.control, 0x21);
+        CHECK_EQ(e.dmaGot, stage == 0 ? 0u : 1024u);
+        CHECK_EQ(e.writes, (unsigned)stage);
+        CHECK_EQ(memcmp(e.cmd, write, 9), 0);
+        // いちばん長い 1 行も入る
+        memset(&e, 0xff, sizeof e);
+        e.reader = true;
+        e.kind = Fuk::Event::LINK_LOST;
+        e.reason = Fuk::Event::NO_W;
+        e.phase = 6;
+        e.cmd[0] = 0x09;
+        e.cmdLen = 200; // 壊れた値でも、はみ出して読まない
+        e.dmaChain = true;
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, "write frames") != nullptr, 1);
+        CHECK_EQ(strlen(text) < sizeof text, 1);
+        for (int kind = 0; kind < 5; kind++) {
+            for (int r = 0; r < 10; r++) {
+                for (int phase = 0; phase < 9; phase++) {
+                    e.kind = (Fuk::Event::Kind)kind;
+                    e.source = e.reason = (uint8_t)r;
+                    e.phase = (uint8_t)phase;
+                    e.resLen = 7;
+                    Fuk::formatEvent(e, text, sizeof text);
+                    CHECK_EQ(strcmp(text + strlen(text) - 13, " write frames"), 0);
+                }
+            }
+        }
+    }
+}
+
+void writeId(FakeFuk& dev, Fuk& fuk, Count& host, int c, uint8_t* res) {
+    const uint8_t seek[] = {0x0f, 0, (uint8_t)c}, sis[] = {0x08}, id[] = {0x4d, 0, 3, 8, 0x54, 0xe5};
+    host.count = 32;
+    sendCommand(dev, fuk, seek, 3);
+    CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.irq(); }) < 1000000, 1);
+    sendCommand(dev, fuk, sis, 1);
+    readResult(dev, fuk, res, 2);
+    sendCommand(dev, fuk, id, 6);
+    CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+    for (int i = 0; i < 32; i++) fuk.write(3, (uint8_t)(i & 3 ? i & 3 : c));
+    readResult(dev, fuk, res, 7);
+}
+
+// 1 秒を超える WRITE ID
+void writeIdSlow(FakeFuk& dev, Fuk& fuk, Count& host, uint8_t* res) {
+    const uint8_t id[] = {0x4d, 0, 3, 8, 0x54, 0xe5};
+    host.count = 32;
+    sendCommand(dev, fuk, id, 6);
+    CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+    for (int i = 0; i < 32; i++) fuk.write(3, (uint8_t)(i & 3 ? i & 3 : 1));
+    CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.irq(); }) < 10000000, 1);
+    readResult(dev, fuk, res, 7);
+    dev.writeUs = 20000;
+}
+
+// 書き込みの記録 (TRACE)、捨てたバイトの内訳 (STRAY)、ずれた返事 (ODD)
+void testTrace() {
+    Fuk::Event e;
+    char text[Fuk::EVENT_TEXT];
+    uint8_t res[7];
+    {
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        for (int c = 0; c < 30; c++) writeId(dev, fuk, host, c, res); // SIS と WRITE ID で 60 個 (最初の SIS は WRITE ID の前なので 59)
+        // 書き込みの間は何も出さない。静かになったら、先頭の TRACE_FIRST 個と最後の TRACE_LAST 個
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        runUntil(dev, fuk, [] { return false; }, Fuk::TRACE_QUIET_US / 2, 1000);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        unsigned want = 0;
+        runUntil(dev, fuk, [&] {
+            Fuk::Event next;
+            if (!fuk.takeEvent(next)) return false;
+            e = next;
+            CHECK_EQ(e.kind, Fuk::Event::TRACE);
+            CHECK_EQ(e.number, ++want);
+            if (want == Fuk::TRACE_FIRST) {
+                Fuk::formatEvent(e, text, sizeof text);
+                CHECK_EQ(strstr(text, "write trace #4, ") != nullptr, 1);
+                want = 59 - Fuk::TRACE_LAST;
+            }
+            return false;
+        }, Fuk::TRACE_QUIET_US * 2, 1000);
+        CHECK_EQ(want, 59u);
+        CHECK_EQ(memcmp(e.res, res, 7), 0);
+        // WRITE ID から TRACE_AGAIN_US の間は、WRITE DATA だけでも記録する
+        const uint8_t write[] = {0x45, 0x00, 29, 0, 1, 3, 8, 0x35, 0xff};
+        host.count = 1024;
+        sendCommand(dev, fuk, write, 9);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        for (int i = 0; i < 1024; i++) fuk.write(3, 0x33);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        CHECK_EQ(fuk.flushEvents(), 0);
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::TRACE);
+        CHECK_EQ(e.number, 1u);
+        CHECK_EQ(e.dmaGot, 1024u);
+        // flushEvents() は待たずに積む
+        for (int c = 0; c < 5; c++) writeId(dev, fuk, host, c, res);
+        CHECK_EQ(fuk.flushEvents(), 0);
+        unsigned last = 0;
+        while (fuk.takeEvent(e)) last = e.number;
+        CHECK_EQ(last, 9u); // 最初の SIS は、ひと続きの前
+        CHECK_EQ(fuk.stats().stray, 0);
+        for (uint32_t x : fuk.stats().odd) CHECK_EQ(x, 0);
+        CHECK_EQ(fuk.eventsDropped(), 0);
+    }
+    {
+        // リザルトのあとの余分なバイト。種類ごとに先頭の数件と総数
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        dev.extraAfterResult = true;
+        for (int c = 0; c < 10; c++) writeId(dev, fuk, host, c, res);
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        dev.sendPort2('z');
+        dev.sendPort2('W');
+        dev.sendPort2('w');
+        dev.sendPort2('R');
+        dev.sendPort2(0);
+        dev.sendPort2(0);
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        const Fuk::Stats& st = fuk.stats();
+        CHECK_EQ(st.strays[Fuk::Event::S_PORT1], 20);
+        CHECK_EQ(st.strays[Fuk::Event::S_PORT2], 1);
+        CHECK_EQ(st.strays[Fuk::Event::S_W], 1);
+        CHECK_EQ(st.strays[Fuk::Event::S_W_DONE], 1);
+        CHECK_EQ(st.strays[Fuk::Event::S_R], 1);
+        CHECK_EQ(st.stray, 24);
+        fuk.flushEvents();
+        unsigned n[6] = {};
+        while (fuk.takeEvent(e)) {
+            if (e.kind != Fuk::Event::STRAY) continue;
+            n[e.reason]++;
+            if (e.reason == Fuk::Event::S_PORT1) CHECK_EQ(e.value, 0x5a);
+            if (e.reason == Fuk::Event::S_PORT2) {
+                CHECK_EQ(e.value, 'z');
+                CHECK_EQ(e.cmdLen, 6); // 直前のコマンド
+                Fuk::formatEvent(e, text, sizeof text);
+                CHECK_EQ(strstr(text, "stray: unknown port 2 byte 7a (#1), ") != nullptr, 1);
+                CHECK_EQ(strstr(text, "last command [4d 00 03 08 54 e5]") != nullptr, 1);
+            }
+        }
+        // 最初の SIS のあとの 1 つ (WRITE ID の前) と、数え直してからの 4 つ
+        CHECK_EQ(n[Fuk::Event::S_PORT1], 1 + Fuk::STRAY_FIRST);
+        CHECK_EQ(n[Fuk::Event::S_R], 1);
+    }
+    {
+        // リザルトの前の余分なバイト: 1 つずれる
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        dev.extraBeforeResult = true;
+        writeId(dev, fuk, host, 3, res);
+        CHECK_EQ(res[0], 0x5a);
+        CHECK_EQ(fuk.stats().odd[Fuk::Event::ODD_RESULT], 1);
+        fuk.flushEvents();
+        bool seen = false;
+        while (fuk.takeEvent(e)) {
+            if (e.kind != Fuk::Event::ODD) continue;
+            seen = true;
+            CHECK_EQ(e.value, 0x5a);
+            CHECK_EQ(e.res[0], 0x5a);
+            Fuk::formatEvent(e, text, sizeof text);
+            CHECK_EQ(strstr(text, "odd reply: result does not match the command 5a (#1)") != nullptr, 1);
+        }
+        CHECK_EQ(seen, 1);
+    }
+    {
+        // 'w' が来ずに切れ、X68000 がリザルトを読まないまま止まっても、最後の記録が出る
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        for (int c = 0; c < 6; c++) writeId(dev, fuk, host, c, res);
+        const uint8_t id[] = {0x4d, 0, 3, 8, 0x54, 0xe5};
+        sendCommand(dev, fuk, id, 6);
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+        dev.silent = true;
+        for (int i = 0; i < 32; i++) fuk.write(3, 3);
+        runUntil(dev, fuk, [] { return false; }, 40000000, 1000);
+        unsigned last = 0;
+        uint8_t source = 0;
+        while (fuk.takeEvent(e)) {
+            if (e.kind != Fuk::Event::TRACE) continue;
+            CHECK_EQ(e.number, ++last);
+            source = e.source;
+        }
+        CHECK_EQ(last, 12u);
+        CHECK_EQ(source, Fuk::Event::FAIL_COMMAND);
+    }
+    {
+        // 移し終える前に次の書き込みが始まったら、続きとして終わるまで待つ (番号も続く)
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        for (int c = 0; c < 10; c++) writeId(dev, fuk, host, c, res); // 19 個
+        CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.takeEvent(e); }, 30000000, 1000) < 30000000, 1);
+        unsigned n = 1;
+        for (int c = 0; c < 3; c++) writeId(dev, fuk, host, c, res); // 5 個
+        CHECK_EQ(e.number, 1u);
+        while (fuk.takeEvent(e)) CHECK_EQ(e.number, ++n);
+        const unsigned before = n;
+        runUntil(dev, fuk, [] { return false; }, 1000000, 1000);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        runUntil(dev, fuk, [] { return false; }, 30000000, 1000);
+        while (fuk.takeEvent(e)) CHECK_EQ(e.number, ++n);
+        CHECK_EQ(before < 19, 1);
+        CHECK_EQ(n, 24u);
+        CHECK_EQ(memcmp(e.res, res, 7), 0);
+        CHECK_EQ(fuk.eventsDropped(), 0);
+    }
+    {
+        // ディスクの読み出し (#381) の間: 異常終了も書き込みも記録しない。つなぎ直しには reading a disk と書く
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        CHECK_EQ(fuk.idleForReader(), 1);
+        fuk.beginReader(0);
+        const uint8_t bad[] = {0x46, 0x00, 80, 0, 1, 3, 8, 0x35, 0xff};
+        const uint8_t id[] = {0x4d, 0, 3, 8, 0x54, 0xe5};
+        sendCommand(dev, fuk, bad, 9);
+        readResult(dev, fuk, res, 7);
+        CHECK_EQ(res[0] & 0xc0, 0x40);
+        command(fuk, id, 6); // 断る
+        for (int i = 0; i < 7; i++) res[i] = fuk.read(3);
+        CHECK_EQ(fuk.flushEvents(), 0);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        dev.unplug();
+        runUntil(dev, fuk, [] { return false; }, 10000);
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        Fuk::formatEvent(e, text, sizeof text);
+        CHECK_EQ(strstr(text, ", reading a disk, ") != nullptr, 1);
+    }
+    {
+        // SEEK の途中で装置が入れ替わった、つながっていない間のコマンド
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        runUntil(dev, fuk, [] { return false; }, 100000);
+        const uint8_t seek[] = {0x0f, 0, 5};
+        dev.seekUs = 1000000;
+        sendCommand(dev, fuk, seek, 3);
+        dev.plug();
+        runUntil(dev, fuk, [] { return false; }, 1000);
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::LINK_LOST);
+        CHECK_EQ(e.reason, Fuk::Event::NEW_DEVICE);
+        CHECK_EQ(e.cmdLen, 3);
+        CHECK_EQ(memcmp(e.cmd, seek, 3), 0);
+        dev.unplug();
+        runUntil(dev, fuk, [] { return false; }, 10000);
+        while (fuk.takeEvent(e)) {
+        }
+        host.count = 1024;
+        const uint8_t read[] = {0x46, 0x00, 1, 0, 1, 3, 8, 0x35, 0xff};
+        command(fuk, read, 9);
+        for (int i = 0; i < 7; i++) res[i] = fuk.read(3);
+        CHECK_EQ(res[0] & 0xc8, 0x48);
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        CHECK_EQ(e.source, Fuk::Event::OFFLINE);
+    }
+    {
+        // 記録する数の上限: ひと続きの書き込みは TRACE_WINDOW_US あたり TRACE_RUNS 回まで
+        FakeFuk dev;
+        Count host;
+        Fuk fuk(dev, &host);
+        CHECK_EQ(fuk.start(1000), 1);
+        motorOn(dev, fuk);
+        unsigned n = 0;
+        for (unsigned k = 0; k < Fuk::TRACE_RUNS + 2; k++) {
+            writeId(dev, fuk, host, 1, res);
+            runUntil(dev, fuk, [] { return false; }, Fuk::TRACE_QUIET_US * 2, 10000);
+            while (fuk.takeEvent(e)) n++;
+        }
+        CHECK_EQ(n, Fuk::TRACE_RUNS);
+        CHECK_EQ(fuk.eventsDropped(), 2u);
+        // 記録しない回でも、書き込みの間の捨てたバイトは、落ち着いてから出す
+        dev.writeUs = 9000000; // 終わってから 10 秒待つ (始まってからではない)
+        writeIdSlow(dev, fuk, host, res);
+        dev.sendPort2('z');
+        runUntil(dev, fuk, [] { return false; }, 5000000, 1000);
+        CHECK_EQ(fuk.stats().stray, 1);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        runUntil(dev, fuk, [] { return false; }, Fuk::TRACE_QUIET_US * 2, 10000);
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::STRAY);
+        CHECK_EQ(fuk.takeEvent(e), 0);
+        dev.advance(Fuk::TRACE_WINDOW_US); // 時間がたてば、また記録する
+        writeId(dev, fuk, host, 1, res);
+        fuk.flushEvents();
+        CHECK_EQ(fuk.takeEvent(e), 1);
+        CHECK_EQ(e.kind, Fuk::Event::TRACE);
+    }
+}
+
+// DMA の異常終了でオーバーランに変えたリザルトと、そのあとのふつうのリザルト
+void testDmaAbortEvent() {
+    FakeFuk dev;
+    Count host;
+    Fuk fuk(dev, &host);
+    CHECK_EQ(fuk.start(1000), 1);
+    motorOn(dev, fuk);
+    Fuk::Event e;
+    uint8_t res[7];
+    host.count = 1024;
+    const uint8_t read[] = {0x46, 0x00, 0, 0, 1, 3, 1, 0x1b, 0xff};
+    sendCommand(dev, fuk, read, 9);
+    fuk.abortTransfer(); // 'R' が届く前
+    readResult(dev, fuk, res, 7);
+    CHECK_EQ(fuk.takeEvent(e), 1);
+    CHECK_EQ(e.source, Fuk::Event::DMA_ABORT);
+    CHECK_EQ(memcmp(e.res, res, 7), 0);
+    sendCommand(dev, fuk, read, 9);
+    CHECK_EQ(runUntil(dev, fuk, [&] { return fuk.dataReady(); }) < 1000000, 1);
+    fuk.abortTransfer(); // データを渡している途中
+    readResult(dev, fuk, res, 7);
+    CHECK_EQ(fuk.takeEvent(e), 1);
+    CHECK_EQ(e.source, Fuk::Event::DMA_ABORT);
+    CHECK_EQ(e.res[1] & 0x10, 0x10);
+    const uint8_t bad[] = {0x46, 0x00, 80, 0, 1, 3, 1, 0x1b, 0xff};
+    sendCommand(dev, fuk, bad, 9);
+    readResult(dev, fuk, res, 7);
+    CHECK_EQ(fuk.takeEvent(e), 1);
+    CHECK_EQ(e.source, Fuk::Event::FROM_FUK);
+}
+
+// 積むスレッドと取り出すスレッドを分ける
+void testEventThreads() {
+    FakeFuk dev;
+    Count host;
+    Fuk fuk(dev, &host);
+    CHECK_EQ(fuk.start(1000), 1);
+    motorOn(dev, fuk);
+    host.count = 0; // 受け付けない書き込み
+    constexpr unsigned SENT = 4000;
+    std::atomic<bool> end{false};
+    std::thread producer([&] {
+        for (unsigned i = 0; i < SENT; i++) {
+            const uint8_t write[] = {0x45, 0, (uint8_t)i, (uint8_t)(i >> 8), 1, 3, 8, 0x35, 0xff};
+            command(fuk, write, 9);
+            for (int k = 0; k < 7; k++) fuk.read(3);
+            if (i % Fuk::EVENT_WRITES == Fuk::EVENT_WRITES - 1) dev.advance(Fuk::EVENT_WINDOW_US);
+            if (i % 32 == 0) std::this_thread::yield();
+        }
+        end = true;
+    });
+    unsigned taken = 0;
+    int last = -1;
+    bool ok = true;
+    for (;;) {
+        const bool stop = end;
+        Fuk::Event e;
+        while (fuk.takeEvent(e)) {
+            const int i = e.cmd[2] | e.cmd[3] << 8;
+            ok = ok && i > last && e.source == Fuk::Event::REFUSED && e.res[3] == e.cmd[2] && e.res[4] == e.cmd[3];
+            last = i;
+            taken++;
+        }
+        if (stop) break;
+    }
+    producer.join();
+    CHECK_EQ(ok, 1);
+    CHECK_EQ(taken > 0, 1);
+    CHECK_EQ(taken + fuk.eventsDropped(), SENT);
+}
+
 } // namespace
 
 int main() {
@@ -1315,6 +1950,10 @@ int main() {
     testPartialSend();
     testWrite();
     testNonDmaWrite();
+    testEvents();
+    testTrace();
+    testDmaAbortEvent();
+    testEventThreads();
     testWriteTail();
     testWriteTailAsync();
     testStreamedRead();

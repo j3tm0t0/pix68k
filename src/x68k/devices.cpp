@@ -5,8 +5,14 @@ namespace x68k {
 // ---------------------------------------------------------------- システムポート
 
 void SysPort::reset() {
-    contrast_ = tvctrl_ = imageUnit_ = sramWrite_ = power_ = 0;
+    // コントラストは変えない (RESET 命令のたびに画面の明るさが変わることになる。実機で変わるという資料はない)
+    tvctrl_ = imageUnit_ = sramWrite_ = power_ = 0;
     keyctrl_ = 0x08; // bit3 = 1: キーボードがつながっている
+}
+
+void SysPort::powerOn() {
+    contrast_ = CONTRAST_POWER_ON;
+    reset();
 }
 
 uint8_t SysPort::read(uint32_t offset) {

@@ -16,6 +16,8 @@ cmake --build build -j
                             # IPL ROM がなければテストパターンを出す)。オプションの一覧は host/main.cpp の先頭、入力は下の「ホスト版の入力」
 ```
 
+`tools/fetch_sst.sh` は、`tools/sst_files.txt` にある版 (コミットの SHA) とファイルの一覧を使い、raw.githubusercontent.com から取る (一覧のファイルがそろわないか、取った中身が一覧と違えば失敗する)。もうあるファイルは、中身が一覧と同じなら取り直さない。一覧の作り直し方と確かめ方は `tools/make_sst_list.sh` の先頭にある。
+
 ホスト版には SDL2 が要る (`brew install sdl2`)。見つからなければホスト版だけビルドしない。
 
 Release のビルドは `-fomit-frame-pointer` を付ける (#224。aarch64 の GCC で命令数が 1% ほど減る)。`perf record -g` などでフレームポインタを

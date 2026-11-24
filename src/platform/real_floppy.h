@@ -52,15 +52,16 @@ inline bool isRealFloppyName(const char* name) { return realFloppyUnit(name) >= 
 // 実物のドライブから読んだディスクを、イメージのファイルに書き出すときの名前 (#287)。中身の CRC-32 (zlib の crc32() と
 // 同じ値) から "FD-602F7858.XDF" の形にする。同じディスクは同じ名前になるので、書き出し済みかどうかが名前で分かり、
 // 違うディスクを上書きすることもない。out は REAL_FLOPPY_IMAGE_NAME_SIZE 以上
-constexpr size_t REAL_FLOPPY_IMAGE_NAME_SIZE = 16;
-inline void realFloppyImageName(uint32_t crc, char* out) {
+// partial: 読めないセクタのある、欠けた控え (#386)。"FD-602F7858-PARTIAL.XDF"
+constexpr size_t REAL_FLOPPY_IMAGE_NAME_SIZE = 24;
+inline void realFloppyImageName(uint32_t crc, char* out, bool partial = false) {
     static const char kHex[] = "0123456789ABCDEF";
     char* p = out;
     *p++ = 'F';
     *p++ = 'D';
     *p++ = '-';
     for (int shift = 28; shift >= 0; shift -= 4) *p++ = kHex[(crc >> shift) & 15];
-    for (const char* e = ".XDF"; *e != 0; e++) *p++ = *e;
+    for (const char* e = partial ? "-PARTIAL.XDF" : ".XDF"; *e != 0; e++) *p++ = *e;
     *p = 0;
 }
 

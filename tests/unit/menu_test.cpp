@@ -111,6 +111,30 @@ public:
         return rollBackOk;
     }
     // 実物のフロッピーディスクドライブ (USB-FDD) から読んだディスクが入っているドライブ
+    int writeUnit = -1, prepares = 0, writesRun = 0, writeCancels = 0;
+    bool prepareOk = true, writePartial = false, accepted = false;
+    char writeName[64] = {};
+    int floppyWriteUnit() const override { return writeUnit; }
+    bool prepareFloppyWrite(const char* name, FloppyWriteInfo& info, MenuText& msg) override {
+        prepares++;
+        copyString(writeName, sizeof writeName, name);
+        copyString(info.line[0], sizeof info.line[0], "Backup: FD-00000000.XDF");
+        info.count = 1;
+        if (writePartial) {
+            info.partial = true;
+            copyString(info.bad[0], sizeof info.bad[0], "C10H0");
+            info.badCount = 1;
+        }
+        if (!prepareOk) msg.add("write protected");
+        return prepareOk;
+    }
+    bool runFloppyWrite(bool acceptPartial, MenuText& msg) override {
+        accepted = acceptPartial;
+        writesRun++;
+        msg.add("written and verified");
+        return true;
+    }
+    void cancelFloppyWrite() override { writeCancels++; }
     bool realFloppy[2] = {false, false};
     int imageSaves = 0, lastImageDrive = -1;
     const char* imageMsg = "saved as FD-602F7858.XDF";
@@ -133,6 +157,96 @@ bool moveTo(Menu& m, const char* label) {
     printf("  no item %s\n", label);
     failures++;
     return false;
+}
+
+// 実物のディスクへの書き込み (experimental)。はじめは No で、Yes を選んで Enter を押したときだけ書く
+void testFloppyWrite() {
+    printf("floppy write\n");
+    FakeHost host;
+    Menu m(host);
+    m.open(Settings(), Settings());
+    for (int i = 0; i < 40; i++) {
+        CHECK_EQ(strcmp(m.currentLabel(), "Write XDF") != 0, true); // 許していなければ出ない
+        m.key(mk::DOWN);
+    }
+    host.writeUnit = 2;
+    m.open(Settings(), Settings());
+    CHECK_EQ(moveTo(m, "Write XDF"), true);
+    auto choose = [&] {
+        m.key(mk::ENTER);
+        m.key(mk::DOWN);
+        m.key(mk::ENTER);
+    };
+    m.key(mk::ENTER);
+    m.key(mk::ENTER); // [Cancel]
+    CHECK_EQ(host.prepares, 0);
+    choose();
+    CHECK_EQ(host.prepares, 1);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::ENTER); // No
+    CHECK_EQ(host.writesRun, 0);
+    CHECK_EQ(host.writeCancels, 1);
+    choose();
+    m.key(mk::UP);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0); // 上と左は No
+    m.key(mk::LEFT);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::DOWN);
+    CHECK_EQ(strcmp(m.currentLabel(), "Yes"), 0);
+    m.key(mk::UP);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::DOWN);
+    m.key(mk::ESC);
+    CHECK_EQ(host.writesRun, 0);
+    CHECK_EQ(host.writeCancels, 2);
+    choose();
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0); // 毎回 No から
+    m.close();
+    CHECK_EQ(host.writeCancels, 3);
+    m.open(Settings(), Settings());
+    moveTo(m, "Write XDF");
+    host.prepareOk = false;
+    choose();
+    CHECK_EQ(strstr(m.status(), "write protected") != nullptr, true);
+    m.key(mk::DOWN);
+    CHECK_EQ(host.writesRun, 0);
+    host.prepareOk = true;
+    moveTo(m, "Write XDF");
+    choose();
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.writesRun, 1);
+    CHECK_EQ(strstr(m.status(), "verified") != nullptr, true);
+    CHECK_EQ(strcmp(m.currentLabel(), "Write XDF"), 0);
+    CHECK_EQ(host.accepted, false);
+    // 控えが欠けている: 別の確認 (No から) のあとで、書いてよいかを尋ねる (また No から)
+    host.writePartial = true;
+    const int cancels = host.writeCancels;
+    choose();
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.writeCancels, cancels + 1);
+    choose();
+    m.key(mk::DOWN);
+    m.key(mk::ENTER); // 欠けたままでよい
+    CHECK_EQ(host.writesRun, 1);
+    CHECK_EQ(strcmp(m.currentLabel(), "No"), 0);
+    m.key(mk::ENTER); // 書かない
+    CHECK_EQ(host.writesRun, 1);
+    CHECK_EQ(host.writeCancels, cancels + 2);
+    choose(); // 前に認めたことは残らない
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.writesRun, 1);
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.writesRun, 2);
+    CHECK_EQ(host.accepted, true);
+    host.writePartial = false;
+    choose();
+    m.key(mk::DOWN);
+    m.key(mk::ENTER);
+    CHECK_EQ(host.accepted, false);
 }
 
 // 前の版に戻す。はじめは No
@@ -2062,6 +2176,7 @@ int main() {
     testOsdBars();
     testDiscardConfirm();
     testNavigate();
+    testFloppyWrite();
     testRollback();
     testDisks();
     testJapaneseNames();
