@@ -202,7 +202,12 @@ int compareDouble(const void* a, const void* b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-alignas(16384) uint32_t g_pixels[Renderer::MAX_WIDTH * Renderer::MAX_HEIGHT];
+#ifdef _WIN32
+alignas(8192) // Windows の COFF は 8192 を超える揃えを持てない
+#else
+alignas(16384)
+#endif
+uint32_t g_pixels[Renderer::MAX_WIDTH * Renderer::MAX_HEIGHT];
 
 // 受け取ったものを使わずに、描いたことにする先
 struct NullSink : x68k::IndexedLineSink {

@@ -142,7 +142,9 @@ Neptune-X (`src/x68k/neptune.cpp`) は、拡張スロットに ISA バスをつ�
   - `loopback`: 送ったフレームをそのまま返す (ホスト版だけ)
   - `pcap:IF` (ホスト版だけ): libpcap で、ホストのネットワークインタフェース IF とイーサネットのフレームを送受信する。BPF (`/dev/bpf*`) を読み書きする権限が要る
     (macOS なら Wireshark の ChmodBPF を入れるなど)。有線のインタフェースで使う。Wi-Fi は、ほかの MAC アドレスのフレームを
-    アクセスポイントが通さないことが多い
+    アクセスポイントが通さないことが多い。
+    Windows では [Npcap](https://npcap.com/) を入れておく (pcap:IF を使うときに `System32\Npcap\wpcap.dll` を読む)。
+    IF は `\Device\NPF_{...}` の形で、名前を間違えるとエラーと一緒に使えるインタフェースの一覧が出る
   - `tap:NAME` (Linux のホスト版だけ): tap デバイスに出し入れする。あらかじめ作っておく
     (例: `sudo ip tuntap add tap0 mode tap user $USER && sudo ip link set tap0 up`。ホスト側でブリッジや NAT を組む)
   - `eth` (ベアメタル版の既定): Pi の有線の Ethernet (Raspberry Pi 3 Model B+ は LAN7800、Raspberry Pi 3 Model B は LAN9514、Raspberry Pi 4 / Raspberry Pi 400 は GENET、Raspberry Pi 5 は RP1 の MACB)。ホスト版で `eth` を指定すると、警告を出して `echo` にする (ベアメタル版と同じ設定ファイルを使えるように)。

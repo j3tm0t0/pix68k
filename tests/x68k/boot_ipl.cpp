@@ -124,9 +124,16 @@ static int cannotLoad(const char* what, const char* path) {
 static uint8_t* loadWhole(const char* path, size_t& size) {
     FILE* f = fopen(path, "rb");
     if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    // Windows は long が 32 ビットで ftell が 2GB を超えられないので、64 ビットの版を使う
+#ifdef _WIN32
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t n = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    const int64_t n = (int64_t)ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
     uint8_t* buf = n > 0 ? new uint8_t[(size_t)n] : nullptr;
     if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
         delete[] buf;

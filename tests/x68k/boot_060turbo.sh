@@ -34,13 +34,14 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 cp "$DISK" "$TMP/boot.xdf"
 chmod u+w "$TMP/boot.xdf"
-mcopy -i "$TMP/boot.xdf" ::CONFIG.SYS "$TMP/orig.sys" || exit 1
+cp "$SYS" "$TMP/060turbo.sys"
+# mcopy には一時ディレクトリの中の相対パスで渡す (Windows の mcopy は C:/... の C: を mtools のドライブ名と取り違える)
+(cd "$TMP" && mcopy -i boot.xdf ::CONFIG.SYS orig.sys) || exit 1
 {
   printf 'DEVICE    = \\060TURBO.SYS %s\r\n' "$OPT"
   grep -v -i 'FLOAT2' "$TMP/orig.sys"
 } > "$TMP/CONFIG.SYS"
-mcopy -o -i "$TMP/boot.xdf" "$TMP/CONFIG.SYS" ::CONFIG.SYS || exit 1
-mcopy -o -i "$TMP/boot.xdf" "$SYS" ::060TURBO.SYS || exit 1
+(cd "$TMP" && mcopy -o -i boot.xdf CONFIG.SYS ::CONFIG.SYS && mcopy -o -i boot.xdf 060turbo.sys ::060TURBO.SYS) || exit 1
 # 起動の表示 (060turbo.sys と 060SP の組み込み) を見てから、別に起動して DIR を打つ (DIR の表示で起動の表示が流れるため)
 # (拡張モードでは表示の行が増えて 060turbo.sys の題名の行が画面の外へ流れるので、題名の行は見ない)
 if [ -n "$OPT" ]; then

@@ -321,14 +321,25 @@ endforeach()
 add_executable(host_serial_test tests/unit/host_serial_test.cpp host/host_serial.cpp)
 target_include_directories(host_serial_test PRIVATE host src)
 target_link_libraries(host_serial_test x68k Threads::Threads)
+if(WIN32)
+  target_link_libraries(host_serial_test ws2_32) # Winsock
+endif()
 target_compile_options(host_serial_test PRIVATE -Wall -Wextra)
 add_test(NAME host_serial_test COMMAND host_serial_test)
 # ホスト版の FUK のシリアルポートの口 (pty の先に偽物の装置を置く) と、ベアメタル版のリング
-add_executable(host_fuk_test tests/unit/host_fuk_test.cpp host/host_fuk.cpp)
-target_include_directories(host_fuk_test PRIVATE host src tests/unit)
-target_link_libraries(host_fuk_test x68k Threads::Threads)
-target_compile_options(host_fuk_test PRIVATE -Wall -Wextra)
-add_test(NAME host_fuk_test COMMAND host_fuk_test)
+if(NOT WIN32)
+  add_executable(host_fuk_test tests/unit/host_fuk_test.cpp host/host_fuk.cpp)
+  target_include_directories(host_fuk_test PRIVATE host src tests/unit)
+  target_link_libraries(host_fuk_test x68k Threads::Threads)
+  target_compile_options(host_fuk_test PRIVATE -Wall -Wextra)
+  add_test(NAME host_fuk_test COMMAND host_fuk_test)
+else() # Windows 版の口 (COM ポート。host_fuk_win.cpp) を、pty の代わりに名前付きパイプの先に偽物の装置を置いて試す
+  add_executable(host_fuk_test tests/unit/host_fuk_win_test.cpp host/host_fuk_win.cpp)
+  target_include_directories(host_fuk_test PRIVATE host src tests/unit)
+  target_link_libraries(host_fuk_test x68k Threads::Threads setupapi)
+  target_compile_options(host_fuk_test PRIVATE -Wall -Wextra)
+  add_test(NAME host_fuk_test COMMAND host_fuk_test)
+endif()
 add_executable(input_map_test tests/unit/input_map_test.cpp)
 target_include_directories(input_map_test PRIVATE src)
 target_compile_options(input_map_test PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
@@ -541,7 +552,7 @@ add_test(NAME cdrom_test COMMAND cdrom_test)
 # 実行状態の保存と復元 (x68k/state.h)。テスト用の IPL ROM で動かすものと、ROM と起動ディスクがあるときだけ動かす
 # Human68k の起動の途中で保存するもの
 add_executable(state_test tests/unit/state_test.cpp)
-target_link_libraries(state_test x68k)
+target_link_libraries(state_test x68k Threads::Threads) # 終わらなくなったときに打ち切る見張りのスレッド
 target_compile_options(state_test PRIVATE -Wall -Wextra)
 add_test(NAME state_test COMMAND state_test)
 # 壊れたステートを読ませる試験が、終わらない繰り返しに入っていないか (試験の中でも 1 回ごとに 60 秒で打ち切る)
@@ -551,6 +562,10 @@ set_tests_properties(state_test PROPERTIES TIMEOUT 600)
 add_executable(x68k_boot tests/x68k/boot_ipl.cpp host/host_fuk.cpp)
 target_include_directories(x68k_boot PRIVATE host)
 target_link_libraries(x68k_boot x68k Threads::Threads)
+if(WIN32) # Windows 版の FUK接続 (COM ポート)
+  target_sources(x68k_boot PRIVATE host/host_fuk_win.cpp)
+  target_link_libraries(x68k_boot setupapi)
+endif()
 add_test(NAME x68k_boot_no_disk COMMAND x68k_boot -f 600 -o "" --check-no-disk)
 set_tests_properties(x68k_boot_no_disk PROPERTIES SKIP_RETURN_CODE 77)
 # Human68k を起動し、キーボードから DIR を打って一覧が出るかを見る。ROM か起動ディスクがなければ飛ばす
@@ -813,11 +828,24 @@ if(PIX68K_HOST)
     add_executable(pix68k host/main.cpp host/host_ether.cpp host/host_serial.cpp host/host_fuk.cpp host/fuk_read.cpp host/real_floppy_dev.cpp)
     target_include_directories(pix68k PRIVATE src)
     target_compile_options(pix68k PRIVATE -Wall -Wextra)
+    if(WIN32 AND TARGET SDL2::SDL2main)
+      target_link_libraries(pix68k SDL2::SDL2main)
+      target_link_options(pix68k PRIVATE -mconsole)
+    endif()
     target_link_libraries(pix68k x68k midisynth SDL2::SDL2 Threads::Threads)
+    if(WIN32)
+      target_link_libraries(pix68k ws2_32) # RS-232C の TCP (host_serial.cpp) の Winsock
+      target_sources(pix68k PRIVATE host/host_fuk_win.cpp) # FUK の COM ポート
+      target_link_libraries(pix68k setupapi) # fuk=on で COM ポートを探す
+      target_link_options(pix68k PRIVATE -static-libgcc -static-libstdc++ -static)
+    endif()
     # Neptune-X の neptune_link=pcap:IF に使う。なければ pcap の口なしで作る
     find_path(PCAP_INCLUDE_DIR pcap.h)
     find_library(PCAP_LIBRARY pcap)
-    if(PCAP_INCLUDE_DIR AND PCAP_LIBRARY)
+    if(WIN32)
+      # Windows は Npcap の wpcap.dll を pcap:IF を使うときに読む (host/npcap_win.h)。SDK もリンクも要らない
+      target_compile_definitions(pix68k PRIVATE PIX68K_HAVE_PCAP)
+    elseif(PCAP_INCLUDE_DIR AND PCAP_LIBRARY)
       target_compile_definitions(pix68k PRIVATE PIX68K_HAVE_PCAP)
       target_include_directories(pix68k PRIVATE ${PCAP_INCLUDE_DIR})
       target_link_libraries(pix68k ${PCAP_LIBRARY})
@@ -839,13 +867,14 @@ if(PIX68K_HOST)
     # (ROM がなければテストパターンになるので飛ばす)
     add_test(NAME host_midi COMMAND sh -c
       "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --wav host_midi.wav --midi --midi-sf2 /nonexistent.sf2")
-    set_tests_properties(host_midi PROPERTIES PASS_REGULAR_EXPRESSION "midi: cannot load the SoundFont /nonexistent.sf2"
+    # (Windows の sh は /nonexistent.sf2 を C:/.../nonexistent.sf2 にして渡すので、前に何が付いてもよい)
+    set_tests_properties(host_midi PROPERTIES PASS_REGULAR_EXPRESSION "midi: cannot load the SoundFont .*/nonexistent.sf2"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # MT-32 の音源: 読めない ROM (ないファイル、大きさの違うファイル) は、知らせて音源なしで続ける
     add_test(NAME host_midi_mt32 COMMAND sh -c
       "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --wav host_midi_mt32.wav --midi-mt32-ctrl /nonexistent.rom --midi-mt32-pcm '${CMAKE_SOURCE_DIR}/LICENSE'")
     set_tests_properties(host_midi_mt32 PROPERTIES
-      PASS_REGULAR_EXPRESSION "midi: cannot load the MT-32 ROMs /nonexistent.rom and .*LICENSE: the CONTROL ROM is not"
+      PASS_REGULAR_EXPRESSION "midi: cannot load the MT-32 ROMs .*/nonexistent.rom and .*LICENSE: the CONTROL ROM is not"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # SC-55mkII の音源: ROM のないディレクトリは、知らせて音源なしで続ける
     add_test(NAME host_midi_sc55 COMMAND sh -c

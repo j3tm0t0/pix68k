@@ -3,6 +3,9 @@
 // termios.h の ECHO などのマクロが settings.h の名前とぶつかるので、先に読む
 #include "platform/settings.h"
 
+// Windows 版は host_fuk_win.cpp (COM ポート)
+#ifndef _WIN32
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -285,3 +288,5 @@ x68k::FukLink* openHostFukLink(const char* spec, char* err, size_t errSize) {
     }
     return openHostFukLinkAt(a, b, err, errSize);
 }
+
+#endif // _WIN32

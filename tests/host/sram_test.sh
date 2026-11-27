@@ -11,6 +11,9 @@ PIX68K=$1
 ROM_DIR=${PIX68K_ROM_DIR:-$HOME/.cache/pix68k/rom}
 [ -f "$ROM_DIR/IPLROM.DAT" ] || { echo "SKIP: no IPLROM.DAT"; exit 77; }
 WORK=$(mktemp -d)
+# Windows (Git Bash / MSYS2) の sh は、exe に渡す /tmp/... を C:/.../Temp/... に変える。pix68k が表示するパスと grep で
+# 比べるので、同じ C:/... の形にそろえる (cygpath はそれらの sh にだけある。ほかの OS では何もしない)
+if command -v cygpath > /dev/null; then WORK=$(cygpath -m "$WORK"); fi
 trap 'rm -rf "$WORK"' EXIT
 export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 

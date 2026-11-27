@@ -1,6 +1,6 @@
 # ビルドとテスト (ホスト)
 
-ホスト版 (macOS / Linux、SDL2) のビルド、ctest と速さの測り方、オプション、入力、CI。
+ホスト版 (macOS / Linux / Windows、SDL2) のビルド、ctest と速さの測り方、オプション、入力、CI。
 
 文中の #番号 は、開発用の非公開リポジトリの issue と PR の番号。
 
@@ -22,6 +22,25 @@ cmake --build build -j
 
 Release のビルドは `-fomit-frame-pointer` を付ける (#224。aarch64 の GCC で命令数が 1% ほど減る)。`perf record -g` などでフレームポインタを
 たどって呼び出し元を見たいときは、`cmake -S . -B build -DPIX68K_FRAME_POINTER=ON` でビルドする。
+
+Windows は MSYS2 の UCRT64 (`pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,SDL2}`) でビルドする。`C:\msys64\ucrt64\bin` を PATH に足して
+次のようにすると `build-win/pix68k.exe` ができる (libgcc と libstdc++ は静的リンク。実行には SDL2.dll を exe の隣に置くか PATH に通す)。
+既定のファイルの置き場所は、ほかの OS と同じく `~/.cache/pix68k/` (`HOME` がなければ `%USERPROFILE%\.cache\pix68k\`)。
+設定ファイルは、ほかの OS と同じく `--config` で渡したときだけ読む (`--config` がなければ、メニューの「Save settings」は保存しない)。
+Neptune-X をホストのネットワークにつなぐ (`--neptune-link pcap:IF`、[expansion.md](expansion.md)) には [Npcap](https://npcap.com/) を入れておく
+(使うときに `System32\Npcap\wpcap.dll` を読む。ビルドに Npcap SDK は要らない)。Npcap の無償版はライセンスで再配布が認められていないので、exe と一緒に配らない。
+
+```sh
+cmake -S . -B build-win -G Ninja -DPIX68K_REQUIRE_SDL2=ON
+cmake --build build-win --target pix68k
+cp /c/msys64/ucrt64/bin/SDL2.dll build-win/
+```
+
+ctest は、シェルスクリプトの試験があるので `sh` のある端末 (Git Bash か MSYS2 の UCRT64) から `ctest --test-dir build-win` で動かす
+(PowerShell から動かすと、シェルスクリプトの試験は Not Run になる)。試験のスクリプトは python3 も使うので、MSYS2 の
+`pacman -S mingw-w64-ucrt-x86_64-python` で入れ、`C:\msys64\ucrt64\bin` を PATH の前のほうに通す
+(Git Bash なら `export PATH=/c/msys64/ucrt64/bin:$PATH`。Windows の「アプリ実行エイリアス」の python3 が先に見つかると、
+Microsoft Store を開くだけで試験が失敗するので、そのエイリアスはオフにしておく)。
 
 Linux (Ubuntu 26.04 の GCC 15 で確かめている) では、次のパッケージを入れると同じ手順でビルドできる。
 

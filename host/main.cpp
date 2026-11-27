@@ -52,7 +52,7 @@
 //   --rs232c SPEC    RS-232C (SCC のチャネル A) の相手 (設定ファイルの rs232c=)。tcp:PORT で 127.0.0.1 の PORT に待ち受け、
 //                    tcp:ADDR:PORT で ADDR に待ち受ける。off (既定) はつながない (host_serial.h)
 //   --fuk SPEC       FUK (USB でつなぐ実物の FDC と FDD) を、内蔵の FDC の代わりに使う (設定ファイルの fuk=)。
-//                    on で Linux のポートの名前から探し、PORT_A,PORT_B で 2 本のシリアルポートの名前を書く (host_fuk.h)。
+//                    on で Linux のポートの名前 (Windows は USB の VID:PID) から探し、PORT_A,PORT_B で 2 本のシリアルポートの名前を書く (host_fuk.h)。
 //                    使っている間は -0 / -1 のイメージを使わず、ステートは保存できない。見つからなければ内蔵の FDC のまま動かす
 //   --fuk-read N FILE  FUK のドライブ N (0-3) のディスク (2HD) を XDF のイメージ FILE に読み出して終わる (X68000 は動かさない。
 //                    --fuk も要る。ディスクには書かない。FILE があれば上書きしない)
@@ -118,6 +118,21 @@
 // ROM がなければ、そのことを表示してテストパターンを出す (ROM のない CI でも host_smoke が通るように)。
 #include <SDL.h>
 #include <dirent.h>
+
+#ifdef _WIN32
+// Windows (MinGW) 用の置き換え
+#include <io.h>
+#include <stdlib.h>
+extern "C" __declspec(dllimport) int __stdcall MoveFileExA(const char*, const char*, unsigned long);
+static inline int fsync(int fd) { return _commit(fd); }
+// _fullpath は区切りを \ で返すので / にそろえる (cfgValue() が / で、設定ファイルのディレクトリの中かを見る)
+static inline char* realpath(const char* p, char* out) {
+    if (!_fullpath(out, p, PATH_MAX)) return nullptr;
+    for (char* c = out; *c; c++)
+        if (*c == '\\') *c = '/';
+    return out;
+}
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -822,14 +837,39 @@ bool loadFile(const char* path, uint8_t* buf, size_t size) {
     return n == size && extra == EOF;
 }
 
+// ファイルの大きさ (失敗は -1)。Windows は long が 32 ビットで ftell が 2GB を超えられないので、64 ビットの版を使う。
+// 終わると先頭に戻す
+static int64_t fileSize64(FILE* f) {
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) != 0) return -1;
+    const int64_t n = _ftelli64(f);
+    if (_fseeki64(f, 0, SEEK_SET) != 0) return -1;
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) return -1;
+    const int64_t n = (int64_t)ftello(f);
+    if (fseeko(f, 0, SEEK_SET) != 0) return -1;
+#endif
+    return n < 0 || (uint64_t)n > (uint64_t)SIZE_MAX ? -1 : n;
+}
+
+// size バイトを読む。1 回の fread は 1GB まで (大きな 1 回の読み書きを C ランタイムに任せない)
+static constexpr size_t kIoChunk = (size_t)1 << 30;
+static bool readAll(FILE* f, uint8_t* buf, size_t size) {
+    for (size_t done = 0; done < size;) {
+        const size_t want = size - done < kIoChunk ? size - done : kIoChunk;
+        const size_t got = fread(buf + done, 1, want, f);
+        if (got != want) return false;
+        done += got;
+    }
+    return true;
+}
+
 uint8_t* loadWhole(const char* path, size_t& size) {
     FILE* f = fopen(path, "rb");
     if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    const int64_t n = fileSize64(f);
     uint8_t* buf = n > 0 ? (uint8_t*)malloc((size_t)n) : nullptr;
-    if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+    if (buf && !readAll(f, buf, (size_t)n)) {
         free(buf);
         buf = nullptr;
     }
@@ -844,13 +884,11 @@ uint8_t* loadRom(const char* path, size_t& size, bool (*sizeOk)(uint64_t)) {
     size = 0;
     FILE* f = fopen(path, "rb");
     if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    const long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    const int64_t n = fileSize64(f);
     uint8_t* buf = nullptr;
     if (n > 0 && sizeOk((uint64_t)n)) {
         buf = new uint8_t[(size_t)n];
-        if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        if (!readAll(f, buf, (size_t)n)) {
             delete[] buf;
             buf = nullptr;
         }
@@ -865,24 +903,42 @@ uint8_t* loadRom(const char* path, size_t& size, bool (*sizeOk)(uint64_t)) {
 bool saveFile(const char* path, const uint8_t* buf, size_t size) {
     char tmp[1200];
     snprintf(tmp, sizeof tmp, "%s.tmp%ld", path, (long)getpid());
+#ifdef _WIN32
+    // テキストモードだと 0x0A を 0x0D 0x0A にしてしまう
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+#else
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+#endif
     if (fd < 0) return false;
     bool ok = true;
     for (size_t done = 0; ok && done < size;) {
-        ssize_t n = write(fd, buf + done, size - done);
+        // Windows の write は 1 回の大きさが unsigned int で戻り値が int なので、1GB ずつ書く
+        const size_t want = size - done < kIoChunk ? size - done : kIoChunk;
+        ssize_t n = write(fd, buf + done, want);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) ok = false;
         else done += (size_t)n;
     }
     if (ok && fsync(fd) != 0) ok = false;
     if (close(fd) != 0) ok = false;
+#ifdef _WIN32
+    // Windows の rename は置き換え先があると失敗する。MOVEFILE_REPLACE_EXISTING (1) | MOVEFILE_WRITE_THROUGH (8)
+    if (ok && !MoveFileExA(tmp, path, 1 | 8)) {
+        errno = EACCES;
+        ok = false;
+    }
+#else
     if (ok && rename(tmp, path) != 0) ok = false;
+#endif
     if (!ok) {
         int e = errno;
         unlink(tmp);
         errno = e;
         return false;
     }
+#ifdef _WIN32
+    return true; // ディレクトリは open で開けない (MOVEFILE_WRITE_THROUGH で書き終えている)
+#endif
     char dir[1200];
     snprintf(dir, sizeof dir, "%s", path);
     char* slash = strrchr(dir, '/');
@@ -930,9 +986,17 @@ void unescape(const char* in, char* out, size_t size) {
 // 今の地方時を「1970 年からの秒数」で返す (Machine::setTime() は地方時を受け取る)
 int64_t localSeconds() {
     time_t now = time(nullptr);
+#ifdef _WIN32
+    struct tm lt, gt;
+    localtime_s(&lt, &now);
+    gmtime_s(&gt, &now);
+    lt.tm_isdst = 0; gt.tm_isdst = 0;
+    return (int64_t)now + (int64_t)difftime(mktime(&lt), mktime(&gt));
+#else
     struct tm lt;
     localtime_r(&now, &lt);
     return (int64_t)now + lt.tm_gmtoff;
+#endif
 }
 
 struct Options {
@@ -1139,14 +1203,32 @@ void unloadDisk(x68k::Machine& m, int drive, Disk& d, bool writeBack) {
 void dirName(const char* path, char* dir, size_t size) {
     snprintf(dir, size, "%s", path);
     char* slash = strrchr(dir, '/');
+#ifdef _WIN32
+    char* back = strrchr(dir, '\\'); // Windows は \ も区切り (--config C:\dir\pix68k.cfg)
+    if (back && (!slash || back > slash)) slash = back;
+    if (slash && slash == dir + 2 && dir[1] == ':') { // C:\file → C:\
+        slash[1] = 0;
+        return;
+    }
+#endif
     if (slash == dir) slash[1] = 0;
     else if (slash) *slash = 0;
     else snprintf(dir, size, ".");
 }
 
+// 絶対パスか (Windows はドライブ付きと \ で始まるものも)
+bool isAbsolutePath(const char* p) {
+    if (p[0] == '/') return true;
+#ifdef _WIN32
+    if (p[0] == '\\') return true;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+#endif
+    return false;
+}
+
 // 設定ファイルの値のファイル名: / で始まらなければ、設定ファイルのあるディレクトリから
 void configPath(const char* cfg, const char* value, char* out, size_t size) {
-    if (value[0] == 0 || value[0] == '/' || !cfg[0]) {
+    if (value[0] == 0 || isAbsolutePath(value) || !cfg[0]) {
         snprintf(out, size, "%s", value);
         return;
     }
@@ -2630,6 +2712,9 @@ bool parseRange(const char* s, int lo, int hi, int& out) {
 int main(int argc, char** argv) {
     static Options opt;
     const char* home = getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = getenv("USERPROFILE");
+#endif
     snprintf(opt.romDir, sizeof opt.romDir, "%s/.cache/pix68k/rom", home ? home : ".");
     snprintf(opt.sram, sizeof opt.sram, "%s/.cache/pix68k/sram.dat", home ? home : ".");
     snprintf(opt.stateDir, sizeof opt.stateDir, "%s/.cache/pix68k", home ? home : ".");
