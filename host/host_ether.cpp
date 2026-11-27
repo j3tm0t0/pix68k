@@ -12,8 +12,12 @@
 #include "platform/settings.h"
 
 #ifdef PIX68K_HAVE_PCAP
+#ifdef _WIN32
+#include "npcap_win.h" // Npcap の wpcap.dll を実行時に読む
+#else
 #include <pcap.h>
 #include <poll.h>
+#endif
 #endif
 
 #ifdef __linux__
@@ -39,6 +43,9 @@ public:
     }
     bool open(const char* dev, const uint8_t mac[6], char* err, size_t errSize) {
         char ebuf[PCAP_ERRBUF_SIZE] = {};
+#ifdef _WIN32
+        if (!loadNpcap(err, errSize)) return false;
+#endif
         rx_ = pcap_create(dev, ebuf);
         if (!rx_) return fail(err, errSize, ebuf);
         pcap_set_snaplen(rx_, 2048);
@@ -47,10 +54,16 @@ public:
         pcap_set_immediate_mode(rx_, 1);
         if (pcap_activate(rx_) < 0) return fail(err, errSize, pcap_geterr(rx_));
         if (pcap_datalink(rx_) != DLT_EN10MB) return fail(err, errSize, "not an Ethernet interface");
-        pcap_setdirection(rx_, PCAP_D_IN); // 自分が送ったフレームは受け取らない (できない環境もある)
-        char filter[128];
-        snprintf(filter, sizeof filter, "ether dst %02x:%02x:%02x:%02x:%02x:%02x or ether broadcast or ether multicast",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        // 自分が送ったフレームは受け取らない。できない環境 (Npcap など) では、送り元が自分の MAC のものをフィルタで落とす
+        const bool inOnly = pcap_setdirection(rx_, PCAP_D_IN) == 0;
+        char filter[192];
+        int at = 0;
+        if (!inOnly)
+            at = snprintf(filter, sizeof filter, "not ether src %02x:%02x:%02x:%02x:%02x:%02x and (", mac[0], mac[1],
+                          mac[2], mac[3], mac[4], mac[5]);
+        snprintf(filter + at, sizeof filter - at,
+                 "ether dst %02x:%02x:%02x:%02x:%02x:%02x or ether broadcast or ether multicast%s", mac[0], mac[1],
+                 mac[2], mac[3], mac[4], mac[5], inOnly ? "" : ")");
         bpf_program prog;
         if (pcap_compile(rx_, &prog, filter, 1, PCAP_NETMASK_UNKNOWN) == 0) {
             pcap_setfilter(rx_, &prog);
@@ -59,8 +72,14 @@ public:
         // 受け取るスレッドは待たずに読み、poll() で 100ms までフレームを待つ (止めるときに pcap_next_ex() で
         // ずっと待たないように)
         if (pcap_setnonblock(rx_, 1, ebuf) < 0) return fail(err, errSize, ebuf);
+#ifdef _WIN32
+        // Windows は poll() の代わりに、フレームが届くと合図になるイベントを待つ
+        event_ = pcap_getevent(rx_);
+        if (!event_) return fail(err, errSize, "cannot wait for frames on this interface");
+#else
         fd_ = pcap_get_selectable_fd(rx_);
         if (fd_ < 0) return fail(err, errSize, "cannot wait for frames on this interface");
+#endif
         tx_ = pcap_open_live(dev, 64, 0, 10, ebuf);
         if (!tx_) return fail(err, errSize, ebuf);
         thread_ = std::thread([this] { run(); });
@@ -82,8 +101,12 @@ private:
             const int r = pcap_next_ex(rx_, &h, &data);
             if (r < 0) return;
             if (r == 0) {
+#ifdef _WIN32
+                WaitForSingleObject(event_, 100);
+#else
                 pollfd p = {fd_, POLLIN, 0};
                 poll(&p, 1, 100);
+#endif
                 continue;
             }
             if (h->caplen == h->len && h->caplen >= (unsigned)MIN_FRAME && h->caplen <= (unsigned)MAX_FRAME)
@@ -93,7 +116,11 @@ private:
 
     pcap_t* rx_ = nullptr;
     pcap_t* tx_ = nullptr;
+#ifdef _WIN32
+    HANDLE event_ = nullptr; // pcap_getevent() のもの (pcap_close() が閉じる)
+#else
     int fd_ = -1;
+#endif
     std::thread thread_;
     std::atomic<bool> stop_{false};
     platform::FrameRing<64> ring_;
@@ -164,6 +191,11 @@ x68k::EtherLink* openHostEtherLink(const char* spec, const uint8_t mac[6], char*
         PcapLink* l = new PcapLink;
         if (l->open(arg, mac, err, errSize)) return l;
         delete l;
+#ifdef _WIN32
+        // 名前 (\Device\NPF_{...}) は分かりにくいので、Npcap が読めていれば使えるインタフェースを並べる
+        char loaded[8];
+        if (loadNpcap(loaded, sizeof loaded)) listNpcapDevices(stderr);
+#endif
 #else
         (void)mac;
         snprintf(err, errSize, "pcap: this build has no libpcap");

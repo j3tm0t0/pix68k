@@ -38,7 +38,7 @@ for line in sys.stdin:
     except FileNotFoundError:
         continue
     if hashlib.sha1(b"blob %d\0" % len(d) + d).hexdigest() != want:
-        print(name)' "$1"
+        print(name)' "$1" | tr -d '\r'
 }
 # 今あるファイルのうち、壊れているか別の版のもの。ほかの実行が使っているかもしれないので、消さずに、取り直せてから置き換える
 BAD=$(echo "$FILES" | differing "$OUT/json")

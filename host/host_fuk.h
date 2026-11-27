@@ -1,8 +1,10 @@
 // ホスト版の FUK (x68k/fuk.h。USB でつなぐ実物の FDC と FDD) の口。FUK の 2 本の USB シリアルポートを開く。
 // fuk= / --fuk の値 (platform::parseFuk()):
-//   on             ポートを名前で探す。Linux の /dev/serial/by-id/usb-TNB_Factory._FDC_emulator-if00 と -if02 だけ
-//                  (ほかの OS では探せないので、ポートの名前を書く)
-//   PORT_A,PORT_B  2 本のポートの名前 (macOS なら /dev/cu.usbmodemXXXX)。順番はどちらでもよい (x68k::Fuk が見分ける)
+//   on             ポートを名前で探す。Linux の /dev/serial/by-id/usb-TNB_Factory._FDC_emulator-if00 と -if02。
+//                  Windows では USB の 04D8:E6B1 のインタフェース 0 と 2 の COM ポート (host_fuk_win.cpp)
+//                  (macOS では探せないので、ポートの名前を書く)
+//   PORT_A,PORT_B  2 本のポートの名前 (macOS なら /dev/cu.usbmodemXXXX、Windows なら COM3 など)。順番はどちらでもよい
+//                  (x68k::Fuk が見分ける)
 // 名前を書いた (か、上の名前で見つけた) ポート以外には何も送らない。
 // 速さは 115200bps に設定する (速さそのものは USB では意味を持たないが、1200bps にすると FUK の代わりをする Pico の
 // ファームが書き込みモードに入るため、設定する。OS が設定を読ませないときは、設定せずに使う)。

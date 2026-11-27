@@ -14,16 +14,20 @@
 // 新しい Machine B に読んで M フレーム進めたものが同じになる (CPU のサイクル数とレジスタ、RAM、VRAM、合成した画面。
 // machine_bench の checksum と同じ作り方)。さらに、そのあとの 2 つの保存が 1 バイトも違わないこと。
 // 版、機種、CRC、長さが合わないものを読まず、そのとき Machine を変えないこと。
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <initializer_list>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
 
 #include "../bench/scene.h"
@@ -1967,13 +1971,44 @@ void exercise(Env& e, bool midi, bool board) {
     e.box.frames(1);
 }
 
-volatile int g_round = 0;
-void onAlarm(int) {
-    char msg[64];
-    const int n = snprintf(msg, sizeof msg, "  round %d does not finish\n", g_round);
-    if (n > 0 && write(1, msg, (size_t)n) < 0) {
+std::atomic<int> g_round{0};
+
+// 終わらなくなったときに打ち切る。alarm() と同じ使い方で、0 で止め、0 以外は今から seconds 秒の期限を置き直す。
+// 期限を過ぎたら、何回目かを出して終わる。alarm と SIGALRM は Windows にないので、見張りのスレッドで待つ。
+// 状態は解放しない (終わるときに、静的なオブジェクトの破棄と detach したスレッドがぶつからないように)
+void watchdog(unsigned seconds) {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool armed = false;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static State* s = [] {
+        State* p = new State;
+        std::thread([p] {
+            std::unique_lock<std::mutex> lock(p->mu);
+            for (;;) {
+                if (!p->armed) {
+                    p->cv.wait(lock);
+                    continue;
+                }
+                if (p->cv.wait_until(lock, p->deadline) != std::cv_status::timeout) continue;
+                if (!p->armed || std::chrono::steady_clock::now() < p->deadline) continue;
+                char msg[64];
+                const int n = snprintf(msg, sizeof msg, "  round %d does not finish\n", g_round.load());
+                if (n > 0 && write(1, msg, (size_t)n) < 0) {
+                }
+                _exit(1);
+            }
+        }).detach();
+        return p;
+    }();
+    {
+        std::lock_guard<std::mutex> lock(s->mu);
+        s->armed = seconds != 0;
+        s->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     }
-    _exit(1);
+    s->cv.notify_one();
 }
 
 // start は、Env を作ったあとに呼ぶ (場面を始める)。rounds 回、書き換えたステートを読ませる
@@ -1983,7 +2018,6 @@ void corrupted(const char* name, const x68k::Config& config, bool midi, bool boa
     int rounds = 150;
     if (const char* r = getenv("STATE_TEST_ROUNDS")) rounds = atoi(r);
     const bool verbose = getenv("STATE_TEST_VERBOSE") != nullptr;
-    signal(SIGALRM, onAlarm);
     Env src(config, midi, board, fpu, mercury, cd);
     start(src);
     makeBusy(src, midi, board, cd);
@@ -2078,7 +2112,7 @@ void corrupted(const char* name, const x68k::Config& config, bool midi, bool boa
         }
         if (verbose) fflush(stdout);
         g_round = round;
-        alarm(60); // 読んだあとに動かしたとき、終わらなくなっていないか
+        watchdog(60); // 読んだあとに動かしたとき、終わらなくなっていないか
         fixHeader(bad.data(), bad.size());
         disks.give(dst);
         Blob before;
@@ -2121,7 +2155,7 @@ void corrupted(const char* name, const x68k::Config& config, bool midi, bool boa
             }
         }
     }
-    alarm(0);
+    watchdog(0);
     // 最後に、書き換えていないものを読めば、もとの続きと同じに動く
     disks.give(dst);
     const char* err = nullptr;
@@ -2981,7 +3015,6 @@ void craftedStates() {
             if (const char* x = getenv("STATE_TEST_SEED")) rng.s ^= (uint32_t)strtoul(x, nullptr, 0) * 2654435761u;
             if (rng.s == 0) rng.s = 1;
             int rounds = 400, loaded = 0;
-            signal(SIGALRM, onAlarm);
             if (const char* r = getenv("STATE_TEST_ROUNDS")) rounds = atoi(r);
             for (int round = 0; round < rounds; round++) {
                 std::vector<uint8_t> bad(good.data, good.data + good.size);
@@ -2994,7 +3027,7 @@ void craftedStates() {
                 fixHeader(bad.data(), bad.size());
                 const char* err = nullptr;
                 g_round = round;
-                alarm(60); // 読んだあとに動かしたとき、終わらなくなっていないか
+                watchdog(60); // 読んだあとに動かしたとき、終わらなくなっていないか
                 if (!x68k::loadState(*e.box.m, bad.data(), bad.size(), err)) continue;
                 loaded++;
                 // 読めたステートを動かすのにかかる時間に上限を置く (corrupted() と同じ)
@@ -3023,7 +3056,7 @@ void craftedStates() {
                     failures++;
                 }
             }
-            alarm(0);
+            watchdog(0);
             printf("  CD-ROM drive without a medium: %d rounds, %d loaded\n", rounds, loaded);
             CHECK_EQ(rounds < 40 || loaded > rounds / 4, true);
         }
@@ -3110,7 +3143,6 @@ void craftedStates() {
             }
         }
 #endif
-        signal(SIGALRM, onAlarm);
         g_round = cpu;
         // 上限を超える時刻: 読めて、時刻は小さい値 (余裕 + 上限の半分で割った余り) になり、そこから進む
         // (戻らなければ 60 秒で止める)。進んだあとの保存は、読むときの確かめを通る (save() が確かめる)
@@ -3120,10 +3152,10 @@ void craftedStates() {
             if (!tryLoad("CPU time past the limit", e, with(v), nullptr)) continue;
             const uint64_t t0 = e.box.m->cycles();
             CHECK_EQ(t0, past + v % (limit / 2) / unit);
-            alarm(60);
+            watchdog(60);
             e.run(1000);
             e.box.frames(3);
-            alarm(0);
+            watchdog(0);
             CHECK_EQ(e.box.m->cycles() >= t0 + 1000 && e.box.m->cycles() < t0 + 1000 + e.box.m->cpuHz(), true);
             Blob after;
             save(*e.box.m, after);
@@ -3172,7 +3204,7 @@ void craftedStates() {
         // 受け取るバイト、進むサイクル数、レジスタが同じ。終わりのステートも、読まずに続けたものの保存を読んで
         // 時刻を直したものと、すべて同じ (時刻で持っている値に、戻し忘れがあれば合わない)
         // (runFrame() は上限を超えた時刻を戻すので、ここでは run() で進める。Machine::rebaseTime())
-        alarm(120);
+        watchdog(120);
         e.run(1000);
         e.run((int64_t)e.box.m->cpuHz() * 2);
         e.run(5000000);
@@ -3187,7 +3219,7 @@ void craftedStates() {
         e.box.m->input().onMouse(10, -3, 1);
         sccB(e, 5, 0x62);
         e.run(3000); // 1 バイト目を送っている途中 (4800bps の 1 バイトは 2ms)
-        alarm(0);
+        watchdog(0);
         const uint64_t t1 = e.box.m->cycles();
         CHECK_EQ(t1 >= max + 1000 + 5000000, true);
         Blob over;
@@ -3201,7 +3233,7 @@ void craftedStates() {
             CHECK_EQ(tryLoad("CPU time past the limit after running", e2, copy, nullptr), true);
             const uint64_t t2 = e2.box.m->cycles();
             CHECK_EQ(t2, past + t1 - max);
-            alarm(120);
+            watchdog(120);
             int bytes = 0;
             for (int i = 0; i < 40; i++) {
                 for (Env* x : {&e, &e2}) {
@@ -3223,7 +3255,7 @@ void craftedStates() {
                 }
                 CHECK_EQ(e2.box.m->cycles() - t2, e.box.m->cycles() - t1);
             }
-            alarm(0);
+            watchdog(0);
             CHECK_EQ(bytes >= 6, true); // マウスのパケット 2 つ
             m68k::Registers ra, rb;
             e.box.m->getRegisters(ra);
@@ -3283,7 +3315,7 @@ void craftedStates() {
             CHECK_EQ(e2.box.m->timeShifted() - shifted0, shift);
             CHECK_EQ(e2.box.m->cycles(), e.box.m->cycles() - shift);
             const uint64_t total0 = e.box.m->totalCycles(), total2 = e2.box.m->totalCycles();
-            alarm(120);
+            watchdog(120);
             bool crossed = false;
             int bytes = 0;
 #ifndef PIX68K_NO_CPU020
@@ -3336,7 +3368,7 @@ void craftedStates() {
                     CHECK_EQ(e.box.m->cycles(), e2.box.m->cycles() + shift);
                 }
             }
-            alarm(0);
+            watchdog(0);
             CHECK_EQ(crossed, true);
 #ifndef PIX68K_NO_CPU020
             if (cpu != 68000) CHECK_EQ(phaseChecked, true);

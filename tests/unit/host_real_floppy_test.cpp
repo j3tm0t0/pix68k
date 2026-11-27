@@ -12,7 +12,14 @@
 #include <unistd.h>
 
 int main() {
+#ifdef _WIN32
+    // Windows には /tmp がないので、TEMP の下に作る
+    char path[1024];
+    const char* tmp = getenv("TEMP");
+    snprintf(path, sizeof path, "%s/pix68k_real_floppy_XXXXXX", tmp && *tmp ? tmp : ".");
+#else
     char path[] = "/tmp/pix68k_real_floppy_XXXXXX";
+#endif
     const int fd = mkstemp(path);
     if (fd < 0) {
         perror("mkstemp");

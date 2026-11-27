@@ -16,6 +16,24 @@
 #include "platform/settings.h"
 #include "x68k/fuk_reader.h"
 
+#ifdef _WIN32
+// Windows (MinGW) にない POSIX の関数を、同じ働きのものに置き換える
+#include <io.h>
+#define fsync _commit
+#define lstat stat
+struct sigaction {
+    void (*sa_handler)(int);
+};
+static int sigaction(int sig, const struct sigaction* act, struct sigaction* old) {
+    void (*prev)(int) = signal(sig, act->sa_handler);
+    if (old != nullptr) old->sa_handler = prev;
+    return prev == SIG_ERR ? -1 : 0;
+}
+#endif
+#ifndef O_BINARY
+#define O_BINARY 0 // Windows では、改行を変えずに書くために要る
+#endif
+
 namespace {
 
 volatile sig_atomic_t interrupted = 0;
@@ -23,7 +41,7 @@ void onInterrupt(int) { interrupted = 1; }
 
 // path がないときだけ作って全部を書く。書けなければ消す
 bool saveNew(const char* path, const std::vector<uint8_t>& data) {
-    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0666);
     if (fd < 0) {
         fprintf(stderr, "fuk-read: cannot create %s: %s\n", path, strerror(errno));
         return false;

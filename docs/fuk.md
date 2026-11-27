@@ -19,15 +19,16 @@ fuk=on
 - 使い始めたあとに抜くと、FDC のコマンドは「ノットレディ」で異常終了します。挿し直せば、また使えます。
 - Pi 2 と Pi 3 では使えません (`fuk=on` を書いても、警告を出して内蔵の FDC を使います)。Pi 2 と Pi 3 の USB のコントローラは、同じ装置への受信と送信を同時に進められないためです。
 
-### ホスト版 (Linux、macOS)
+### ホスト版 (Linux、macOS、Windows)
 
 ```
-pix68k -r ~/x68k --fuk on                                          # Linux
+pix68k -r ~/x68k --fuk on                                          # Linux、Windows
 pix68k -r ~/x68k --fuk /dev/cu.usbmodem101,/dev/cu.usbmodem103     # macOS
+pix68k -r ~/x68k --fuk COM3,COM4                                   # Windows (ポートを名前で書くとき)
 ```
 
-- `on` は Linux だけで、`/dev/serial/by-id/usb-TNB_Factory._FDC_emulator-if00` と `-if02` を開きます。
-- ほかの OS では、2 本のシリアルポートの名前を `,` で区切って書きます。順番はどちらでもかまいません。
+- `on` は Linux と Windows だけです。Linux では `/dev/serial/by-id/usb-TNB_Factory._FDC_emulator-if00` と `-if02` を開きます。Windows では、FUK の 2 本のシリアルポートは COM ポートに見えるので、USB の VID:PID (04D8:E6B1) とインタフェースの番号 (0 と 2) から COM ポートを探して開きます (ドライバは Windows の標準の usbser.sys)。
+- macOS では、2 本のシリアルポートの名前を `,` で区切って書きます。Windows でも `COM3,COM4` のように書けます。順番はどちらでもかまいません。
 - 名前を書いていないポートには、何も送りません。
 - 設定ファイルの `fuk=` にも同じ値を書けます。
 - 環境変数 `PIX68K_FUK_TRACE` を設定すると、送受信したバイトを時刻付きで標準エラーに出します (調べるとき用)。
@@ -41,6 +42,7 @@ FUK につないだ FDD のディスクを、XDF のイメージ (1,261,568 バ�
 ```
 pix68k --fuk on --fuk-read 0 disk.xdf                                        # Linux
 pix68k --fuk /dev/cu.usbmodem101,/dev/cu.usbmodem103 --fuk-read 0 disk.xdf   # macOS
+pix68k --fuk on --fuk-read 0 disk.xdf                                        # Windows
 ```
 
 `0` は FUK のドライブの番号 (0〜3) です。
@@ -127,6 +129,7 @@ FUK は USB のシリアルポート (CDC) を 2 本持ちます。
 | `src/x68k/fuk.h`、`fuk.cpp` | X68000 から見た FDC の代わり (`x68k::Fuk`) と、2 本のポートの口 (`x68k::FukLink`)。ホスト版とベアメタル版で共通 |
 | `src/x68k/fuk_reader.h`、`fuk_reader.cpp` | ディスクを XDF に読み出す処理 (`x68k::FukReader`)。ホスト版 (`host/fuk_read.cpp`) とベアメタル版で共通 |
 | `host/host_fuk.cpp` | ホスト版の口。シリアルポートを待たない設定で開く |
+| `host/host_fuk_win.cpp` | Windows 版の口。COM ポートを重なった (overlapped) 読み書きで使う。`on` で COM ポートを探す |
 | `baremetal/fuk_usb.cpp` | ベアメタル版の口。Circle の USB シリアルのドライバを使う |
 | `tools/circle_fuk_patch.sh` | Circle のドライバに、待たずに送る関数と、受信の転送を出したままにする関数を足す (ビルド先の写しだけを書き換える) |
 | `tests/unit/fuk_fake.h` | 試験用の、FUK の手順どおりに答える偽物の装置 |
@@ -308,7 +311,7 @@ fuk: at 503.360 s: link lost: no 'w' after the data, 10000 ms, waiting for 'w', 
 - `fuk_reader_test`: ディスクの読み出しの単体テスト。全バイトの一致、読めないセクタ、別の書式、ディスクなし、出し入れ、中止、抜き差し、時間切れ、X68000 のリセットと、終わったあとの FDC の状態を確かめます。X68000 の読み書きの途中で断ったあとに、その読み書きが最後まで続くことと、ヘッドを戻せなかったあとの WRITE ID を断ることも確かめます。どの場合も、書き込み、排出、転送バイト数を 1 つも送っていないことを見ます。
 - `x68k_boot_fuk_read`: `x68k_boot_fuk` と同じことを、47 フレームごとに X68000 を止めてディスクを読み出しながら行います。
 - `x68k_boot_fuk`: 偽物の装置に入れた Human68k 3.02 のディスクから起動し、`copy` でファイルを書いて `dir` で確かめます (IPL ROM と起動ディスクがなければ飛ばします)。
-- `host_fuk_test`: ホスト版のシリアルポートの口を、pty の先に置いた偽物の装置で確かめます。
+- `host_fuk_test`: ホスト版のシリアルポートの口を、pty の先に置いた偽物の装置で確かめます。Windows では、`tests/unit/host_fuk_win_test.cpp` が同じことを名前付きパイプの先に置いた偽物の装置で確かめます。
 - `fuk_test` の `testStreamedReadBursty` (#320): X68000 が 1 フレーム分を実時間の 1 ms、4 ms、12 ms で動かしてから休む動かし方をまねます (届いたバイトを受け取るのがフレームの初めに寄る)。装置が 1 バイトずつ送る場合と 64 バイトずつまとめて送る場合のどちらでも、届いた時刻の間隔が保たれることを確かめます。`testStreamedReadFixedLead` は、`fuk_lead=` を決めたときにその遅れで渡し始めることを確かめます。
 - `fuk_test` の `testStreamedRead` など (#320): ディスクから読んだ時刻に 1 バイトずつ答える偽物の装置 (R から EOT まで読む) で、最初のバイトがデータの全部届く前に渡ること、TC がリザルトより前に来ること、届いた時刻の間隔が保たれることを確かめます。届いている途中の DMA の異常終了と、残りが来ないときの時間切れも確かめます。
 - `x68k_boot --fuk A.xdf --fuk1 B.xdf --fuk-realtime U:C:H:R:割合` (#320): 指定した Read にディスクから読んだ時刻で答える偽物の装置で動かします (割合 (%) だけ、そのセクタを読む時間を長くします)。`--fuk-head` でデータを読み始めにまとめて送る形、`--fuk-one-sector` で最初のセクタで終える形、`--fuk-ports A,B` で偽物の代わりにシリアルポート (実物か `tools/pico_fukemu` の hostsim) につなぎます。

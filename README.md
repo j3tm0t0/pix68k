@@ -23,7 +23,7 @@ The documentation is in Japanese. License: GPLv3.
 - 機種: X68000 (68000、10MHz / 16MHz)、X68030 (68030 25MHz と 68882)、060turbo (X68030 に 68060 50MHz / 75MHz を載せた構成)
 - 周辺機器: FD、SASI と SCSI のハードディスク、CD-ROM、OPM と ADPCM の音、マウス、ジョイスティック、数値演算プロセッサボード、
   まーきゅりーゆにっと、ネットワークボード Neptune-X、RS-232C、MIDI ボード CZ-6BM1 (SoundFont、MT-32、SC-55mkII、実機の音源。MIDI は動作を保証しない試験的な機能)
-- ホスト版: macOS と Linux で SDL2 を使って動く版。開発と試験に使う ([ソースからビルドする](#ソースからビルドする))
+- ホスト版: macOS、Linux、Windows で SDL2 を使って動く版。開発と試験に使う ([ソースからビルドする](#ソースからビルドする))
 
 画面の合成をコア 2、音の合成をコア 3 で行い、X68000 そのものはコア 1 で実時間で動かす。フレームは飛ばさない。
 
@@ -353,6 +353,8 @@ cmake --build build -j
 ```
 
 Linux (Ubuntu) では `sudo apt install build-essential cmake ninja-build libsdl2-dev python3` を入れると同じ手順でビルドできる。
+Windows は MSYS2 の UCRT64 でビルドする (手順は [build-and-test.md](docs/build-and-test.md))。
+Windows で Neptune-X をホストのネットワークにつなぐ (`--neptune-link pcap:IF`) には [Npcap](https://npcap.com/) を入れておく。
 ctest、速さの測り方 (`bench`、`machine_bench`)、CI は [build-and-test.md](docs/build-and-test.md) にある。
 
 ### RetroArch / libretro (開発中)
@@ -526,3 +528,7 @@ ymfm の著作権表示、条件、免責の全文は `src/x68k/opm.h` と `src/
 (Copyright (C) 2021, 2024 nukeykt) で、pix68k の GPLv3 と一緒に配れる。全文は `external/nuked-sc55/LICENSE` にある。
 pix68k で使うために `src/mcu.cpp`、`src/pcm.cpp`、`src/pcm.h`、`src/submcu.cpp` を変えた (SDL などを除き、大きな配列を確保した
 領域へのポインタに変え、グローバル変数を初めの値に戻す関数を足した。変えたところは各ファイルの先頭に書いた)。
+
+Windows 版は、Neptune-X の `pcap:IF` を使うときだけ [Npcap](https://npcap.com/) の `wpcap.dll` (`System32\Npcap`) を実行時に読む
+(リンクはしない。`host/npcap_win.h`)。Npcap の無償版はライセンスで再配布が認められていないので、Windows 版のバイナリを配るときも
+Npcap は同梱せず、使う人が自分で入れる。

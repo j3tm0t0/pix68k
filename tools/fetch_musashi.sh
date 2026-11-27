@@ -47,7 +47,7 @@ tmp, out, sha, timeout = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4
 lock = out + ".lock"
 old = "%s.old.%d" % (out, os.getpid())
 stop = []
-for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", signal.SIGTERM)):  # Windows の Python に SIGHUP はない
     signal.signal(s, lambda *a: stop.append(1))  # ロックを持っている間は、覚えるだけで止まらない
 
 
